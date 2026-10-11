@@ -1,6 +1,7 @@
-"""CLI: uv run skill-stats {init,walk,classify,detect,lineage,report,update}. Requires the
+"""CLI: uv run skill-stats {init,walk,classify,detect,lineage,report,update,ci}. Requires the
 opencode CLI on PATH for classify (ADR-0001 rolling session). update is the
-orchestrating verb (ADR-0003 clause 7); the stage subcommands stay plumbing."""
+orchestrating verb (ADR-0003 clause 7); the stage subcommands stay plumbing;
+ci renders the workflow and lands artifact updates."""
 
 import argparse
 import json
@@ -9,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import db, gitwalk, identity
+from . import ci, db, gitwalk, identity
 from .classify import DEFAULT_MODEL, SESSION_DIR, Session, classify_pending
 from .lineage import close_lineage
 from .targets import annotate_all
@@ -80,6 +81,23 @@ def main(argv: list[str] | None = None) -> None:
     up.add_argument("--no-report", action="store_true", help="skip report.html regeneration")
     up.add_argument("--no-serialize", action="store_true", help="skip artifact write")
 
+    ci_grp = sub.add_parser("ci", help="CI scaffold: workflow rendering + artifact landing")
+    ci_sub = ci_grp.add_subparsers(dest="ci_cmd", required=True)
+    ci_init = ci_sub.add_parser(
+        "init", help="write .github/workflows/skill-stats.yml (idempotent, refuses drift)"
+    )
+    ci_init.add_argument("--branch", default=None, help="Target branch (default: current)")
+    ci_init.add_argument(
+        "--db", default=ci.DEFAULT_CI_DB, help="working DB the workflow runs update against"
+    )
+    ci_init.add_argument("--no-push", action="store_true", help="render without the landing step")
+    ci_init.add_argument("--upgrade", action="store_true", help="overwrite a drifted workflow")
+    ci_land = ci_sub.add_parser(
+        "land", help="land the artifact-update commit (Q15/Q17/Q18 rules; usable anywhere)"
+    )
+    ci_land.add_argument("--branch", default=None, help="Target branch (default: current)")
+    ci_land.add_argument("--remote", default="origin")
+
     args = parser.parse_args(argv)
 
     settings: dict[str, Any] = {}
@@ -101,6 +119,25 @@ def main(argv: list[str] | None = None) -> None:
             _set(conn, key, value)
         conn.close()
         print(f"initialized {db_path} for {repo} (branch {branch}, model {args.model})")
+        return
+
+    if args.cmd == "ci":
+        # git-side commands: act on the repository at the current directory,
+        # no working DB required
+        top = identity.toplevel()
+        if top is None:
+            sys.exit("not inside a git repository")
+        branch = args.branch or gitwalk.current_branch(top)
+        if args.ci_cmd == "init":
+            try:
+                for msg in ci.init(
+                    top, branch, db=args.db, push=not args.no_push, upgrade=args.upgrade
+                ):
+                    print(msg)
+            except ci.DriftError as exc:
+                sys.exit(f"error: {exc}")
+        else:
+            print(ci.commit_or_abandon(top, branch, args.remote))
         return
 
     conn = db.connect(Path(args.db))
