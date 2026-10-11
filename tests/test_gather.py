@@ -209,3 +209,127 @@ def _connect(path):
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+# ------------------------------- backfill merge rule + org report surface ---
+
+
+def _classifying_repo(tmp_path, name, files, replies, fail_after=None):
+    """update run whose classifier raises after N successful sends (Q13
+    backlog semantics: the failing commit stays pending)."""
+    import unittest.mock as mock
+
+    repo = tmp_path / name
+    repo.mkdir(parents=True)
+    run(repo, "init", "-q", "-b", "main")
+    run(repo, "config", "user.name", "T")
+    run(repo, "config", "user.email", "t@t.io")
+    run(repo, "config", "commit.gpgsign", "false")
+    for msg, content in files:
+        commit_files(repo, msg, content)
+    db_path = str(tmp_path / f"{name}.db")
+    main(["init", str(repo), "--db", db_path])
+    sent = []
+
+    class Flaky(Scripted):
+        def send(self, message):
+            if fail_after is not None and len(sent) >= fail_after:
+                raise RuntimeError("opencode CLI failed")
+            sent.append(message)
+            return super().send(message)
+
+    with mock.patch("skill_stats.cli.Session", lambda model, sid=None: Flaky(list(replies))):
+        main(["update", "--db", db_path, "--no-detect", "--no-lineage", "--no-report"])
+    return repo, db_path
+
+
+def test_union_report_repo_column_and_org_branding(tmp_path):
+    a = _updated_repo(
+        tmp_path,
+        "alpha-repo",
+        [("feature one", {"a.txt": "a1\na2\n"})],
+        ['{"k":"new","title":"alpha module","about":"x","why":"y"}'],
+    )
+    b = _updated_repo(
+        tmp_path,
+        "beta-repo",
+        [("feature two", {"b.txt": "b1\n"})],
+        ['{"k":"new","title":"beta index","about":"x","why":"y"}'],
+    )
+    union = tmp_path / "union.db"
+    main(["gather", "--db", str(union), str(a), str(b)])
+    conn = _connect(union)
+    from skill_stats import htmlreport
+    from skill_stats.report import text_report
+
+    page = htmlreport.build(conn)
+    assert "skill-stats report · 2 repos" in page  # org branding
+    assert "<th>Repo</th>" in page  # REPO column in the ranking table
+    assert "alpha-repo" in page and "beta-repo" in page
+    text = text_report(conn)
+    assert "#alpha-repo-1" in text and "#beta-repo-1" in text
+    assert "alpha-module" not in text  # sanity: no stray remap
+    conn.close()
+
+
+def test_single_repo_report_renders_unchanged(tmp_path):
+    a = _updated_repo(
+        tmp_path,
+        "alpha-repo",
+        [("feature one", {"a.txt": "a1\n"})],
+        ['{"k":"new","title":"alpha module","about":"x","why":"y"}'],
+    )
+    union = tmp_path / "union.db"
+    main(["gather", "--db", str(union), str(a)])
+    conn = _connect(union)
+    from skill_stats import htmlreport
+    from skill_stats.report import text_report
+
+    page = htmlreport.build(conn)
+    text = text_report(conn)
+    assert "<th>Repo</th>" not in page  # single-repo: zero visual diff
+    assert "repos" not in page.split("<title>")[1].split("</title>")[0]
+    assert "skill-stats report · alpha-repo" in page  # slug branding when single
+    assert "alpha-repo " not in text.split("top 15 features by fixes:")[1].splitlines()[1]
+    conn.close()
+
+
+def test_union_sampling_complete_is_least_complete(tmp_path):
+    import unittest.mock as mock
+
+    # backlog repo: one commit classified (feature exists -> samples), one
+    # left pending -> its backfill_state stays "pending"
+    a, a_db = _classifying_repo(
+        tmp_path,
+        "alpha-repo",
+        [("feature one", {"a.txt": "a1\n"}), ("later", {"a.txt": "a1\na2\n"})],
+        ['{"k":"new","title":"alpha module","about":"x","why":"y"}'],
+        fail_after=1,
+    )
+    b = _updated_repo(
+        tmp_path,
+        "beta-repo",
+        [("feature two", {"b.txt": "b1\n"})],
+        ['{"k":"new","title":"beta index","about":"x","why":"y"}'],
+    )
+    union = tmp_path / "union.db"
+    main(["gather", "--db", str(union), str(a), str(b)])
+    conn = _connect(union)
+    from skill_stats import htmlreport
+
+    page = htmlreport.build(conn)
+    assert "Feature size over time" in page
+    assert "sampling incomplete" in page.lower()  # least-complete rule
+    conn.close()
+
+    # clear the backlog -> re-gather -> the union is complete
+    with mock.patch(
+        "skill_stats.cli.Session",
+        lambda model, sid=None: Scripted(['{"k":"new","title":"later","about":"x","why":"y"}']),
+    ):
+        main(["update", "--db", a_db, "--no-detect", "--no-lineage", "--no-report"])
+    main(["gather", "--db", str(union), str(a), str(b)])
+    conn = _connect(union)
+    page = htmlreport.build(conn)
+    assert "sampling incomplete" not in page.lower()
+    conn.close()

@@ -3,16 +3,18 @@
 import sqlite3
 from pathlib import Path
 
-from .metrics import snapshot
+from .metrics import feature_repos, repo_count, snapshot
 
 
 def text_report(conn: sqlite3.Connection, top: int = 15) -> str:
     snap = snapshot(conn, top=top)
+    multi = repo_count(conn) > 1
+    repos = feature_repos(conn) if multi else {}
     lines = [
         "=" * 60,
         f"Walk {snap.total_commits} commits on Target branch",
         f"Verdicts: {snap.verdict_counts}",
-        f"Features: {snap.total_features}", 
+        f"Features: {snap.total_features}",
         f"Fixes:    {snap.total_fixes}",
         f"Features / year: {snap.features_per_year:.1f}",
         f"Fixes / feature: {snap.fixes_per_feature:.2f}",
@@ -29,11 +31,17 @@ def text_report(conn: sqlite3.Connection, top: int = 15) -> str:
     lines.append("")
     lines.append(f"top {top} features by fixes:")
     for fid, title, n in snap.top_features_by_fixes:
-        lines.append(f"  #{fid:<4} {title:<48} {n}")
+        if multi:
+            lines.append(f"  #{fid:<4} {title:<32} {repos.get(fid, ''):<16} {n}")
+        else:
+            lines.append(f"  #{fid:<4} {title:<48} {n}")
     lines.append("")
     lines.append(f"top {top} features by churn:")
     for fid, title, n in snap.top_features_by_churn:
-        lines.append(f"  #{fid:<4} {title:<48} {n}")
+        if multi:
+            lines.append(f"  #{fid:<4} {title:<32} {repos.get(fid, ''):<16} {n}")
+        else:
+            lines.append(f"  #{fid:<4} {title:<48} {n}")
     lines.append("=" * 60)
     return "\n".join(lines)
 

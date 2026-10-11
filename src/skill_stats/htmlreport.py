@@ -12,7 +12,15 @@ import subprocess
 from datetime import date
 from pathlib import Path
 
-from .metrics import feature_ranking, features_timeline, fixes_rolling, snapshot
+from .metrics import (
+    feature_ranking,
+    feature_repos,
+    features_timeline,
+    fixes_rolling,
+    repo_count,
+    sampling_complete,
+    snapshot,
+)
 
 C = {
     "bg": "#0f1117",
@@ -474,8 +482,21 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
     model = str(settings.get("model", ""))
     min_lines = int(settings.get("min_target_lines", 1))
     url = _repo_url(repo)
-    repo_name = repo.rstrip("/").split("/")[-1] or repo
     branch = str(settings.get("branch", "main"))
+    n_repos = repo_count(conn)
+    multi = n_repos > 1
+    if multi:
+        repo_name = f"{n_repos} repos"  # org mode branding
+        branch_tag = ""
+    elif repo:
+        repo_name = repo.rstrip("/").split("/")[-1] or repo
+        branch_tag = f" <span class='muted'>({_esc(branch)})</span>"
+    else:
+        # union of one: brand by Repository key slug
+        slugs = [str(r["slug"]) for r in conn.execute("SELECT slug FROM repositories ORDER BY id")]
+        repo_name = slugs[0] if slugs else ""
+        branch_tag = f" <span class='muted'>({_esc(branch)})</span>"
+    repos = feature_repos(conn) if multi else {}
 
     tl = features_timeline(conn)
     months = [p.month for p in tl]
@@ -567,34 +588,42 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
         rank_rows.append(
             f"<tr><td class='num'>{i}</td><td>#{r.fid} &nbsp;{_esc(r.title)}</td>"
             f"<td class='num'>{r.created}</td><td class='num'>{r.fixes}</td>"
-            f"<td class='num'>{r.churn}</td><td class='num'>{r.live}</td><td>{link}</td></tr>"
+            f"<td class='num'>{r.churn}</td><td class='num'>{r.live}</td>"
+            + (f"<td>{_esc(r.repo)}</td>" if multi else "")
+            + f"<td>{link}</td></tr>"
         )
     rank_table = (
         "<table><thead><tr>"
         "<th class='num'>#</th><th>Feature</th><th class='num'>Created</th>"
         "<th class='num'>Fixes</th><th class='num'>Churn (lines)</th>"
         "<th class='num'>Live lines</th>"
-        "<th>First commit</th></tr></thead><tbody>" + "".join(rank_rows) + "</tbody></table>"
+        + ("<th>Repo</th>" if multi else "")
+        + "<th>First commit</th></tr></thead><tbody>"
+        + "".join(rank_rows)
+        + "</tbody></table>"
     )
 
     unattr_raw = settings.get("unattributed_lines")
-    backfill_state = settings.get("backfill_state")
-    complete = isinstance(backfill_state, dict) and backfill_state.get("status") == "done"
+    complete = sampling_complete(conn)  # union: least complete constituent
     live_section = _live_size_section(
         conn, int(unattr_raw) if unattr_raw is not None else None, complete
     )
 
     churn_rows = [
-        f"<tr><td class='num'>{i}</td><td>#{fid} {_esc(title)}</td><td class='num'>{n}</td></tr>"
+        f"<tr><td class='num'>{i}</td><td>#{fid} {_esc(title)}</td>"
+        + (f"<td>{_esc(repos.get(fid, ''))}</td>" if multi else "")
+        + f"<td class='num'>{n}</td></tr>"
         for i, (fid, title, n) in enumerate(snap.top_features_by_churn, 1)
     ]
     churn_table = (
         "<table><thead><tr><th class='num'>#</th><th>Feature</th>"
-        "<th class='num'>Churn (lines)</th></tr></thead>"
+        + ("<th>Repo</th>" if multi else "")
+        + "<th class='num'>Churn (lines)</th></tr></thead>"
         "<tbody>" + "".join(churn_rows) + "</tbody></table>"
     )
 
-    who = f"{_esc(repo_name)} <span class='muted'>({_esc(branch)})</span> — {_esc(model)}"
+    who = f"{_esc(repo_name)}{branch_tag} — {_esc(model)}"
+    target_label = _esc(repo or repo_name)
     other_pct = percent(
         snap.verdict_counts.get("revert", 0)
         + snap.verdict_counts.get("cleanup", 0)
@@ -607,8 +636,8 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_esc(title)}</title><style>{CSS}</style></head>
 <body>
-<h1>skill-stats report — {_esc(repo_name)} <span class="muted">({_esc(branch)})</span></h1>
-<div class="muted">Target repo: {_esc(repo)} &nbsp;·&nbsp; generated {date.today().isoformat()}
+<h1>skill-stats report — {_esc(repo_name)}{branch_tag}</h1>
+<div class="muted">Target repo: {target_label} &nbsp;·&nbsp; generated {date.today().isoformat()}
  &nbsp;·&nbsp; verdict model: {_esc(model)}</div>
 
 <div class="kpis">{kpis}</div>
