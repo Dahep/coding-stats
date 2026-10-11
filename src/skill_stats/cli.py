@@ -98,6 +98,12 @@ def main(argv: list[str] | None = None) -> None:
     ci_land.add_argument("--branch", default=None, help="Target branch (default: current)")
     ci_land.add_argument("--remote", default="origin")
 
+    gath = sub.add_parser("gather", help="ingest artifacts into a union DB keyed by Repository key")
+    gath.add_argument("--db", default="skill-stats-union.db", help="union DB to build/refresh")
+    gath.add_argument(
+        "sources", nargs="+", help="repo checkouts (read .skill-stats/) or artifact file paths"
+    )
+
     args = parser.parse_args(argv)
 
     settings: dict[str, Any] = {}
@@ -138,6 +144,19 @@ def main(argv: list[str] | None = None) -> None:
                 sys.exit(f"error: {exc}")
         else:
             ci.report_landing(ci.commit_or_abandon(top, branch, args.remote))
+        return
+
+    if args.cmd == "gather":
+        from .gather import GatherError
+        from .gather import gather as run_gather
+
+        try:
+            result = run_gather(Path(args.db), [Path(s) for s in args.sources])
+        except GatherError as exc:
+            sys.exit(f"error: {exc}")
+        print(
+            f"{args.db}: {result.ingested} ingested, {result.skipped} skipped (identical artifact)"
+        )
         return
 
     conn = db.connect(Path(args.db))

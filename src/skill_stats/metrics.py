@@ -170,7 +170,8 @@ def churn_per_feature(conn: sqlite3.Connection) -> list[tuple[str, str, int]]:
 
 
 class FeatureRank(NamedTuple):
-    """One feature with its attributed-fix count, churn and live lines."""
+    """One feature with its attributed-fix count, churn and live lines.
+    Internal API: callers unpack by name, never by position."""
 
     fid: str
     title: str
@@ -179,6 +180,7 @@ class FeatureRank(NamedTuple):
     churn: int
     sha: str  # earliest defining commit sha
     live: int  # features.live_lines at the latest live-lines run
+    repo: str  # repository slug (REPO column for multi-repo reports)
 
 
 def feature_ranking(conn: sqlite3.Connection) -> list[FeatureRank]:
@@ -202,14 +204,67 @@ def feature_ranking(conn: sqlite3.Connection) -> list[FeatureRank]:
             churn=int(churn.get(str(r["fid"]), 0)),
             sha=str(sha.get(r["fid"], "")),
             live=int(r["live"]),
+            repo=str(r["repo"]),
         )
         for r in conn.execute(
-            """SELECT f.id fid, f.title, f.created_at d, f.live_lines live,
+            """SELECT f.id fid, f.title, f.created_at d, f.live_lines live, rp.slug repo,
                       COUNT(ff.fix_commit_id) n
-               FROM features f LEFT JOIN fixes_features ff ON ff.feature_id = f.id
+               FROM features f
+               JOIN repositories rp ON rp.id = f.repo_id
+               LEFT JOIN fixes_features ff ON ff.feature_id = f.id
                GROUP BY f.id ORDER BY n DESC, f.id"""
         )
     ]
+
+
+def repo_count(conn: sqlite3.Connection) -> int:
+    """How many Repository keys this DB covers (1 for a single-repo DB)."""
+    return int(conn.execute("SELECT COUNT(*) c FROM repositories").fetchone()["c"])
+
+
+def feature_repos(conn: sqlite3.Connection) -> dict[str, str]:
+    """feature id -> repository slug (the REPO column for multi-repo views)."""
+    return {
+        str(r["fid"]): str(r["slug"])
+        for r in conn.execute(
+            "SELECT f.id fid, rp.slug slug FROM features f"
+            " JOIN repositories rp ON rp.id = f.repo_id"
+        )
+    }
+
+
+def sampling_complete(conn: sqlite3.Connection) -> bool:
+    """Whether sample history is complete enough to render gaps as zeros. A
+    union DB is only as complete as its LEAST complete constituent
+    (union_artifacts carries each artifact's backfill_state); a single-repo DB
+    follows its own backfill_state. Unknown states read as incomplete."""
+    if _has_table(conn, "union_artifacts"):
+        rows = conn.execute("SELECT backfill_state FROM union_artifacts").fetchall()
+        if rows:
+            return all(_state_done(str(r["backfill_state"])) for r in rows)
+    return _state_done(_setting(conn, "backfill_state"))
+
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _setting(conn: sqlite3.Connection, key: str) -> str:
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return str(row["value"]) if row else ""
+
+
+def _state_done(raw: str) -> bool:
+    try:
+        state = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(state, dict) and state.get("status") == "done"
 
 
 def snapshot(conn: sqlite3.Connection, top: int = 15) -> MetricSnapshot:

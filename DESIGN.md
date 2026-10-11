@@ -103,9 +103,12 @@ matplotlib scripts over SQL queries. Build git-only phase first.
   distinct commit parented on the push, pushed with `GITHUB_TOKEN` (ring
   closed by exclusion); report also uploaded as an Actions artifact; Pages
   publishing gated on public/paid repos.
-- **Gather (designed, not built)**: ingests N artifacts into a union DB keyed
-  by Repository key; union DB is structurally identical to any single-repo
-  DB, so the report code path reads either unchanged.
+- **Gather** (built: `src/skill_stats/gather.py`): ingests N artifacts into a
+  union DB keyed by Repository key; verify-first ingest, idempotent per key
+  (identical artifact = no-op, a newer one last-wins), slug collisions refuse
+  (Q18.2). Union DB is structurally identical to any single-repo DB, so the
+  report code path reads either unchanged (REPO columns appear only when it
+  holds >1 key); commit ids are union-local, feature ids need no remapping.
 
 ## opencode pipeline (schema settled now, built later)
 

@@ -98,7 +98,8 @@ def rebuild(
     raw.row_factory = sqlite3.Row
     try:
         if data is not None:
-            artifact.materialize(raw, data)
+            artifact.materialize(raw, data)  # authorizer-guarded replay
+            artifact.stamp_schema_steps(raw, data)  # bookkeeping, outside it
     finally:
         raw.close()
     fresh = db.connect(tmp_path)  # no-op for materialized steps; migrates old artifacts
