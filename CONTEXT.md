@@ -7,7 +7,7 @@ A tool that mines git history (and later opencode history) to measure feature-le
 ### Git domain
 
 **Repository key**:
-A Target repo's identity across machines and clones: clone URL plus the repository's Target branch. Machine-local paths are never identity; Gather keys on a Repository key, two clones of the same repository are one.
+A Target repo's identity across machines and clones: clone URL plus the repository's Target branch. Machine-local paths are never identity; SSH config alias hosts are machine-local names and never identity either. Gather keys on a Repository key, two clones of the same repository are one.
 
 **Feature id**:
 A Feature's identifier. Locally unique within a repo; globally disambiguated by its Repository key so gathered unions need no remapping.
