@@ -17,6 +17,7 @@ on the repository passed in, pushing HEAD to exactly the given branch.
 import difflib
 import os
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_CI_DB = ".skill-stats/working.db"
@@ -30,6 +31,15 @@ BOT_EMAIL = "skill-stats[bot]@users.noreply.github.com"
 
 class DriftError(RuntimeError):
     """The on-disk file differs from what this version generates."""
+
+
+@dataclass(frozen=True)
+class Landing:
+    """The landing outcome. The verb itself stays silent: reporting is the
+    CLI's job, so the status is printed exactly once."""
+
+    status: str  # 'landed' | 'noop' | 'abandoned'
+    detail: str
 
 
 def render_workflow(branch: str, db: str = DEFAULT_CI_DB, push: bool = True) -> str:
@@ -149,30 +159,28 @@ def init(
     return out
 
 
-def commit_or_abandon(repo: Path, branch: str, remote: str = "origin") -> str:
-    """The landing verb (ADR-0003 clause 6, Q15/Q17/Q18). Returns one of:
+def commit_or_abandon(repo: Path, branch: str, remote: str = "origin") -> Landing:
+    """The landing verb (ADR-0003 clause 6, Q15/Q17/Q18):
     'noop' — .skill-stats/ is unchanged (no-op discipline: nothing is pushed);
     'abandoned' — the checked-out push is behind the branch tip (a newer push
-    landed while this run worked; its own run covers the data) or history
-    diverged (never force); 'landed' — the artifact update is committed as
-    skill-stats[bot] and pushed to exactly `branch`."""
+    landed while this run worked, including the check-to-push race window) or
+    history diverged (never force);
+    'landed' — the artifact update is committed as skill-stats[bot] and pushed
+    to exactly `branch`. Unrelated push failures (auth, network) raise."""
     if not _store_dirty(repo):
-        _report("noop", "no artifact changes to land")
-        return "noop"
+        return Landing("noop", "no artifact changes to land")
     base = _git(repo, "rev-parse", "HEAD").strip()
-    _git(repo, "fetch", remote, f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}")
-    tip = _git(repo, "rev-parse", f"refs/remotes/{remote}/{branch}").strip()
+    _fetch_tip(repo, branch, remote)
+    tip = _tip(repo, branch, remote)
     if tip != base:
         if _is_ancestor(repo, base, tip):
-            _report(
+            return Landing(
                 "abandoned",
                 f"a newer push landed on {branch} while this run worked;"
                 " its own run covers the data",
             )
-            return "abandoned"
         if not _is_ancestor(repo, tip, base):
-            _report("abandoned", f"history diverged from {remote}/{branch}; never force-push")
-            return "abandoned"
+            return Landing("abandoned", f"history diverged from {remote}/{branch}; never force")
     _git(repo, "add", "-A", "--", ".skill-stats")
     _git(
         repo,
@@ -186,21 +194,50 @@ def commit_or_abandon(repo: Path, branch: str, remote: str = "origin") -> str:
         "--",
         ".skill-stats",
     )
-    _git(repo, "push", remote, f"HEAD:refs/heads/{branch}")
-    _report("landed", f"artifact-update commit pushed to {remote} {branch}")
-    return "landed"
+    try:
+        _push(repo, remote, branch)
+    except subprocess.CalledProcessError as exc:
+        # Q18 race: the branch advanced between our staleness check and this
+        # push and the push was rejected. Superseded runs end neutrally —
+        # never force, never block; anything else (auth, network) is a real
+        # error and must surface.
+        _fetch_tip(repo, branch, remote)
+        tip = _tip(repo, branch, remote)
+        if tip != base and not _is_ancestor(repo, tip, base):
+            return Landing(
+                "abandoned",
+                f"a newer push landed on {branch} during the landing attempt;"
+                " superseded (the local artifact commit stays unpushed)",
+            )
+        raise exc
+    return Landing("landed", f"artifact-update commit pushed to {remote} {branch}")
 
 
-def _report(status: str, detail: str) -> None:
-    line = f"skill-stats ci land: {status} — {detail}"
-    if status == "abandoned":
-        print(f"::notice::{line}")  # neutral annotation: never a red run (Q18)
+def report_landing(landing: Landing) -> None:
+    """Print the landing outcome exactly once (the CLI's reporting step):
+    neutral ::notice:: annotation + step summary for abandonment (Q18: never
+    a red failure for superseded runs), a plain line otherwise."""
+    line = f"skill-stats ci land: {landing.status} — {landing.detail}"
+    if landing.status == "abandoned":
+        print(f"::notice::{line}")
     else:
         print(line)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as fh:
             fh.write(f"### {line}\n")
+
+
+def _push(repo: Path, remote: str, branch: str) -> None:
+    _git(repo, "push", remote, f"HEAD:refs/heads/{branch}")
+
+
+def _fetch_tip(repo: Path, branch: str, remote: str) -> None:
+    _git(repo, "fetch", remote, f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}")
+
+
+def _tip(repo: Path, branch: str, remote: str) -> str:
+    return _git(repo, "rev-parse", f"refs/remotes/{remote}/{branch}").strip()
 
 
 def _diff(rel: str, current: str, generated: str) -> str:

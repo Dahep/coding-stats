@@ -137,7 +137,7 @@ def main(argv: list[str] | None = None) -> None:
             except ci.DriftError as exc:
                 sys.exit(f"error: {exc}")
         else:
-            print(ci.commit_or_abandon(top, branch, args.remote))
+            ci.report_landing(ci.commit_or_abandon(top, branch, args.remote))
         return
 
     conn = db.connect(Path(args.db))
