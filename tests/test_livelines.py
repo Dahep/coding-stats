@@ -10,7 +10,7 @@ from conftest import add_feature, commit_files, make_db, run
 from skill_stats.blame import _porcelain_shas
 from skill_stats.gitwalk import walk
 from skill_stats.lineage import close_lineage
-from skill_stats.livelines import sample_points, update_live_lines
+from skill_stats.livelines import _line_counts_at, sample_points, update_live_lines
 from skill_stats.targets import annotate_all
 
 
@@ -139,6 +139,32 @@ def test_update_live_lines_is_idempotent(repo, tmp_path):
     res2 = update_live_lines(conn, repo)
     assert res2.backfilled_points == 0  # samples already complete -> no re-sweep
     assert set(conn.execute("SELECT * FROM feature_line_samples")) == before
+
+
+def test_binary_files_never_crash_blame(repo, tmp_path):
+    """Dotfiles history carries vendored binaries (fonts, archives): a blame
+    sweep must treat non-UTF-8 content as unattributed, not crash the whole
+    walk on a strict UTF-8 decode (0x89 of a physical file)."""
+    h1 = commit_files(repo, "feature a", {"f.txt": "a1\na2\n"})
+    binary = repo / "logo.png"
+    binary.write_bytes(b"PNG\r\n\x89 binary \xb5mas content\n")
+    run(repo, "add", "-A")
+    run(repo, "commit", "-m", "vendor binary")
+    h2 = commit_files(repo, "feature b", {"g.txt": "b1\nb2\nb3\nb4\n"})
+    conn = make_db(tmp_path / "l.db", repo)
+    walk(repo, conn, "main")
+    fa = add_feature(conn, "feature a")
+    fb = add_feature(conn, "feature b")
+    _define(conn, fa, h1)
+    _define(conn, fb, h2)
+    for sha in (h1, h2):
+        _verdict(conn, sha, "feature")
+    conn.commit()
+
+    counts, unattributed = _line_counts_at(repo, h2)
+    # the binary blob's content lines end in the unattributed bucket
+    assert unattributed > 0
+    assert "logo.png" not in counts  # bytes never attributed like lines
 
 
 def test_sample_points_full_then_capped():

@@ -155,13 +155,19 @@ class CommitRow:
 
 
 def _git(repo: Path, *args: str, text: bool = True) -> str:
+    """Git output to str. Decoded with 'replace' (never strict): vendored
+    files can be text-ish-but-not-UTF-8 (no NUL byte, so git diffs them as
+    text carrying raw bytes); strict decode would crash the walk/blame on
+    line-structure output, while replacement chars change nothing for line
+    counting, patch-ids, or the classifier context."""
     out = subprocess.run(
         ["git", "-C", str(repo), *args],
         check=True,
         capture_output=True,
-        text=text,
     )
-    return cast(str, out.stdout)
+    if not text:
+        return cast(str, out.stdout)
+    return out.stdout.decode("utf-8", errors="replace")
 
 
 def current_branch(repo: Path) -> str:

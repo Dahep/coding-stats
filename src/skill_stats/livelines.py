@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .blame import _porcelain_shas
-from .gitwalk import _git, _unquote_git_path, is_store_path
+from .gitwalk import _unquote_git_path, is_store_path
 
 # Backfill plan caps (grill-r3-Q9 leaves the cap to implementation):
 # a full sweep up to this many walked commits, evenly sampled above it.
@@ -209,11 +209,32 @@ def _line_counts_at(repo_dir: Path, sha: str) -> tuple[Counter[str], int]:
     unattributed = 0
     for path in _files_at(repo_dir, sha):
         try:
-            text = _git(
-                repo_dir, "blame", "-w", "-C", "--first-parent", "--porcelain", sha, "--", path
+            proc = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo_dir),
+                    "blame",
+                    "-w",
+                    "-C",
+                    "--first-parent",
+                    "--porcelain",
+                    sha,
+                    "--",
+                    path,
+                ],
+                check=True,
+                capture_output=True,
             )
+            text = proc.stdout.decode("utf-8")
         except subprocess.CalledProcessError:
-            unattributed += _blob_line_count(repo_dir, sha, path)  # binary etc.
+            unattributed += _blob_line_count(repo_dir, sha, path)  # blame failure
+            continue
+        except UnicodeDecodeError:
+            # text blame never applies: the file is non-UTF-8 (binary — vendored
+            # archives, fonts, images). Binary content is unblamable by design:
+            # its blob line count surfaces as unattributed, like failed blame.
+            unattributed += _blob_line_count(repo_dir, sha, path)
             continue
         for blamed in _porcelain_shas(text):
             counts[blamed] += 1
