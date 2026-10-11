@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>skill-stats report · t3-f2c63abe</title><style>
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body {
+  margin: 0 auto; max-width: 1020px; padding: 24px 18px 64px;
+  background: #0f1117; color: #c0caf5;
+  font: 14px/1.55 "Inter", "Segoe UI", system-ui, sans-serif;
+}
+h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.02em; }
+h2 { font-size: 16px; margin: 34px 0 10px; letter-spacing: -0.01em; }
+a { color: #7aa2f7; text-decoration: none; }
+a:hover { text-decoration: underline; }
+.muted { color: #7d88b0; font-size: 12.5px; }
+.kpis { display: grid; grid-template-columns: repeat(3, 1fr);
+        gap: 12px; margin: 22px 0 4px; }
+.kpi { background: #161a26; border: 1px solid #232a3d;
+       border-radius: 10px; padding: 14px 16px; }
+.kpi-value { font-size: 26px; font-weight: 650; letter-spacing: -0.02em; }
+.kpi-sub { color: #7d88b0; font-size: 11.5px; }
+.kpi-label { color: #7d88b0; font-size: 12px; margin-top: 2px; }
+.note { color: #7d88b0; font-size: 12px; margin: 6px 0 12px; }
+.legend { display: flex; gap: 18px; font-size: 12px; color: #7d88b0;
+          margin: 8px 2px 0; align-items: center; }
+.chartbox { margin-top: 6px; }
+.donut-row { display: flex; gap: 22px; align-items: center;
+             background: #161a26; border: 1px solid #232a3d;
+             border-radius: 10px; padding: 16px 20px; flex-wrap: wrap; }
+.badge { display: flex; align-items: center; gap: 7px; margin: 3px 0;
+         font-size: 13px; }
+.badge b { font-variant-numeric: tabular-nums; }
+.dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block;
+       flex: none; }
+.tick { font: 10.5px "Inter", sans-serif; fill: #7d88b0; }
+.donut-total { font: 22px "Inter", sans-serif; fill: #c0caf5;
+               font-weight: 650; }
+table { border-collapse: collapse; width: 100%;
+        background: #161a26; border: 1px solid #232a3d;
+        border-radius: 10px; overflow: hidden; font-size: 13px; }
+th, td { padding: 7px 12px; text-align: left;
+         border-bottom: 1px solid #232a3d; }
+th { color: #7d88b0; font-weight: 550; font-size: 12px;
+     background: #0f1117; }
+tbody tr:last-child td { border-bottom: none; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.foot { margin-top: 40px; color: #7d88b0; font-size: 12px;
+        border-top: 1px solid #232a3d; padding-top: 12px; }
+.foot code { color: #c0caf5; }
+@media (max-width: 720px) { .kpis { grid-template-columns: 1fr 1fr; } }
+@media print {
+  @page { size: A4; margin: 9mm; }
+  body { max-width: none; padding: 0; margin: 0; }
+  h2 { margin: 16px 0 6px; }
+  section { margin: 0; }
+  .kpi { padding: 10px 14px; }
+  .kpi-value { font-size: 21px; }
+  .kpis { gap: 8px; margin: 14px 0 2px; }
+  .note { margin: 4px 0 6px; }
+  .chartbox { margin-top: 2px; }
+  .legend { margin: 4px 2px 0; }
+  * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .kpi, .donut-row, svg { break-inside: avoid; }
+  .chartbox { break-inside: avoid; }
+  tr { break-inside: avoid; }
+  thead { display: table-header-group; }
+  a { color: inherit; }
+}
+</style></head>
+<body>
+<h1>skill-stats report — t3-f2c63abe <span class='muted'>(t3/f2c63abe)</span></h1>
+<div class="muted">Target repo: /home/dherrmann/.t3/worktrees/skill-stats/t3-f2c63abe &nbsp;·&nbsp; generated 2026-10-11
+ &nbsp;·&nbsp; verdict model: </div>
+
+<div class="kpis"><div class="kpi"><div class="kpi-value">16</div><div class="kpi-label">commits walked</div><div class="kpi-sub">span 2026-10-02 → 2026-10-11</div></div><div class="kpi"><div class="kpi-value">0</div><div class="kpi-label">features</div><div class="kpi-sub">0.0 / year</div></div><div class="kpi"><div class="kpi-value">0</div><div class="kpi-label">fixes</div><div class="kpi-sub">0.00 per feature</div></div><div class="kpi"><div class="kpi-value">0</div><div class="kpi-label">top feature fixes</div></div><div class="kpi"><div class="kpi-value">0.00</div><div class="kpi-label">peak rolling fixes/features</div><div class="kpi-sub">1-month trailing window</div></div><div class="kpi"><div class="kpi-value">0</div><div class="kpi-label">fixes w/o target</div><div class="kpi-sub">fix commits attributed to no feature</div></div></div>
+
+<section>
+<h2>Features over time</h2>
+<div class="note">Features per month created (bars, left axis) and cumulative
+features in existence (line, right axis). A feature is an LLM-classified
+coherent unit of change; features can span several commits or appear across
+multiple features from one commit.</div>
+<div class="chartbox"><div class="legend"><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#9ece6a"></span> new features / month<span style="display:inline-block;width:12px;height:2px;background:#bb9af7"></span> features in total (right scale)</div><svg viewBox="0 0 920 300" role="img" style="width:100%"><rect width="920" height="300" fill="#161a26" rx="8"/><line x1="56" y1="260.0" x2="844" y2="260.0" stroke="#28314a" stroke-width="1"/><text x="48" y="263.5" class="tick" text-anchor="end">0</text><text x="852" y="263.5" class="tick" fill="#bb9af7">0</text><line x1="56" y1="201.0" x2="844" y2="201.0" stroke="#28314a" stroke-width="1"/><text x="48" y="204.5" class="tick" text-anchor="end">0.25</text><text x="852" y="204.5" class="tick" fill="#bb9af7">0.25</text><line x1="56" y1="142.0" x2="844" y2="142.0" stroke="#28314a" stroke-width="1"/><text x="48" y="145.5" class="tick" text-anchor="end">0.5</text><text x="852" y="145.5" class="tick" fill="#bb9af7">0.5</text><line x1="56" y1="83.0" x2="844" y2="83.0" stroke="#28314a" stroke-width="1"/><text x="48" y="86.5" class="tick" text-anchor="end">0.75</text><text x="852" y="86.5" class="tick" fill="#bb9af7">0.75</text><line x1="56" y1="24.0" x2="844" y2="24.0" stroke="#28314a" stroke-width="1"/><text x="48" y="27.5" class="tick" text-anchor="end">1</text><text x="852" y="27.5" class="tick" fill="#bb9af7">1</text><polyline points="450.0,260.0" fill="none" stroke="#bb9af7" stroke-width="2"/><circle cx="450.0" cy="260.0" r="2.6" fill="#bb9af7"><title>2026-10: 0 features in total</title></circle><text x="450.0" y="284" class="tick" text-anchor="middle">2026-10</text></svg></div>
+</section>
+
+<section>
+<h2>fixes / feature — trailing 1-month window</h2>
+<div class="note">Each point: all fix commits that fall in the trailing 30 days,
+divided by the number of distinct features those fixes reach through the
+lineage closure (a feature counts once however many fixes touch it). Sampled
+every 7 days, with a final sample at the latest commit date.</div>
+<div class="chartbox"><svg viewBox="0 0 920 300" style="width:100%"><rect width="920" height="300" fill="#161a26" rx="8"/><text x="460.0" y="150.0" text-anchor="middle" class="tick">no data yet</text></svg></div>
+</section>
+
+<section>
+<h2>Ranking — features with most fixes</h2>
+<div class="note">Fixes reach a feature through the lineage closure
+(fix-of-a-fix counts towards the original feature); each fix is counted once
+per feature it reaches. The table covers all 0 features.</div>
+<svg viewBox="0 0 920 30" style="width:100%"><rect width="920" height="30" fill="#161a26" rx="8"/></svg>
+<table><thead><tr><th class='num'>#</th><th>Feature</th><th class='num'>Created</th><th class='num'>Fixes</th><th class='num'>Churn (lines)</th><th class='num'>Live lines</th><th>First commit</th></tr></thead><tbody></tbody></table>
+</section>
+
+
+
+<section>
+<h2>Other gathered data</h2>
+
+<h2 style="margin-top:18px;font-size:14px">Commit verdict mix</h2>
+<div class="donut-row"><svg viewBox="0 0 180 180" style="width:168px;height:168px"><text x="90" y="87" text-anchor="middle" class="donut-total">1</text><text x="90" y="105" text-anchor="middle" class="tick">commits</text></svg><div></div></div>
+<div class="note">Every Target-branch commit got one verdict (feature · fix ·
+refactor · revert · cleanup); the single verdict drives all feature metrics.
+0% of commits define or
+extend the feature set, 0% are
+fixes, 0.0%
+refactor/revert/cleanup (non-feature work).</div>
+
+<h2 style="margin-top:18px;font-size:14px">Commit volume</h2>
+<div class="chartbox"><div class="legend"><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#73daca"></span> commits / month<span style="display:inline-block;width:12px;height:2px;background:#f7768e"></span> fixes / month (right scale)</div><svg viewBox="0 0 920 300" role="img" style="width:100%"><rect width="920" height="300" fill="#161a26" rx="8"/><line x1="56" y1="260.0" x2="844" y2="260.0" stroke="#28314a" stroke-width="1"/><text x="48" y="263.5" class="tick" text-anchor="end">0</text><text x="852" y="263.5" class="tick" fill="#f7768e">0</text><line x1="56" y1="201.0" x2="844" y2="201.0" stroke="#28314a" stroke-width="1"/><text x="48" y="204.5" class="tick" text-anchor="end">4.32</text><text x="852" y="204.5" class="tick" fill="#f7768e">0.25</text><line x1="56" y1="142.0" x2="844" y2="142.0" stroke="#28314a" stroke-width="1"/><text x="48" y="145.5" class="tick" text-anchor="end">8.64</text><text x="852" y="145.5" class="tick" fill="#f7768e">0.5</text><line x1="56" y1="83.0" x2="844" y2="83.0" stroke="#28314a" stroke-width="1"/><text x="48" y="86.5" class="tick" text-anchor="end">12.96</text><text x="852" y="86.5" class="tick" fill="#f7768e">0.75</text><line x1="56" y1="24.0" x2="844" y2="24.0" stroke="#28314a" stroke-width="1"/><text x="48" y="27.5" class="tick" text-anchor="end">17.28</text><text x="852" y="27.5" class="tick" fill="#f7768e">1</text><rect x="197.8" y="41.5" width="504.3" height="218.5" rx="3" fill="#73daca" opacity="0.9"><title>2026-10: 16 commits / month</title></rect><polyline points="450.0,260.0" fill="none" stroke="#f7768e" stroke-width="2"/><circle cx="450.0" cy="260.0" r="2.6" fill="#f7768e"><title>2026-10: 0 fixes / month</title></circle><text x="450.0" y="284" class="tick" text-anchor="middle">2026-10</text></svg></div>
+
+<h2 style="margin-top:18px;font-size:14px">Top features by churn (lines changed)</h2>
+<table><thead><tr><th class='num'>#</th><th>Feature</th><th class='num'>Churn (lines)</th></tr></thead><tbody></tbody></table>
+
+<div class="foot">
+<strong>Methodology.</strong> Walk: first-parent walk of the Target branch (<code>t3/f2c63abe</code>); squash-merge work appears once. Verdicts: rolling
+LLM session via the opencode CLI (<code></code>), one JSON verdict
+per commit. Fixes: blame evidence at the first parent
+(<code>git blame -w -C --first-parent</code>, ≥1 lines). Lineage:
+<code>fixes_features</code> transitive closure — a fix of a fix is attributed to
+every feature in its chain. Running 1-month window: fix commits in trailing
+window ÷ distinct features those fixes reach. Generated by <code>skill-stats</code> from
+<code>/tmp/opencode/scratch2.db</code>.
+<div class="muted">t3-f2c63abe <span class='muted'>(t3/f2c63abe)</span> — </div>
+</div>
+</body></html>
