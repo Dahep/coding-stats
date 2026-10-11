@@ -17,7 +17,13 @@ build-backend = "hatchling.build"
 packages = ["src/skill_stats"]
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.14", "mypy>=1.19", "matplotlib>=3.10"]
+dev = [
+    "pytest>=8",
+    "ruff>=0.14",
+    "mypy>=1.19",
+    "matplotlib>=3.10",
+    "pyyaml>=6.0.3",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
