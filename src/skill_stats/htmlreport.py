@@ -329,48 +329,66 @@ def _segments(vals: list[float | None]) -> list[list[tuple[int, float]]]:
     return segs
 
 
-def _live_size_section(conn: sqlite3.Connection, unattributed: int | None, complete: bool) -> str:
-    """Feature size over time from feature_line_samples; empty (graceful
-    omission) when the live-lines stage has not produced samples yet. While
-    the backfill is incomplete (backfill_state), absent samples render as gaps
-    — zero-filling would present unknown history as measurements."""
+def _size_series(
+    conn: sqlite3.Connection,
+) -> (
+    tuple[
+        list[str],
+        list[tuple[str, list[float | None], str]],
+        tuple[str, list[float | None], str],
+    ]
+    | None
+):
+    """(labels, top-8 feature series, total) for the size-over-time chart;
+    None when no samples exist. Union-correct: a sample joins its feature's
+    OWN repository's commit — (repo_id, sha) — so fork-shared shas never
+    double-count; the axis is chronological (committed_at, sha) because
+    per-repo walk indexes overlap across a union; and each feature's line
+    spans only ITS OWN sample dates — a missing sample is a gap, never an
+    invented zero (staggered sampling differs per repo)."""
     rows = conn.execute(
         """SELECT s.at_commit_sha sha, s.feature_id fid, s.live_lines n, c.committed_at d
-           FROM feature_line_samples s JOIN commits c ON c.sha = s.at_commit_sha
-           ORDER BY c.walk_index"""
+           FROM feature_line_samples s
+           JOIN features f ON f.id = s.feature_id
+           JOIN commits c ON c.sha = s.at_commit_sha AND c.repo_id = f.repo_id"""
     ).fetchall()
     if not rows:
-        return ""
-    order: list[tuple[str, str]] = []
-    totals: dict[str, float] = {}
-    per: dict[str, dict[str, float]] = {}
+        return None
+    points = sorted({(str(r["d"]), str(r["sha"])) for r in rows})
+    per: dict[str, dict[tuple[str, str], float]] = {}
+    totals: dict[tuple[str, str], float] = {}
     for r in rows:
-        sha = str(r["sha"])
-        if sha not in totals:
-            order.append((sha, str(r["d"])[:10]))
-            totals[sha] = 0.0
-        totals[sha] += float(r["n"])
-        per.setdefault(str(r["fid"]), {})[sha] = float(r["n"])
+        pt = (str(r["d"]), str(r["sha"]))
+        totals[pt] = totals.get(pt, 0.0) + float(r["n"])
+        per.setdefault(str(r["fid"]), {})[pt] = float(r["n"])
     top = conn.execute(
         "SELECT id, title FROM features ORDER BY live_lines DESC, id LIMIT 8"
     ).fetchall()
-    labels = [lbl for _, lbl in order]
-
-    def values_for(fid: str) -> list[float | None]:
-        # complete history: a defined-but-empty feature measures 0;
-        # incomplete: absent samples are unknown -> gaps, never zeros
-        per_f = per.get(fid, {})
-        return [(per_f.get(sha, 0.0) if complete else per_f.get(sha)) for sha, _ in order]
-
+    labels = [d[:10] for d, _sha in points]
     series = [
-        (f"#{f['id']} {f['title']}", values_for(str(f["id"])), _LIVE_COLORS[i % len(_LIVE_COLORS)])
+        (
+            f"#{f['id']} {f['title']}",
+            [per.get(str(f["id"]), {}).get(pt) for pt in points],
+            _LIVE_COLORS[i % len(_LIVE_COLORS)],
+        )
         for i, f in enumerate(top)
     ]
     total: tuple[str, list[float | None], str] = (
         "total attributed lines",
-        [totals[sha] for sha, _ in order],
+        [totals.get(pt, 0.0) for pt in points],
         C["muted"],
     )
+    return labels, series, total
+
+
+def _live_size_section(conn: sqlite3.Connection, unattributed: int | None, complete: bool) -> str:
+    """Feature size over time; empty (graceful omission) when the live-lines
+    stage has not produced samples yet. Incomplete backfill (backfill_state)
+    is said out loud — the curves already render gaps instead of zeros."""
+    sized = _size_series(conn)
+    if sized is None:
+        return ""
+    labels, series, total = sized
     note = (
         "Every line at the Target-branch tip is owned by exactly one commit; commit "
         "lines accrue to the features the commit defines or touches, and fix lines "
@@ -481,21 +499,31 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
     repo = str(settings.get("repo", ""))
     model = str(settings.get("model", ""))
     min_lines = int(settings.get("min_target_lines", 1))
-    url = _repo_url(repo)
-    branch = str(settings.get("branch", "main"))
+    fallback_url = _repo_url(repo)  # machine DBs: resolve via settings.repo's origin
+    clone_urls = {
+        str(r["fid"]): str(r["url"] or "")
+        for r in conn.execute(
+            "SELECT f.id fid, rp.clone_url url FROM features f"
+            " JOIN repositories rp ON rp.id = f.repo_id"
+        )
+    }
     n_repos = repo_count(conn)
     multi = n_repos > 1
+    branch = str(settings.get("branch", "main")) if repo else ""
     if multi:
         repo_name = f"{n_repos} repos"  # org mode branding
         branch_tag = ""
+        branch = ""  # no single-branch claim over many repositories
     elif repo:
         repo_name = repo.rstrip("/").split("/")[-1] or repo
         branch_tag = f" <span class='muted'>({_esc(branch)})</span>"
     else:
-        # union of one: brand by Repository key slug
+        # union of one: brand by Repository key slug and its Target branch
         slugs = [str(r["slug"]) for r in conn.execute("SELECT slug FROM repositories ORDER BY id")]
         repo_name = slugs[0] if slugs else ""
-        branch_tag = f" <span class='muted'>({_esc(branch)})</span>"
+        row = conn.execute("SELECT branch FROM repositories ORDER BY id LIMIT 1").fetchone()
+        branch = str(row["branch"] or "") if row else ""
+        branch_tag = f" <span class='muted'>({_esc(branch)})</span>" if branch else ""
     repos = feature_repos(conn) if multi else {}
 
     tl = features_timeline(conn)
@@ -580,9 +608,10 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
 
     rank_rows = []
     for i, r in enumerate(ranking, 1):
+        link_url = clone_urls.get(r.fid) or fallback_url  # per-feature repository
         link = (
-            f'<a href="{html.escape(url, quote=True)}/commit/{r.sha}">{r.sha[:7]}</a>'
-            if url and r.sha
+            f'<a href="{html.escape(link_url, quote=True)}/commit/{r.sha}">{r.sha[:7]}</a>'
+            if link_url and r.sha
             else (_esc(r.sha[:7]) if r.sha else "—")
         )
         rank_rows.append(
@@ -624,6 +653,11 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
 
     who = f"{_esc(repo_name)}{branch_tag} — {_esc(model)}"
     target_label = _esc(repo or repo_name)
+    walk_note = (
+        f"first-parent walk of the Target branch (<code>{_esc(branch)}</code>)"
+        if branch
+        else "first-parent walk of each Target branch"  # multi-repo: no single claim
+    )
     other_pct = percent(
         snap.verdict_counts.get("revert", 0)
         + snap.verdict_counts.get("cleanup", 0)
@@ -690,8 +724,7 @@ refactor/revert/cleanup (non-feature work).</div>
 {churn_table}
 
 <div class="foot">
-<strong>Methodology.</strong> Walk: first-parent walk of the Target branch
-(<code>{_esc(branch)}</code>); squash-merge work appears once. Verdicts: rolling
+<strong>Methodology.</strong> Walk: {walk_note}; squash-merge work appears once. Verdicts: rolling
 LLM session via the opencode CLI (<code>{_esc(model)}</code>), one JSON verdict
 per commit. Fixes: blame evidence at the first parent
 (<code>git blame -w -C --first-parent</code>, ≥{min_lines} lines). Lineage:

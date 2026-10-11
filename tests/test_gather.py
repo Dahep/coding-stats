@@ -23,11 +23,15 @@ class Scripted:
         return self.replies.pop(0) if self.replies else '{"k":"cleanup","why":"w"}'
 
 
-def _updated_repo(tmp_path, name, files, replies, branch="main", no_classify=False) -> Path:
+def _updated_repo(
+    tmp_path, name, files, replies, branch="main", no_classify=False, origin=None
+) -> Path:
     """A scratch repo whose artifact was written by a real update run."""
     repo = tmp_path / name
     repo.mkdir(parents=True)
     run(repo, "init", "-q", "-b", branch)
+    if origin:
+        run(repo, "remote", "add", "origin", origin)
     run(repo, "config", "user.name", "T")
     run(repo, "config", "user.email", "t@t.io")
     run(repo, "config", "commit.gpgsign", "false")
@@ -426,3 +430,144 @@ def test_gather_malformed_artifact_clean_error(tmp_path):
         main(["gather", "--db", str(union), str(repo)])
     assert "alpha-repo" in str(excinfo.value)
     assert not union.exists()
+
+
+# ------------------------- union chart, links, and branding correctness -----
+
+
+def _crafted_union(path):
+    """Union DB with two repositories sharing one SHA (a fork) and staggered
+    sample points — crafted directly in the union shape."""
+    from skill_stats.db import connect
+
+    conn = connect(path)
+    conn.executescript(
+        """
+        INSERT INTO repositories (id, repo_key, slug, branch, clone_url, added_at)
+          VALUES (1, 'local:a@main', 'a', 'main', NULL, ''),
+                 (2, 'local:b@main', 'b', 'dev', NULL, '');
+        INSERT INTO commits (id, repo_id, sha, tree_sha, committed_at, author_name, title,
+                             message, walk_index, kind, diff, added_lines, deleted_lines,
+                             churn_lines)
+          VALUES (1, 1, 'x40', 't', '2026-01-01T00:00:00Z', 't', 'one', 'm', 1,
+                  'normal', '', 1, 0, 1),
+                 (2, 2, 'x40', 't', '2026-01-01T00:00:00Z', 't', 'one', 'm', 1,
+                  'normal', '', 1, 0, 1),
+                 (3, 1, 'y40', 't', '2026-01-02T00:00:00Z', 't', 'two', 'm', 2,
+                  'normal', '', 1, 0, 1),
+                 (4, 2, 'z40', 't', '2026-01-03T00:00:00Z', 't', 'three', 'm', 2,
+                  'normal', '', 1, 0, 1);
+        INSERT INTO features (id, title, about, title_history_json, created_at, repo_id, live_lines)
+          VALUES ('a-1', 'alpha', '', '[]', '2026-01-01T00:00:00Z', 1, 8),
+                 ('b-1', 'beta', '', '[]', '2026-01-01T00:00:00Z', 2, 4);
+        INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines)
+          VALUES ('a-1', 'x40', 5), ('b-1', 'x40', 7),
+                 ('a-1', 'y40', 8), ('b-1', 'z40', 4);
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def test_union_chart_repo_scoped_totals_and_staggered_lines(tmp_path):
+    from skill_stats.htmlreport import _size_series
+
+    conn = _crafted_union(tmp_path / "union.db")
+    labels, series, total = _size_series(conn)
+    assert total[1] == [12.0, 8.0, 4.0]  # fork-shared SHA counted once per row, not doubled
+    assert dict((name, vals) for name, vals, _c in series)["#a-1 alpha"] == [5.0, 8.0, None]
+    assert dict((name, vals) for name, vals, _c in series)["#b-1 beta"] == [7.0, None, 4.0]
+    # each line spans only its OWN sample dates (staggered sampling invents
+    # no zeros); the axis is chronological (committed_at)
+    assert labels == ["2026-01-01", "2026-01-02", "2026-01-03"]
+    conn.close()
+
+
+def test_union_chart_single_feature_regression(tmp_path):
+    from skill_stats.htmlreport import _size_series
+
+    conn = _crafted_union(tmp_path / "union.db")
+    conn.execute("DELETE FROM feature_line_samples WHERE feature_id = 'b-1'")
+    conn.execute("DELETE FROM features WHERE id = 'b-1'")
+    conn.commit()
+    labels, series, total = _size_series(conn)
+    assert [vals for _n, vals, _c in series] == [[5.0, 8.0]]
+    assert total[1] == [5.0, 8.0]  # points with no remaining rows vanish
+    assert labels == ["2026-01-01", "2026-01-02"]
+    conn.close()
+
+
+def test_union_report_links_by_feature_repository(tmp_path):
+    a = _updated_repo(
+        tmp_path,
+        "alpha-repo",
+        [("feature one", {"a.txt": "a1\n"})],
+        ['{"k":"new","title":"one","about":"x","why":"y"}'],
+        origin="git@github.com:dahep/alpha.git",
+    )
+    b = _updated_repo(
+        tmp_path,
+        "beta-repo",
+        [("feature two", {"b.txt": "b1\n"})],
+        ['{"k":"new","title":"two","about":"x","why":"y"}'],
+        origin="https://github.com/beta-org/beta-repo.git",
+    )
+    union = tmp_path / "union.db"
+    main(["gather", "--db", str(union), str(a), str(b)])
+    conn = _connect(union)
+    from skill_stats import htmlreport
+
+    page = htmlreport.build(conn)
+    conn.close()
+    assert "/dahep/alpha/commit/" in page  # per-feature link domains
+    assert "/beta-org/beta-repo/commit/" in page
+
+
+def test_machine_db_link_falls_back_to_settings_repo(tmp_path):
+    repo = _updated_repo(
+        tmp_path,
+        "alpha-repo",
+        [("feature one", {"a.txt": "a1\n"})],
+        ['{"k":"new","title":"one","about":"x","why":"y"}'],
+    )
+    # the DB row is a shim (no clone_url) but settings.repo's origin resolves
+    run(repo, "remote", "add", "origin", "git@github.com:dahep/alpha.git")
+    db_path = tmp_path / "alpha-repo.db"
+    conn = _connect(db_path)
+    from skill_stats import htmlreport
+
+    page = htmlreport.build(conn)
+    conn.close()
+    assert "/dahep/alpha/commit/" in page  # fallback via settings.repo path
+
+
+def test_union_branch_branding(tmp_path):
+    a = _updated_repo(
+        tmp_path,
+        "alpha-repo",
+        [("feature one", {"a.txt": "a1\n"})],
+        ['{"k":"new","title":"one","about":"x","why":"y"}'],
+        branch="dev",
+    )
+    union = tmp_path / "union.db"
+    main(["gather", "--db", str(union), str(a)])
+    conn = _connect(union)
+    from skill_stats import htmlreport
+
+    page = htmlreport.build(conn)
+    conn.close()
+    assert "(dev)" in page  # the lone repo's Target branch, not a 'main' default
+    assert "(main)" not in page
+
+    b = _updated_repo(
+        tmp_path,
+        "beta-repo",
+        [("feature two", {"b.txt": "b1\n"})],
+        ['{"k":"new","title":"two","about":"x","why":"y"}'],
+        branch="release",
+    )
+    main(["gather", "--db", str(union), str(a), str(b)])
+    conn = _connect(union)
+    page = htmlreport.build(conn)
+    conn.close()
+    assert "(dev)" not in page and "(release)" not in page and "(main)" not in page
