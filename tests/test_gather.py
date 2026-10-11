@@ -571,3 +571,107 @@ def test_union_branch_branding(tmp_path):
     page = htmlreport.build(conn)
     conn.close()
     assert "(dev)" not in page and "(release)" not in page and "(main)" not in page
+
+
+# ------------------------------------ canonical backfill of shim-keyed rows --
+
+
+def test_gather_adopts_canonical_key_for_shim_artifact(tmp_path):
+    # artifact produced WITHOUT origin -> shim key; the checkout resolves a
+    # canonical identity at gather time -> the union adopts it and rewrites
+    # feature-id prefixes (local numbers preserved)
+    repo = _updated_repo(
+        tmp_path,
+        "dotfiles",
+        [("feature one", {"a.txt": "a1\n"})],
+        ['{"k":"new","title":"one","about":"x","why":"y"}'],
+    )
+    art = repo / ".skill-stats" / "skill-stats.sql"
+    before = art.read_bytes()
+    run(repo, "remote", "add", "origin", "git@github.com:dahep/dotfiles.git")
+    union = tmp_path / "union.db"
+    main(["gather", "--db", str(union), str(repo)])
+    repos = _rows(union, "SELECT repo_key, slug, clone_url FROM repositories")
+    assert repos == [
+        {
+            "repo_key": "https://github.com/dahep/dotfiles@main",
+            "slug": "dahep-dotfiles",
+            "clone_url": "https://github.com/dahep/dotfiles",
+        }
+    ]
+    assert [f["id"] for f in _rows(union, "SELECT id FROM features ORDER BY id")] == [
+        "dahep-dotfiles-1"
+    ]
+    assert art.read_bytes() == before  # union-only normalization: store untouched
+    from skill_stats import htmlreport
+
+    assert "dahep-dotfiles-1" in htmlreport.build(_connect(union))
+
+
+def test_gather_keeps_shim_when_no_origin_resolves(tmp_path):
+    repo = _updated_repo(
+        tmp_path,
+        "dotfiles",
+        [("feature one", {"a.txt": "a1\n"})],
+        ['{"k":"new","title":"one","about":"x","why":"y"}'],
+    )
+    union = tmp_path / "union.db"
+    main(["gather", "--db", str(union), str(repo)])
+    assert _rows(union, "SELECT repo_key, slug FROM repositories") == [
+        {"repo_key": "local:dotfiles@main", "slug": "dotfiles"}
+    ]
+    # an explicit artifact file has no checkout context: stays shim-keyed too
+    union2 = tmp_path / "union2.db"
+    main(["gather", "--db", str(union2), str(repo / ".skill-stats" / "skill-stats.sql")])
+    assert _rows(union2, "SELECT repo_key, slug FROM repositories") == [
+        {"repo_key": "local:dotfiles@main", "slug": "dotfiles"}
+    ]
+
+
+def test_gather_aliases_shim_and_canonical_artifacts_of_one_repo(tmp_path):
+    import shutil
+    import unittest.mock as mock
+
+    repo1 = _updated_repo(
+        tmp_path,
+        "dotfiles",
+        [("feature one", {"a.txt": "a1\n"}), ("feature two", {"b.txt": "b1\n"})],
+        [
+            '{"k":"new","title":"one","about":"x","why":"y"}',
+            '{"k":"new","title":"two","about":"x","why":"y"}',
+        ],
+    )  # shim-keyed artifact, range = two commits
+    repo2 = tmp_path / "dotfiles-clone"
+    shutil.copytree(repo1, repo2)
+    commit_files(repo2, "feature three", {"c.txt": "c1\n"})
+    for r in (repo1, repo2):
+        run(r, "remote", "add", "origin", "git@github.com:dahep/dotfiles.git")
+    db2 = str(tmp_path / "dotfiles-clone.db")
+    main(["init", str(repo2), "--db", db2])  # canonical: origin resolves now
+    with mock.patch(
+        "skill_stats.cli.Session",
+        lambda model, sid=None: Scripted(
+            [
+                '{"k":"new","title":"one","about":"x","why":"y"}',
+                '{"k":"new","title":"two","about":"x","why":"y"}',
+                '{"k":"new","title":"three","about":"x","why":"y"}',
+            ]
+        ),
+    ):
+        main(["update", "--db", db2, "--no-detect", "--no-lineage", "--no-report"])
+
+    union = tmp_path / "union.db"
+    main(["gather", "--db", str(union), str(repo1), str(repo2)])
+    # one key: the shim artifact aliased into the canonical identity
+    assert len(_rows(union, "SELECT * FROM repositories")) == 1
+    assert _rows(union, "SELECT repo_key FROM repositories")[0]["repo_key"] == (
+        "https://github.com/dahep/dotfiles@main"
+    )
+    # overlapping rows resolved by last-ingest-wins: three commits, three ids
+    assert _rows(union, "SELECT COUNT(*) c FROM commits")[0]["c"] == 3
+    assert [f["id"] for f in _rows(union, "SELECT id FROM features ORDER BY id")] == [
+        "dahep-dotfiles-1",
+        "dahep-dotfiles-2",
+        "dahep-dotfiles-3",
+    ]
+    assert len(_rows(union, "SELECT * FROM union_artifacts")) == 1

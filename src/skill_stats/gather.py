@@ -29,11 +29,12 @@ as the LEAST complete constituent (see metrics.sampling_complete).
 """
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import artifact, db
+from . import artifact, db, identity
 
 STORE_REL = ".skill-stats/skill-stats.sql"
 
@@ -68,6 +69,7 @@ class _Ingest:
     header: artifact.ArtifactHeader
     key: str
     slug: str
+    clone_url: str | None
     backfill_state: str
     unattributed_lines: int
     model: str
@@ -137,18 +139,66 @@ def _load(source: Path) -> _Ingest:
             f"{source}: inconsistent artifact (header says {header.repository_key!r},"
             f" rows say {key!r})"
         )
+    slug = str(repo_row["slug"])
+    clone_url = str(repo_row["clone_url"]) if repo_row["clone_url"] else None
+    if source.is_dir():
+        # Canonical backfill (wave-4 obligation): when the checkout resolves a
+        # canonical identity — for shim-keyed artifacts always (the shim is a
+        # placeholder, the key header and row agree per the check above and
+        # gather recalibrates to canonical here), and for canonical-keyed
+        # artifacts when they already match it (seeded rows can carry mixed
+        # shim-era prefixes). Feature-id prefixes follow the canonical slug
+        # (local numbers preserved, walk-order-stable) so shim- and
+        # canonical-produced artifacts of one repo alias into ONE key with
+        # consistent ids. The artifact file on disk is never touched:
+        # union-only normalization.
+        canon = identity.normalize_clone_url(identity.origin_url(source) or "")
+        if canon:
+            branch = str(repo_row["branch"] or "")
+            canon_key = identity.repo_key(canon, branch)
+            if key.startswith("local:") or key == canon_key:
+                canon_slug = identity.slug_from_clone_url(canon)
+                _reprefix_features(rows, canon_slug)
+                key, slug, clone_url = canon_key, canon_slug, canon
     return _Ingest(
         source=source,
         data=data,
         header=header,
         key=key,
-        slug=str(repo_row["slug"]),
+        slug=slug,
+        clone_url=clone_url,
         backfill_state=_setting_text(rows, "backfill_state", "{}"),
         unattributed_lines=_as_int(_setting_json(rows, "unattributed_lines", 0)),
         model=str(_setting_json(rows, "model", "")),
         min_target_lines=_as_int(_setting_json(rows, "min_target_lines", 1)),
         rows=rows,
     )
+
+
+def _reprefix_features(rows: sqlite3.Connection, new_slug: str) -> None:
+    """Re-prefix every feature id of the ingested rows to {new_slug}-{n}
+    (local numbers preserved) across features, commits_features,
+    fixes_features and feature_line_samples."""
+    pat = re.compile(r"^(.+)-(\d+)$")
+
+    def rewrite(value: str) -> str:
+        m = pat.match(value)
+        return f"{new_slug}-{m.group(2)}" if m else value
+
+    for old_id in [str(r["id"]) for r in rows.execute("SELECT id FROM features")]:
+        new_id = rewrite(old_id)
+        if new_id != old_id:
+            rows.execute("UPDATE features SET id = ? WHERE id = ?", (new_id, old_id))
+    for table, col in (
+        ("commits_features", "feature_id"),
+        ("fixes_features", "feature_id"),
+        ("feature_line_samples", "feature_id"),
+    ):
+        for r in rows.execute(f"SELECT DISTINCT {col} v FROM {table}"):
+            old_val = str(r["v"])
+            new_val = rewrite(old_val)
+            if new_val != old_val:
+                rows.execute(f"UPDATE {table} SET {col} = ? WHERE {col} = ?", (new_val, old_val))
 
 
 def _as_int(value: object) -> int:
@@ -338,7 +388,7 @@ def _insert_repo(conn: sqlite3.Connection, item: _Ingest, repo_id: int) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO repositories (id, repo_key, slug, branch, clone_url, added_at)"
         " VALUES (?, ?, ?, ?, ?, ?)",
-        (repo_id, item.key, item.slug, row["branch"], row["clone_url"], row["added_at"]),
+        (repo_id, item.key, item.slug, row["branch"], item.clone_url, row["added_at"]),
     )
 
 
