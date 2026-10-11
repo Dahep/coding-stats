@@ -41,6 +41,13 @@ See `DESIGN.md` (decisions) and `CONTEXT.md` (domain language).
    the workflow, usable locally) lands the artifact-update commit: no-op
    updates push nothing, superseded runs abandon neutrally, everything else
    commits as `skill-stats[bot]` and pushes with `GITHUB_TOKEN`.
+8. `gather` — `skill-stats gather --db union.db <repo|artifact>...` ingests
+   N artifacts into a union DB keyed by Repository key. Ingest verifies each
+   artifact first, is idempotent per key (identical artifact = no-op, a newer
+   one last-wins), and refuses when distinct keys share a URL-derived slug
+   (one repo on two Target branches — never renames ids). The union is
+   structurally single-repo: `report --db union.db` reads it unchanged, with
+   REPO columns appearing only when it covers more than one repository.
 
 ## Usage
 
@@ -55,6 +62,7 @@ uv run skill-stats report  --db ~/.skill-stats/skill-stats.db --json --charts
 uv run skill-stats update  --db ~/.skill-stats/skill-stats.db   # verify->walk->...->serialize
 uv run skill-stats ci init [--branch main] [--no-push] [--upgrade]   # in the target repo
 uv run skill-stats ci land --branch main                             # landing verb
+uv run skill-stats gather --db union.db ~/dotfiles ~/.config-repo     # union of artifacts
 ```
 
 `classify` shells out to the `opencode` CLI (`opencode run --format json`,
@@ -65,7 +73,6 @@ replies are stored as verdict `unknown` and excluded from metrics.
 
 ## Not built yet (per DESIGN.md)
 
-- Gather / union DB org-wide reports.
 - opencode-history import (schema is settled, built later).
 - Plugin-logged skill metrics (ADR-0002: going-forward only).
 
