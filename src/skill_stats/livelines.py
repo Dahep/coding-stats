@@ -204,10 +204,22 @@ def _line_counts_at(repo_dir: Path, sha: str) -> tuple[Counter[str], int]:
     """(introducing commit -> line count, unblamable lines) at a commit.
     --first-parent matches the walk's first-parent semantics: lines brought in
     by side-branch commits (absent from the DB) attribute to the merge commit
-    the walk includes, instead of going unattributed."""
+    the walk includes, instead of going unattributed.
+
+    Binary accounting matches the walk's numstat semantics exactly:
+    NUL-containing blobs are binary to git (numstat reports '-', churn is
+    never counted) and are skipped here entirely — their bytes are content,
+    not lines, and must not surface as fake unattributed lines. Weird-text
+    blobs (high bytes, no NUL) are text to git: they count in walked churn,
+    so blame attributes them normally (porcelain decoded with 'replace' —
+    record metadata is ASCII; content bytes don't affect sha records)."""
     counts: Counter[str] = Counter()
     unattributed = 0
-    for path in _files_at(repo_dir, sha):
+    entries = _files_at(repo_dir, sha)
+    binaries = _binary_blobs(repo_dir, {blob for _, blob in entries})
+    for path, blob in entries:
+        if blob in binaries:
+            continue  # binary to git: neither walked churn nor live lines
         try:
             proc = subprocess.run(
                 [
@@ -226,43 +238,73 @@ def _line_counts_at(repo_dir: Path, sha: str) -> tuple[Counter[str], int]:
                 check=True,
                 capture_output=True,
             )
-            text = proc.stdout.decode("utf-8")
+            text = proc.stdout.decode("utf-8", "replace")
         except subprocess.CalledProcessError:
             unattributed += _blob_line_count(repo_dir, sha, path)  # blame failure
-            continue
-        except UnicodeDecodeError:
-            # text blame never applies: the file is non-UTF-8 (binary — vendored
-            # archives, fonts, images). Binary content is unblamable by design:
-            # its blob line count surfaces as unattributed, like failed blame.
-            unattributed += _blob_line_count(repo_dir, sha, path)
             continue
         for blamed in _porcelain_shas(text):
             counts[blamed] += 1
     return counts, unattributed
 
 
-def _files_at(repo_dir: Path, sha: str) -> list[str]:
-    """Tracked paths at a commit, skipping store paths and submodule gitlinks.
-    Uses raw NUL-delimited ``ls-tree -z`` names: text output C-quotes special
-    spellings, which would both break blame lookups and let quoted store
-    paths slip past the exclusion check."""
+def _binary_blobs(repo_dir: Path, blobs: set[bytes]) -> set[bytes]:
+    """Blob shas whose head 8000 bytes contain a NUL — git's own binary
+    verdict (the same heuristic `numstat` uses to report '-'). One streaming
+    cat-file batch pass; per-blob cost is bounded by the head-cap read even
+    for multi-MB blobs."""
+    if not blobs:
+        return set()
+    NUL_HEAD = 8000  # bytes; git's binary heuristic window
+    found: set[bytes] = set()
+    proc = subprocess.Popen(
+        ["git", "-C", str(repo_dir), "cat-file", "--batch"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdin and proc.stdout
+        for blob in blobs:
+            proc.stdin.write(blob + b"\n")
+            proc.stdin.flush()
+            header = proc.stdout.readline()  # "<oid> (blob|missing) <size>"
+            parts = header.split()
+            if len(parts) < 3 or parts[1] == b"missing":
+                continue
+            size = int(parts[2])
+            head = proc.stdout.read(min(size, NUL_HEAD))
+            proc.stdout.read(size - len(head) + 1)  # trailing NL after content
+            if b"\0" in head:
+                found.add(blob)
+    finally:
+        if proc.stdin:
+            proc.stdin.close()
+        proc.wait()
+    return found
+
+
+def _files_at(repo_dir: Path, sha: str) -> list[tuple[str, bytes]]:
+    """Tracked (path, blob-sha) pairs at a commit, skipping store paths and
+    submodule gitlinks. Uses raw NUL-delimited ``ls-tree -z`` names: text
+    output C-quotes special spellings, which would both break blame
+    lookups and let quoted store paths slip past the exclusion check."""
     proc = subprocess.run(
         ["git", "-C", str(repo_dir), "ls-tree", "-r", "-z", sha],
         capture_output=True,
         check=True,
     )
-    paths = []
+    pairs = []
     for entry in proc.stdout.split(b"\0"):
         if not entry:
             continue
         meta, _, name = entry.partition(b"\t")
-        if meta.split()[0] == b"160000":
+        mode_type_sha = meta.split()
+        if mode_type_sha[0] == b"160000":
             continue  # gitlinks: blame never descends into submodule content
         path = _decode_name(name)
         if is_store_path(path):
             continue
-        paths.append(path)
-    return paths
+        pairs.append((path, mode_type_sha[2]))
+    return pairs
 
 
 def _decode_name(raw: bytes) -> str:

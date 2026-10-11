@@ -142,14 +142,16 @@ def test_update_live_lines_is_idempotent(repo, tmp_path):
 
 
 def test_binary_files_never_crash_blame(repo, tmp_path):
-    """Dotfiles history carries vendored binaries (fonts, archives): a blame
-    sweep must treat non-UTF-8 content as unattributed, not crash the whole
-    walk on a strict UTF-8 decode (0x89 of a physical file)."""
+    """Vendored content exercises both git content classes and both must stay
+    consistent with walked churn accounting: NUL-containing blobs are binary
+    to git (numstat '-', so churn is not counted) and are skipped in
+    live-lines too — their bytes must never surface as fake unattributed
+    lines; weird-text blobs (high bytes, no NUL) count everywhere."""
     h1 = commit_files(repo, "feature a", {"f.txt": "a1\na2\n"})
-    binary = repo / "logo.png"
-    binary.write_bytes(b"PNG\r\n\x89 binary \xb5mas content\n")
+    (repo / "nul.bin").write_bytes(b"ZIP\x00 binary \xb5 content\n")  # NUL → git binary
+    (repo / "high.txt").write_bytes(b"text with \x89 high \xb5 utf-8 break\n")  # no NUL → text
     run(repo, "add", "-A")
-    run(repo, "commit", "-m", "vendor binary")
+    run(repo, "commit", "-q", "-m", "vendor content")
     h2 = commit_files(repo, "feature b", {"g.txt": "b1\nb2\nb3\nb4\n"})
     conn = make_db(tmp_path / "l.db", repo)
     walk(repo, conn, "main")
@@ -162,9 +164,22 @@ def test_binary_files_never_crash_blame(repo, tmp_path):
     conn.commit()
 
     counts, unattributed = _line_counts_at(repo, h2)
-    # the binary blob's content lines end in the unattributed bucket
-    assert unattributed > 0
-    assert "logo.png" not in counts  # bytes never attributed like lines
+    # no blob bytes surface as fake unattributed lines
+    assert unattributed == 0
+    # fresh text + high-byte text attribute normally
+    counts_shas = set(counts)
+    tip_blames = {
+        _porcelain_shas(
+            subprocess.run(
+                ["git", "-C", str(repo), "blame", "-w", "-C", "--porcelain", h2, "--", p],
+                check=True,
+                capture_output=True,
+            ).stdout.decode("utf-8", "replace")
+        )[0]
+        for p in ("f.txt", "g.txt", "high.txt")
+    }
+    for sha in tip_blames:
+        assert sha in counts_shas
 
 
 def test_sample_points_full_then_capped():
