@@ -23,10 +23,19 @@ class Scripted:
         return self.replies.pop(0) if self.replies else '{"k":"cleanup","why":"w"}'
 
 
-def _updated_repo(
-    tmp_path, name, files, replies, branch="main", no_classify=False, origin=None
+def _repo_with_artifact(
+    tmp_path,
+    name,
+    files,
+    replies,
+    branch="main",
+    no_classify=False,
+    origin=None,
+    fail_after=None,
 ) -> Path:
-    """A scratch repo whose artifact was written by a real update run."""
+    """Shared scratch-repo factory: builds the repo and runs a real update to
+    produce its artifact. `fail_after` makes the classifier raise after N
+    sends (the Q13 backlog case); `no_classify` skips classification."""
     repo = tmp_path / name
     repo.mkdir(parents=True)
     run(repo, "init", "-q", "-b", branch)
@@ -41,7 +50,16 @@ def _updated_repo(
     main(["init", str(repo), "--branch", branch, "--db", db_path])
     import unittest.mock as mock
 
-    with mock.patch("skill_stats.cli.Session", lambda model, sid=None: Scripted(list(replies))):
+    sent: list[str] = []
+
+    class Session(Scripted):
+        def send(self, message):
+            if fail_after is not None and len(sent) >= fail_after:
+                raise RuntimeError("opencode CLI failed")
+            sent.append(message)
+            return super().send(message)
+
+    with mock.patch("skill_stats.cli.Session", lambda model, sid=None: Session(list(replies))):
         flags = ["--no-detect", "--no-lineage", "--no-report"]
         if no_classify:
             flags.append("--no-classify")
@@ -57,14 +75,24 @@ def _rows(db_path, sql):
     return out
 
 
+def _canonical(db_path, table, exclude=()):
+    """Ordered canonical projection for determinism comparisons (a fixed
+    ORDER BY — unordered SELECT * would only compare as sets)."""
+    rows = _rows(db_path, f"SELECT * FROM {table} ORDER BY rowid")
+    for r in rows:
+        for key in exclude:
+            r.pop(key, None)
+    return rows
+
+
 def test_gather_unions_two_repos_deterministically(tmp_path, monkeypatch):
-    a = _updated_repo(
+    a = _repo_with_artifact(
         tmp_path,
         "alpha-repo",
         [("feature one", {"a.txt": "a1\na2\n"})],
         ['{"k":"new","title":"alpha module","about":"x","why":"y"}'],
     )
-    b = _updated_repo(
+    b = _repo_with_artifact(
         tmp_path,
         "beta-repo",
         [("feature two", {"b.txt": "b1\n"})],
@@ -91,10 +119,14 @@ def test_gather_unions_two_repos_deterministically(tmp_path, monkeypatch):
         assert len(m["artifact_sha256"]) == 64
         assert m["covered_through"] and m["backfill_state"]
 
-    # determinism: two fresh unions from the same sources carry identical
-    # rows AND identical id assignment
+    # determinism: two fresh unions of the same artifacts carry identical
+    # rows AND identical id assignment (ordered canonical projection). The
+    # second union crosses source TYPES for the same artifacts (explicit file
+    # vs checkout dir): rows match exactly except union_artifacts.source_path
+    # — intentional provenance of where each artifact was read from, which
+    # differs by construction and is excluded on that basis.
     union2 = tmp_path / "union2.db"
-    main(["gather", "--db", str(union2), str(a), str(b / ".skill-stats" / "skill-stats.sql")])
+    main(["gather", "--db", str(union2), str(a / ".skill-stats" / "skill-stats.sql"), str(b)])
     for table in (
         "repositories",
         "commits",
@@ -107,20 +139,18 @@ def test_gather_unions_two_repos_deterministically(tmp_path, monkeypatch):
         "feature_line_samples",
         "union_artifacts",
     ):
-        assert _rows(union, f"SELECT * FROM {table}") == _rows(union2, f"SELECT * FROM {table}"), (
-            table
-        )
+        exclude = ("source_path",) if table == "union_artifacts" else ()
+        assert _canonical(union, table, exclude) == _canonical(union2, table, exclude), table
 
     # re-gather into the same union: idempotent no-op (same rows, same ids)
     main(["gather", "--db", str(union), str(a), str(b)])
     for table in ("repositories", "commits", "features", "union_artifacts"):
-        assert _rows(union, f"SELECT * FROM {table}") == _rows(union2, f"SELECT * FROM {table}"), (
-            table
-        )
+        exclude = ("source_path",) if table == "union_artifacts" else ()
+        assert _canonical(union, table, exclude) == _canonical(union2, table, exclude), table
 
 
 def test_gather_upserts_newer_artifact_of_same_key(tmp_path):
-    repo = _updated_repo(
+    repo = _repo_with_artifact(
         tmp_path,
         "solo-repo",
         [("feature one", {"a.txt": "a1\n"}), ("feature two", {"b.txt": "b1\n"})],
@@ -155,13 +185,13 @@ def test_gather_upserts_newer_artifact_of_same_key(tmp_path):
 
 
 def test_gather_refuses_slug_collision(tmp_path):
-    a = _updated_repo(
+    a = _repo_with_artifact(
         tmp_path / "x",
         "dotfiles",
         [("feature one", {"a.txt": "a1\n"})],
         ['{"k":"new","title":"one","about":"x","why":"y"}'],
     )
-    b = _updated_repo(
+    b = _repo_with_artifact(
         tmp_path / "y",
         "dotfiles",
         [("feature two", {"b.txt": "b1\n"})],
@@ -178,7 +208,7 @@ def test_gather_refuses_slug_collision(tmp_path):
 
 
 def test_gather_refuses_non_verifying_artifact(tmp_path):
-    a = _updated_repo(
+    a = _repo_with_artifact(
         tmp_path,
         "alpha-repo",
         [("feature one", {"a.txt": "a1\n"})],
@@ -195,7 +225,7 @@ def test_gather_refuses_non_verifying_artifact(tmp_path):
 
 
 def test_gather_decodes_hdr_non_ascii_key(tmp_path):
-    repo = _updated_repo(
+    repo = _repo_with_artifact(
         tmp_path,
         "café-repo",
         [("feature one", {"a.txt": "a1\n"})],
@@ -218,43 +248,14 @@ def _connect(path):
 # ------------------------------- backfill merge rule + org report surface ---
 
 
-def _classifying_repo(tmp_path, name, files, replies, fail_after=None):
-    """update run whose classifier raises after N successful sends (Q13
-    backlog semantics: the failing commit stays pending)."""
-    import unittest.mock as mock
-
-    repo = tmp_path / name
-    repo.mkdir(parents=True)
-    run(repo, "init", "-q", "-b", "main")
-    run(repo, "config", "user.name", "T")
-    run(repo, "config", "user.email", "t@t.io")
-    run(repo, "config", "commit.gpgsign", "false")
-    for msg, content in files:
-        commit_files(repo, msg, content)
-    db_path = str(tmp_path / f"{name}.db")
-    main(["init", str(repo), "--db", db_path])
-    sent = []
-
-    class Flaky(Scripted):
-        def send(self, message):
-            if fail_after is not None and len(sent) >= fail_after:
-                raise RuntimeError("opencode CLI failed")
-            sent.append(message)
-            return super().send(message)
-
-    with mock.patch("skill_stats.cli.Session", lambda model, sid=None: Flaky(list(replies))):
-        main(["update", "--db", db_path, "--no-detect", "--no-lineage", "--no-report"])
-    return repo, db_path
-
-
 def test_union_report_repo_column_and_org_branding(tmp_path):
-    a = _updated_repo(
+    a = _repo_with_artifact(
         tmp_path,
         "alpha-repo",
         [("feature one", {"a.txt": "a1\na2\n"})],
         ['{"k":"new","title":"alpha module","about":"x","why":"y"}'],
     )
-    b = _updated_repo(
+    b = _repo_with_artifact(
         tmp_path,
         "beta-repo",
         [("feature two", {"b.txt": "b1\n"})],
@@ -277,7 +278,7 @@ def test_union_report_repo_column_and_org_branding(tmp_path):
 
 
 def test_single_repo_report_renders_unchanged(tmp_path):
-    a = _updated_repo(
+    a = _repo_with_artifact(
         tmp_path,
         "alpha-repo",
         [("feature one", {"a.txt": "a1\n"})],
@@ -303,14 +304,15 @@ def test_union_sampling_complete_is_least_complete(tmp_path):
 
     # backlog repo: one commit classified (feature exists -> samples), one
     # left pending -> its backfill_state stays "pending"
-    a, a_db = _classifying_repo(
+    a = _repo_with_artifact(
         tmp_path,
         "alpha-repo",
         [("feature one", {"a.txt": "a1\n"}), ("later", {"a.txt": "a1\na2\n"})],
         ['{"k":"new","title":"alpha module","about":"x","why":"y"}'],
         fail_after=1,
     )
-    b = _updated_repo(
+    a_db = str(tmp_path / "alpha-repo.db")
+    b = _repo_with_artifact(
         tmp_path,
         "beta-repo",
         [("feature two", {"b.txt": "b1\n"})],
@@ -345,7 +347,7 @@ def test_union_sampling_complete_is_least_complete(tmp_path):
 def test_preflight_rejects_multi_repository_artifact(tmp_path):
     from test_artifact_security import _rechecksum
 
-    repo = _updated_repo(
+    repo = _repo_with_artifact(
         tmp_path,
         "alpha-repo",
         [("feature one", {"a.txt": "a1\n"})],
@@ -369,7 +371,7 @@ def test_preflight_rejects_multi_repository_artifact(tmp_path):
 def test_preflight_rejects_stray_foreign_commit_id(tmp_path):
     from test_artifact_security import _rechecksum
 
-    repo = _updated_repo(
+    repo = _repo_with_artifact(
         tmp_path,
         "alpha-repo",
         [("feature one", {"a.txt": "a1\n"})],
@@ -390,7 +392,7 @@ def test_preflight_rejects_stray_foreign_commit_id(tmp_path):
 
 
 def test_gather_dest_not_skill_stats_database(tmp_path):
-    repo = _updated_repo(
+    repo = _repo_with_artifact(
         tmp_path,
         "alpha-repo",
         [("feature one", {"a.txt": "a1\n"})],
@@ -411,7 +413,7 @@ def test_gather_dest_not_skill_stats_database(tmp_path):
 def test_gather_malformed_artifact_clean_error(tmp_path):
     from test_artifact_security import _rechecksum
 
-    repo = _updated_repo(
+    repo = _repo_with_artifact(
         tmp_path,
         "alpha-repo",
         [("feature one", {"a.txt": "a1\n"})],
@@ -498,14 +500,14 @@ def test_union_chart_single_feature_regression(tmp_path):
 
 
 def test_union_report_links_by_feature_repository(tmp_path):
-    a = _updated_repo(
+    a = _repo_with_artifact(
         tmp_path,
         "alpha-repo",
         [("feature one", {"a.txt": "a1\n"})],
         ['{"k":"new","title":"one","about":"x","why":"y"}'],
         origin="git@github.com:dahep/alpha.git",
     )
-    b = _updated_repo(
+    b = _repo_with_artifact(
         tmp_path,
         "beta-repo",
         [("feature two", {"b.txt": "b1\n"})],
@@ -524,7 +526,7 @@ def test_union_report_links_by_feature_repository(tmp_path):
 
 
 def test_machine_db_link_falls_back_to_settings_repo(tmp_path):
-    repo = _updated_repo(
+    repo = _repo_with_artifact(
         tmp_path,
         "alpha-repo",
         [("feature one", {"a.txt": "a1\n"})],
@@ -542,7 +544,7 @@ def test_machine_db_link_falls_back_to_settings_repo(tmp_path):
 
 
 def test_union_branch_branding(tmp_path):
-    a = _updated_repo(
+    a = _repo_with_artifact(
         tmp_path,
         "alpha-repo",
         [("feature one", {"a.txt": "a1\n"})],
@@ -559,7 +561,7 @@ def test_union_branch_branding(tmp_path):
     assert "(dev)" in page  # the lone repo's Target branch, not a 'main' default
     assert "(main)" not in page
 
-    b = _updated_repo(
+    b = _repo_with_artifact(
         tmp_path,
         "beta-repo",
         [("feature two", {"b.txt": "b1\n"})],
@@ -580,7 +582,7 @@ def test_gather_adopts_canonical_key_for_shim_artifact(tmp_path):
     # artifact produced WITHOUT origin -> shim key; the checkout resolves a
     # canonical identity at gather time -> the union adopts it and rewrites
     # feature-id prefixes (local numbers preserved)
-    repo = _updated_repo(
+    repo = _repo_with_artifact(
         tmp_path,
         "dotfiles",
         [("feature one", {"a.txt": "a1\n"})],
@@ -609,7 +611,7 @@ def test_gather_adopts_canonical_key_for_shim_artifact(tmp_path):
 
 
 def test_gather_keeps_shim_when_no_origin_resolves(tmp_path):
-    repo = _updated_repo(
+    repo = _repo_with_artifact(
         tmp_path,
         "dotfiles",
         [("feature one", {"a.txt": "a1\n"})],
@@ -632,7 +634,7 @@ def test_gather_aliases_shim_and_canonical_artifacts_of_one_repo(tmp_path):
     import shutil
     import unittest.mock as mock
 
-    repo1 = _updated_repo(
+    repo1 = _repo_with_artifact(
         tmp_path,
         "dotfiles",
         [("feature one", {"a.txt": "a1\n"}), ("feature two", {"b.txt": "b1\n"})],

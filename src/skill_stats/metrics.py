@@ -170,7 +170,8 @@ def churn_per_feature(conn: sqlite3.Connection) -> list[tuple[str, str, int]]:
 
 
 class FeatureRank(NamedTuple):
-    """One feature with its attributed-fix count, churn and live lines."""
+    """One feature with its attributed-fix count, churn and live lines.
+    Internal API: callers unpack by name, never by position."""
 
     fid: str
     title: str
