@@ -319,6 +319,55 @@ def covered_through(conn: sqlite3.Connection) -> str:
     return str(row["sha"]) if row else ""
 
 
+@dataclass(frozen=True)
+class ArtifactHeader:
+    """The comment header of an artifact, values decoded (\\xNN inverse)."""
+
+    repository_key: str
+    covered_through: str
+    digest: str
+    schema_step: int
+
+
+_HEADER_FIELD_RE = re.compile(rb"^-- (repository-key|covered-through|schema-step): ?(.*)$", re.M)
+
+
+def unhdr(text: str) -> str:
+    """Decode _hdr's \\xNN escaping back to the original value (gather's
+    window into header values — repository keys can carry non-ASCII)."""
+    out = bytearray()
+    i = 0
+    while i < len(text):
+        if text.startswith("\\x", i) and i + 4 <= len(text):
+            hexpart = text[i + 2 : i + 4]
+            if len(hexpart) == 2 and all(c in "0123456789abcdefABCDEF" for c in hexpart):
+                out.append(int(hexpart, 16))
+                i += 4
+                continue
+        out.extend(text[i].encode("utf-8", "surrogateescape"))
+        i += 1
+    return out.decode("utf-8", "surrogateescape")
+
+
+def parse_header(data: bytes) -> ArtifactHeader | None:
+    """Parse (and decode) the artifact header; None when it is not a
+    skill-stats artifact."""
+    fields = {m.group(1).decode("ascii"): m.group(2) for m in _HEADER_FIELD_RE.finditer(data)}
+    digest_m = _DIGEST_LINE_RE.search(data)
+    if (
+        not {"repository-key", "covered-through", "schema-step"} <= set(fields)
+        or digest_m is None
+        or not digest_m.group(1)
+    ):
+        return None
+    return ArtifactHeader(
+        repository_key=unhdr(fields["repository-key"].decode("utf-8", "surrogateescape")),
+        covered_through=unhdr(fields["covered-through"].decode("utf-8", "surrogateescape")),
+        digest=digest_m.group(1).decode("ascii"),
+        schema_step=int(fields["schema-step"]),
+    )
+
+
 def materialize(conn: sqlite3.Connection, data: bytes) -> None:
     """Load artifact bytes into conn: the self-executing SQL plus the schema
     bookkeeping markers for its recorded schema step, so the result is a
