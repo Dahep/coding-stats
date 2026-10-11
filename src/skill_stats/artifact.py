@@ -265,7 +265,6 @@ def _hdr(value: object) -> str:
 
 
 def _head(conn: sqlite3.Connection) -> str:
-    covered = conn.execute("SELECT sha FROM commits ORDER BY walk_index DESC LIMIT 1").fetchone()
     key = conn.execute("SELECT repo_key FROM repositories ORDER BY id LIMIT 1").fetchone()
     step = conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '_schema_step_%'"
@@ -277,7 +276,7 @@ def _head(conn: sqlite3.Connection) -> str:
         f"-- format: {FORMAT}\n"
         f"-- schema-step: {_hdr(step_n)}\n"
         f"-- repository-key: {_hdr(key['repo_key'] if key else '')}\n"
-        f"-- covered-through: {_hdr(covered['sha'] if covered else '')}\n"
+        f"-- covered-through: {_hdr(covered_through(conn))}\n"
         f"{DIGEST_BLANK}\n"
     )
 
@@ -313,6 +312,28 @@ def write(conn: sqlite3.Connection, repo_dir: Path, with_report: bool = True) ->
     return path
 
 
+def covered_through(conn: sqlite3.Connection) -> str:
+    """The Coverage horizon: sha of the latest walked Target-branch commit
+    included in the snapshot ('' when the DB holds none)."""
+    row = conn.execute("SELECT sha FROM commits ORDER BY walk_index DESC LIMIT 1").fetchone()
+    return str(row["sha"]) if row else ""
+
+
+def materialize(conn: sqlite3.Connection, data: bytes) -> None:
+    """Load artifact bytes into conn: the self-executing SQL plus the schema
+    bookkeeping markers for its recorded schema step, so the result is a
+    working DB that db.connect accepts (and migrates forward when the artifact
+    predates later steps). The materialized DDL is the artifact's curated
+    shape: identical columns, no cross-table REFERENCES (the dump is
+    self-contained)."""
+    m = re.search(rb"^-- schema-step: (\d+)$", data, re.M)
+    step = int(m.group(1)) if m else 0
+    conn.executescript(data.decode("utf-8"))
+    for i in range(step + 1):
+        conn.execute(f"CREATE TABLE IF NOT EXISTS _schema_step_{i:04d} (ok)")
+    conn.commit()
+
+
 def digest_of(path: Path) -> str:
     """The stored Artifact digest's meaning: sha256 over the exact file bytes
     with the digest line's value blanked. Raises when the file carries no
@@ -332,6 +353,12 @@ def verify(path: Path) -> str | None:
         data = Path(path).read_bytes()
     except OSError as exc:
         return str(exc)
+    return verify_bytes(data)
+
+
+def verify_bytes(data: bytes) -> str | None:
+    """Digest verdict for raw artifact bytes (no file I/O) — used to vet
+    versions restored out of git history before trusting them."""
     parts = _digest_parts(data)
     if parts is None:
         return "no digest line"

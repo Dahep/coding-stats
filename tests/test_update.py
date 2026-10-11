@@ -121,7 +121,9 @@ def test_update_logs_digest_verdict_of_existing_artifact(tmp_path, repo, capsys,
     main(["update", "--db", db_path])
     out = capsys.readouterr().out
     assert re.search(r"artifact digest: MISMATCH", out)
-    # the rewrite supersedes the tampered file and verifies again
+    # no committed artifact version exists to anchor on -> full recompute,
+    # then a fresh version lands and verifies again
+    assert "FULL-RECOMPUTE" in out
     assert artifact.verify(art_path) is None
 
 
@@ -140,6 +142,7 @@ def test_update_supersedes_non_utf8_corrupted_artifact(tmp_path, repo, capsys, m
     main(["update", "--db", db_path])  # must continue, not abort
     out = capsys.readouterr().out
     assert "artifact digest: MISMATCH" in out
+    assert "FULL-RECOMPUTE" in out  # nothing committed to anchor on
     assert "artifact updated" in out
     assert artifact.verify(art_path) is None
 

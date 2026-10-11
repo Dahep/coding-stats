@@ -25,6 +25,22 @@ See `DESIGN.md` (decisions) and `CONTEXT.md` (domain language).
    (`--json`), matplotlib charts (`--charts`), and a self-contained HTML page
    (`--html [path]`: fix ranking, features-over-time, 1-month rolling
    fixes/feature, verdict mix, commit volume, churn).
+6. `update` — one orchestrating run: verify the artifact digest first (on
+   mismatch, partial recompute anchored at the newest self-verifying
+   committed artifact version, full recompute when none verifies), then
+   `walk → classify → detect → lineage → live-lines → report → serialize` +
+   digest + verify. Default `--db skill-stats.db` on a machine; CI runs pass
+   `--db .skill-stats/working.db` — the CI working DB is throwaway (runs are
+   stateless and the committed artifact is the store), so a fresh DB adopts
+   the checkout's git repo and seeds itself from the artifact. Classification
+   is best-effort: a backlog stays visible in the final line and reprocesses
+   on a later run.
+7. `ci` — `skill-stats ci init` writes `.github/workflows/skill-stats.yml`
+   (plus `.skill-stats/.gitignore` for the throwaway DB) idempotently,
+   refusing drifted files unless `--upgrade`; `skill-stats ci land` (called by
+   the workflow, usable locally) lands the artifact-update commit: no-op
+   updates push nothing, superseded runs abandon neutrally, everything else
+   commits as `skill-stats[bot]` and pushes with `GITHUB_TOKEN`.
 
 ## Usage
 
@@ -36,6 +52,9 @@ uv run skill-stats classify --db ~/.skill-stats/skill-stats.db [--limit N] [--fr
 uv run skill-stats detect  --db ~/.skill-stats/skill-stats.db
 uv run skill-stats lineage --db ~/.skill-stats/skill-stats.db
 uv run skill-stats report  --db ~/.skill-stats/skill-stats.db --json --charts
+uv run skill-stats update  --db ~/.skill-stats/skill-stats.db   # verify->walk->...->serialize
+uv run skill-stats ci init [--branch main] [--no-push] [--upgrade]   # in the target repo
+uv run skill-stats ci land --branch main                             # landing verb
 ```
 
 `classify` shells out to the `opencode` CLI (`opencode run --format json`,
@@ -46,9 +65,6 @@ replies are stored as verdict `unknown` and excluded from metrics.
 
 ## Not built yet (per DESIGN.md)
 
-- Artifact store (ADR-0003: committed `.skill-stats/` SQL snapshot + digest +
-  HTML report), `update` verb, exclusion filter, live-lines backfill, CI
-  scaffold, schema step 1 (repo-scoped ids).
 - Gather / union DB org-wide reports.
 - opencode-history import (schema is settled, built later).
 - Plugin-logged skill metrics (ADR-0002: going-forward only).

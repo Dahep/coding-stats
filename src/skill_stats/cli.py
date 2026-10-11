@@ -1,6 +1,7 @@
-"""CLI: uv run skill-stats {init,walk,classify,detect,lineage,report,update}. Requires the
+"""CLI: uv run skill-stats {init,walk,classify,detect,lineage,report,update,ci}. Requires the
 opencode CLI on PATH for classify (ADR-0001 rolling session). update is the
-orchestrating verb (ADR-0003 clause 7); the stage subcommands stay plumbing."""
+orchestrating verb (ADR-0003 clause 7); the stage subcommands stay plumbing;
+ci renders the workflow and lands artifact updates."""
 
 import argparse
 import json
@@ -9,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import db, gitwalk, identity
+from . import ci, db, gitwalk, identity
 from .classify import DEFAULT_MODEL, SESSION_DIR, Session, classify_pending
 from .lineage import close_lineage
 from .targets import annotate_all
@@ -80,6 +81,23 @@ def main(argv: list[str] | None = None) -> None:
     up.add_argument("--no-report", action="store_true", help="skip report.html regeneration")
     up.add_argument("--no-serialize", action="store_true", help="skip artifact write")
 
+    ci_grp = sub.add_parser("ci", help="CI scaffold: workflow rendering + artifact landing")
+    ci_sub = ci_grp.add_subparsers(dest="ci_cmd", required=True)
+    ci_init = ci_sub.add_parser(
+        "init", help="write .github/workflows/skill-stats.yml (idempotent, refuses drift)"
+    )
+    ci_init.add_argument("--branch", default=None, help="Target branch (default: current)")
+    ci_init.add_argument(
+        "--db", default=ci.DEFAULT_CI_DB, help="working DB the workflow runs update against"
+    )
+    ci_init.add_argument("--no-push", action="store_true", help="render without the landing step")
+    ci_init.add_argument("--upgrade", action="store_true", help="overwrite a drifted workflow")
+    ci_land = ci_sub.add_parser(
+        "land", help="land the artifact-update commit (Q15/Q17/Q18 rules; usable anywhere)"
+    )
+    ci_land.add_argument("--branch", default=None, help="Target branch (default: current)")
+    ci_land.add_argument("--remote", default="origin")
+
     args = parser.parse_args(argv)
 
     settings: dict[str, Any] = {}
@@ -101,6 +119,25 @@ def main(argv: list[str] | None = None) -> None:
             _set(conn, key, value)
         conn.close()
         print(f"initialized {db_path} for {repo} (branch {branch}, model {args.model})")
+        return
+
+    if args.cmd == "ci":
+        # git-side commands: act on the repository at the current directory,
+        # no working DB required
+        top = identity.toplevel()
+        if top is None:
+            sys.exit("not inside a git repository")
+        branch = args.branch or gitwalk.current_branch(top)
+        if args.ci_cmd == "init":
+            try:
+                for msg in ci.init(
+                    top, branch, db=args.db, push=not args.no_push, upgrade=args.upgrade
+                ):
+                    print(msg)
+            except ci.DriftError as exc:
+                sys.exit(f"error: {exc}")
+        else:
+            ci.report_landing(ci.commit_or_abandon(top, branch, args.remote))
         return
 
     conn = db.connect(Path(args.db))
@@ -156,8 +193,7 @@ def main(argv: list[str] | None = None) -> None:
             html_path = write_report(conn, args.html)
             print(f"wrote {html_path}")
     elif args.cmd == "update":
-        assert repo_dir is not None, "run init first"
-        _run_update(conn, repo_dir, settings, args)
+        conn = _run_update(conn, Path(args.db), args)
     conn.close()
 
 
@@ -172,26 +208,72 @@ def _pending_count(conn: sqlite3.Connection) -> int:
 
 
 def _run_update(
-    conn: sqlite3.Connection, repo_dir: Path, settings: dict[str, Any], args: argparse.Namespace
-) -> None:
+    conn: sqlite3.Connection, db_path: Path, args: argparse.Namespace
+) -> sqlite3.Connection:
     """One orchestrating run (ADR-0003 clause 7, Q11): verify the existing
     artifact first, then walk -> classify -> detect -> lineage -> live-lines ->
     report -> serialize + digest + verify. Deterministic stages always run;
     classification is best-effort — when it cannot run the walked backlog stays
     pending, is printed loudly, and reprocesses on a later successful update
-    (Q13). The exit code stays 0 with a backlog."""
-    from . import artifact, livelines
+    (Q13). The exit code stays 0 with a backlog.
+
+    On digest MISMATCH the run recovers per ADR-0003 clause 3 (partial
+    recompute anchored at the newest self-verifying committed artifact
+    version; full recompute when none verifies). A fresh/throwaway working DB
+    (CI runs are stateless — the artifact is the store) adopts the git repo at
+    the current directory and seeds itself from a verified artifact."""
+    import os as _os
+
+    from . import artifact, livelines, recovery
     from .htmlreport import write_report
 
-    branch = settings.get("branch") or None
+    settings = _settings(conn)
+    if "repo" in settings:
+        repo_dir = Path(str(settings["repo"]))
+    else:
+        top = identity.toplevel()
+        if top is None:
+            sys.exit(
+                "no repo recorded in the DB and the current directory is not a"
+                " git repository; run init first"
+            )
+        repo_dir = top
+        _set(conn, "repo", str(repo_dir))
+        settings["repo"] = str(repo_dir)
+    branch = str(settings.get("branch") or "") or (
+        _os.environ.get("GITHUB_REF_NAME") or gitwalk.current_branch(repo_dir)
+    )
+    if "branch" not in settings:
+        _set(conn, "branch", branch)
+        settings["branch"] = branch
+    identity.register_repository(conn, repo_dir, branch)
+
     store = repo_dir / ".skill-stats"
     art_path = store / "skill-stats.sql"
-
+    recovered = False
     if art_path.exists():
         err = artifact.verify(art_path)
-        # wave 3 adds the partial-recompute recovery; for now the verdict is
-        # loud and the rewrite below supersedes the (untrusted) file
-        print(f"artifact digest: {'ok' if err is None else 'MISMATCH (' + err + ')'}")
+        if err is None:
+            print("artifact digest: ok")
+            if not conn.execute("SELECT 1 FROM commits LIMIT 1").fetchone():
+                # fresh/throwaway working DB: the artifact is the store —
+                # continue from it instead of re-analyzing everything
+                conn = recovery.rebuild(db_path, art_path.read_bytes(), conn, repo_dir, branch)
+                settings = _settings(conn)
+                print("seeded working db from the artifact")
+        else:
+            print(f"artifact digest: MISMATCH ({err})")
+            rec, conn = recovery.recover(conn, db_path, repo_dir, branch)
+            settings = _settings(conn)
+            recovered = True
+            if rec.mode == "restored":
+                assert rec.anchor_sha is not None
+                print(f"partial recompute: anchored at artifact version {rec.anchor_sha[:12]}")
+            else:
+                print(
+                    "FULL-RECOMPUTE: no committed artifact version verifies;"
+                    " rebuilding from scratch"
+                )
     else:
         print("artifact: none yet (first run)")
 
@@ -245,6 +327,8 @@ def _run_update(
         path = artifact.write(conn, repo_dir, with_report=False)
         err = artifact.verify(path)
         print(f"wrote {path} (digest {'ok' if err is None else 'MISMATCH ' + str(err)})")
+        if recovered:
+            print(f"new coverage horizon: {artifact.covered_through(conn)[:12]}")
 
     total = conn.execute("SELECT COUNT(*) c FROM commits").fetchone()["c"]
     classified = conn.execute("SELECT COUNT(*) c FROM commit_verdicts").fetchone()["c"]
@@ -256,6 +340,7 @@ def _run_update(
             f"WARNING: {pending} commits unclassified — backlog; a later successful"
             " update reprocesses them"
         )
+    return conn
 
 
 if __name__ == "__main__":
