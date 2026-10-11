@@ -123,7 +123,11 @@ def _load(source: Path) -> _Ingest:
 
     rows = sqlite3.connect(":memory:")
     rows.row_factory = sqlite3.Row
-    artifact.materialize(rows, data)
+    try:
+        artifact.materialize(rows, data)
+    except artifact.MaterializeError as exc:
+        rows.close()
+        raise GatherError(f"{source}: {exc}") from exc
     repo_row = rows.execute("SELECT * FROM repositories ORDER BY id LIMIT 1").fetchone()
     if repo_row is None:
         raise GatherError(f"{source}: artifact carries no repository row")

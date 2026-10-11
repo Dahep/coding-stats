@@ -33,6 +33,7 @@ is fixed, and nothing wall-clock-dependent reaches the output.
 import hashlib
 import re
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -369,18 +370,103 @@ def parse_header(data: bytes) -> ArtifactHeader | None:
 
 
 def materialize(conn: sqlite3.Connection, data: bytes) -> None:
-    """Load artifact bytes into conn: the self-executing SQL plus the schema
-    bookkeeping markers for its recorded schema step, so the result is a
-    working DB that db.connect accepts (and migrates forward when the artifact
-    predates later steps). The materialized DDL is the artifact's curated
-    shape: identical columns, no cross-table REFERENCES (the dump is
-    self-contained)."""
+    """Replay artifact bytes into conn under an SQLite authorizer: ONLY the
+    curated shape is executable — CREATE TABLE of the known tables and INSERTs
+    into them (plus plain reads/transactions). ATTACH/DETACH, PRAGMAs, DML
+    beyond INSERT, and any other DDL are DENIED.
+
+    This is load-bearing: the artifact digest is an unkeyed checksum, so any
+    committer can recompute it — checksummed artifact bytes are DATA, never
+    code. Both ingest (gather) and recovery (anchor bytes from the artifact's
+    git history) replay through here. Schema bookkeeping is deliberately not
+    part of the replay: see stamp_schema_steps. Raises MaterializeError on
+    refusal or on a shape that does not match the curated columns."""
+    conn.set_authorizer(_artifact_authorizer())
+    try:
+        conn.executescript(data.decode("utf-8"))
+    except (sqlite3.Error, UnicodeDecodeError) as exc:
+        raise MaterializeError(f"artifact refused: {exc}") from exc
+    finally:
+        conn.set_authorizer(None)
+    _check_shape(conn)
+
+
+def stamp_schema_steps(conn: sqlite3.Connection, data: bytes) -> None:
+    """Mark the artifact's schema step as applied (db.connect bookkeeping).
+    Runs AFTER the guarded replay: bookkeeping tables are ours, not artifact
+    data, and the authorizer denies creating them."""
     m = re.search(rb"^-- schema-step: (\d+)$", data, re.M)
     step = int(m.group(1)) if m else 0
-    conn.executescript(data.decode("utf-8"))
     for i in range(step + 1):
         conn.execute(f"CREATE TABLE IF NOT EXISTS _schema_step_{i:04d} (ok)")
     conn.commit()
+
+
+KNOWN_TABLES: dict[str, tuple[str, ...]] = {t.name: t.columns for t in _TABLES}
+
+
+class MaterializeError(ValueError):
+    """Refused artifact replay: hostile statement or non-curated shape."""
+
+
+def _artifact_authorizer() -> Callable[[int, str | None, str | None, str | None, str | None], int]:
+    """The allowlist (small and complete): known-table CREATE/INSERT, plain
+    reads of known tables, SELECT and transactions. Everything else —
+    ATTACH/DETACH any database, PRAGMA, DELETE/UPDATE/DROP, triggers, views,
+    temp objects, functions — denies."""
+
+    def auth(
+        action: int,
+        arg1: str | None,
+        arg2: str | None,
+        dbname: str | None,
+        source: str | None,
+    ) -> int:
+        if action == sqlite3.SQLITE_CREATE_TABLE and arg1 in KNOWN_TABLES:
+            return sqlite3.SQLITE_OK
+        if action == sqlite3.SQLITE_INSERT and arg1 in KNOWN_TABLES:
+            return sqlite3.SQLITE_OK
+        if action == sqlite3.SQLITE_READ and arg1 in KNOWN_TABLES:
+            return sqlite3.SQLITE_OK
+        if (
+            action == sqlite3.SQLITE_CREATE_INDEX
+            and arg2 in KNOWN_TABLES
+            and (arg1 or "").startswith("sqlite_autoindex_")
+        ):
+            # implicit indexes of our CREATE TABLE PRIMARY KEY/UNIQUE
+            # constraints; explicit CREATE INDEX stays denied
+            return sqlite3.SQLITE_OK
+        if action in (
+            sqlite3.SQLITE_INSERT,
+            sqlite3.SQLITE_READ,
+            sqlite3.SQLITE_UPDATE,
+        ) and arg1 in ("sqlite_master", "sqlite_temp_master"):
+            # CREATE TABLE's own schema bookkeeping; direct sqlite_master
+            # writes are refused by SQLite itself (writable_schema is denied
+            # here), so this cannot mint new objects behind the allowlist
+            return sqlite3.SQLITE_OK
+        if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_TRANSACTION):
+            return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+
+    return auth
+
+
+def _check_shape(conn: sqlite3.Connection) -> None:
+    """Post-replay drift guard: the replay must have created every curated
+    table with exactly its curated columns (an attacker's CREATE TABLE name is
+    checked by the authorizer; its column list, here)."""
+    created = {
+        str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    for name, cols in KNOWN_TABLES.items():
+        if name not in created:
+            raise MaterializeError(f"artifact refused: missing table {name}")
+        actual = [str(r["name"]) for r in conn.execute(f"PRAGMA table_info({name})")]
+        if actual != list(cols):
+            raise MaterializeError(
+                f"artifact refused: table {name} has columns {actual}, expected {list(cols)}"
+            )
 
 
 def digest_of(path: Path) -> str:
