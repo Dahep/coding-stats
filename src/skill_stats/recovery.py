@@ -25,7 +25,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import artifact, db, identity
+from . import artifact, db, gitwalk, identity
 
 STORE_PATH = ".skill-stats/skill-stats.sql"
 
@@ -42,15 +42,21 @@ class Recovery:
     anchor_sha: str | None  # committed artifact version the rebuild anchors at
 
 
-def find_anchor(repo_dir: Path) -> tuple[str, bytes] | None:
-    """(commit sha, bytes) of the newest committed artifact version whose
-    embedded digest self-verifies; None when no committed version does."""
-    log = subprocess.run(
-        ["git", "-C", str(repo_dir), "log", "--format=%H", "--", STORE_PATH],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.split()
+def find_anchor(repo_dir: Path, branch: str) -> tuple[str, bytes] | None:
+    """(commit sha, bytes) of the newest committed artifact version on the
+    TARGET branch whose embedded digest self-verifies; None when no committed
+    version does. Scoped to `branch` on purpose: versions reachable only from
+    another ref (feature-branch artifact commits) must never anchor a restore
+    — their rows would make the Target walk look rewritten."""
+    try:
+        log = subprocess.run(
+            ["git", "-C", str(repo_dir), "log", branch, "--format=%H", "--", STORE_PATH],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+    except subprocess.CalledProcessError:
+        return None  # unknown ref: no anchor -> full recompute, the safe side
     for sha in log:  # newest first: the tampered latest version is skipped by verify
         proc = subprocess.run(
             ["git", "-C", str(repo_dir), "show", f"{sha}:{STORE_PATH}"],
@@ -67,7 +73,7 @@ def recover(
 ) -> tuple[Recovery, sqlite3.Connection]:
     """Rebuild the working DB after a digest MISMATCH. Returns the recovery
     verdict and a fresh connection to the rebuilt DB (the old one is closed)."""
-    anchor = find_anchor(repo_dir)
+    anchor = find_anchor(repo_dir, branch) if branch else None
     if anchor is not None:
         sha, data = anchor
         return Recovery("restored", sha), rebuild(db_path, data, conn, repo_dir, branch)
@@ -83,7 +89,8 @@ def rebuild(
 ) -> sqlite3.Connection:
     """Replace the working DB atomically with a fresh one: materialize `data`
     (artifact bytes) when given — restore/seed — or leave it empty for a full
-    recompute. Non-derived settings are carried over, and the repository is
+    recompute. Pending commits regain their real diffs from git (the artifact
+    stores ''), non-derived settings are carried over, and the repository is
     (re-)registered so identity rules stay enforced."""
     tmp_path = db_path.parent / (db_path.name + ".rebuild-tmp")
     _cleanup(tmp_path)
@@ -98,13 +105,41 @@ def rebuild(
     try:
         _carry_settings(old, fresh)
         identity.register_repository(fresh, repo_dir, branch)
+        if data is not None:
+            _rehydrate_diffs(fresh, repo_dir)
         fresh.commit()
     finally:
         fresh.close()
     old.close()
-    _cleanup(db_path)
-    os.replace(tmp_path, db_path)
+    try:
+        os.replace(tmp_path, db_path)  # atomic: the original stays until the swap
+    except OSError:
+        _cleanup(tmp_path)  # failed swap: the original DB is untouched
+        raise
+    _cleanup_sidecars(db_path)  # stale sidecars of the replaced DB, only now
     return db.connect(db_path)
+
+
+def _rehydrate_diffs(conn: sqlite3.Connection, repo_dir: Path) -> int:
+    """Refill commits.diff for PENDING commits (no verdict row) from git,
+    through the walk's own diff+strip path (store paths out, merge diffs vs
+    first parent). The artifact format stores '' for the machine-derivable
+    payload; without this, restored backlog would be classified against noise
+    (merges would even pass the empty-merge shortcut). Classified commits
+    keep '' — their diffs are already consumed."""
+    rows = conn.execute(
+        """SELECT c.id, c.sha FROM commits c LEFT JOIN commit_verdicts v
+           ON v.commit_id = c.id WHERE v.commit_id IS NULL"""
+    ).fetchall()
+    refilled = 0
+    for r in rows:
+        try:
+            stat = gitwalk.prepare_diff(gitwalk.diff_for(repo_dir, str(r["sha"])))
+        except subprocess.CalledProcessError:
+            continue  # sha not in git: the walk's resume check reports it loudly
+        conn.execute("UPDATE commits SET diff = ? WHERE id = ?", (stat.diff, r["id"]))
+        refilled += 1
+    return refilled
 
 
 def _carry_settings(old: sqlite3.Connection, new: sqlite3.Connection) -> None:
@@ -117,5 +152,10 @@ def _carry_settings(old: sqlite3.Connection, new: sqlite3.Connection) -> None:
 
 
 def _cleanup(db_path: Path) -> None:
-    for suffix in ("", "-wal", "-shm"):
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        Path(str(db_path) + suffix).unlink(missing_ok=True)
+
+
+def _cleanup_sidecars(db_path: Path) -> None:
+    for suffix in ("-wal", "-shm", "-journal"):
         Path(str(db_path) + suffix).unlink(missing_ok=True)
