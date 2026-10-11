@@ -16,10 +16,17 @@ _SCP_RE = re.compile(r"^(?:[^@/:]+@)?([^/:]+):(.+)$")
 _SLUG_RE = re.compile(r"[^a-z0-9._-]+")
 
 
-def normalize_clone_url(remote: str) -> str | None:
+def normalize_clone_url(remote: str, ssh_config: str | None = None) -> str | None:
     """Canonical https form of a clone URL: ssh spellings map to https, the
     trailing .git is stripped, the host is lowercased. Machine-local paths and
-    file:// URLs return None (never identity)."""
+    file:// URLs return None (never identity).
+
+    SSH config aliases are machine-local names (the same class as local
+    paths — ``git@github-personal:Dahep/dotfiles.git`` names a port/key
+    mapping in ~/.ssh/config, not a host): when ~/.ssh/config resolves the
+    host token to a DIFFERENT HostName, the remote is not canonicalizable —
+    None. Resolved-equal or unknown hosts canonicalize as before
+    (git@github.com:... keeps working); ssh_config injectable for tests."""
     url = (remote or "").strip()
     if not url:
         return None
@@ -29,11 +36,42 @@ def normalize_clone_url(remote: str) -> str | None:
             return None  # file:// and unknown schemes are not identity
         authority, _, path = rest.partition("/")
         host = authority.rpartition("@")[2]
+        if _ssh_alias_hostname(host, ssh_config):
+            return None
         return _https(host, path)
     m = _SCP_RE.match(url)  # scp-like ssh spelling: [user@]host:path
     if m:
-        return _https(m.group(1), m.group(2))
+        host = m.group(1)
+        if _ssh_alias_hostname(host, ssh_config):
+            return None
+        return _https(host, m.group(2))
     return None  # plain local path
+
+
+def _ssh_alias_hostname(host: str, ssh_config: str | None) -> bool:
+    """True when the machine's ~/.ssh/config resolves <host> as an alias to
+    a different HostName (``ssh -G`` is a pure config read: no connection).
+    Resolution failure or missing Host entries mean 'not an alias' — the
+    original spellings stay canonical."""
+    try:
+        argv = ["ssh", "-G", "--", host]
+        if ssh_config:
+            argv[1:1] = ["-F", ssh_config]
+        out = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if out.returncode != 0:
+        return False
+    for line in out.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        if key.strip() == "hostname":
+            return value.strip().lower() != host.lower()
+    return False
 
 
 def _https(host: str, path: str) -> str:

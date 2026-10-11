@@ -36,6 +36,59 @@ def test_normalize_clone_url_never_treats_local_paths_as_identity():
     assert normalize_clone_url("") is None
 
 
+def _tmp_ssh_config(aliases: dict[str, str]) -> str:
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as fh:
+        for alias, hostname in aliases.items():
+            fh.write(f"Host {alias}\n  HostName {hostname}\n")
+        return fh.name
+
+
+def test_alias_hosts_are_machine_local_never_identity():
+    """ADR identity clause: an SSH config alias is a machine-local NAME (a
+    remote port/key mapping), never identity — the same rule that keeps
+    machine-local paths out of the Repository key."""
+    cfg = _tmp_ssh_config({"github-personal": "ssh.github.com"})
+    try:
+        # the alias spelling that once leaked into a committed artifact key
+        assert normalize_clone_url("git@github-personal:Dahep/dotfiles.git", cfg) is None
+        assert normalize_clone_url("ssh://git@github-personal/Dahep/dotfiles.git", cfg) is None
+        # a real host inside the url survives, even with the same ssh config
+        assert normalize_clone_url("git@github.com:dahep/dotfiles.git", cfg) == (
+            "https://github.com/dahep/dotfiles"
+        )
+    finally:
+        import os
+
+        os.unlink(cfg)
+
+
+def test_alias_hostname_resolves_equal_is_canonical(tmp_path):
+    """An explicit HostName equal to the spelling is not an alias: IP-literal
+    or self-named hosts keep canonicalizing."""
+    cfg = _tmp_ssh_config({"1.2.3.4": "1.2.3.4"})
+    try:
+        assert normalize_clone_url("git@1.2.3.4:dahep/dotfiles.git", cfg) == (
+            "https://1.2.3.4/dahep/dotfiles"
+        )
+    finally:
+        import os
+
+        os.unlink(cfg)
+
+
+def test_ssh_config_hunt_is_never_fatal():
+    """A failing or missing ssh config lookup leaves canonicalization intact
+    (hostname resolution is hardening, not a hard dependency)."""
+    assert normalize_clone_url("git@github.com:dahep/dotfiles.git", "/nonexistent/ssh_config") == (
+        "https://github.com/dahep/dotfiles"
+    )
+    assert normalize_clone_url("git@github.com:dahep/dotfiles.git") == (
+        "https://github.com/dahep/dotfiles"
+    )
+
+
 def test_slug_and_key():
     assert slug_from_clone_url("https://github.com/dahep/dotfiles") == "dahep-dotfiles"
     assert local_identity("/home/tester/dotfiles") == ("local:dotfiles", "dotfiles")

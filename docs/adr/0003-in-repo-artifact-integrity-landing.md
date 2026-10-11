@@ -107,6 +107,18 @@ Decision, per grill rounds recorded in `docs/decisions-trail.tsv`:
      the run's `skill-stats-report` artifact, renames `report.html` to
      `index.html`, and deploys via `actions/deploy-pages` - a separate
      deployment, not a landing commit; history is never rewritten for Pages.
+   - **SSH-alias hosts are machine-local names, never identity.** An origin
+     spelled `git@github-personal:Dahep/dotfiles.git` names a port/key
+     mapping in the machine's ~/.ssh/config, not a host: normalize_clone_url
+     consults `ssh -G` (a pure config read) and, when the alias resolves to
+     a different HostName, returns None so the key falls back to the
+     documented local: shim — the same machine-local rule as local paths.
+     Real-host spellings (git@github.com:..., IP literals, resolved-equal
+     hosts) keep canonicalizing. Found in dogfooding: an alias-baked key
+     inside a committed artifact blocked CI's seeded working DB on the
+     identity refusal rule (run 38157341104) — genuine data under a
+     machine-local name can never relabel cleanly, which is exactly the
+     gate doing its job.
 
 ## Considered Options
 
