@@ -63,6 +63,22 @@ def _slug(text: str) -> str:
     return _SLUG_RE.sub("-", text.lower()).strip("-")
 
 
+def toplevel(start: Path | None = None) -> Path | None:
+    """The git repository containing `start` (default: the current directory),
+    or None outside any repository."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=str(start) if start else None,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return Path(out) if out else None
+
+
 def origin_url(repo: Path) -> str | None:
     """The repo's origin URL, or None when git cannot answer."""
     try:
