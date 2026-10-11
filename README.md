@@ -52,6 +52,12 @@ See `DESIGN.md` (decisions) and `CONTEXT.md` (domain language).
    structurally single-repo: `report --db union.db` reads it unchanged, with
    REPO columns appearing only when it covers more than one repository.
 
+## Live report (dogfooding)
+
+The tool analyzes this repository on every push to `main`; the report publishes
+to <https://dahep.github.io/skill-stats/> and the analysis artifact
+(`.skill-stats/`) commits back to `main` as `skill-stats[bot]`.
+
 ## Usage
 
 ```sh
