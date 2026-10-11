@@ -87,6 +87,27 @@ Decision, per grill rounds recorded in `docs/decisions-trail.tsv`:
    backlog is marked visible and reprocessed by a later successful run, never
    silently skipped.
 
+   Two tested refinements (2026-10-11, dogfooding on Dahep/skill-stats):
+
+   - **Tool install is git-pinned, not version-pinned.** The rendered
+     workflow installs the tool standalone
+     (`uv tool install 'skill-stats @ git+https://github.com/Dahep/skill-stats.git@<ref>'`),
+     where `<ref>` is the commit of the skill-stats checkout that rendered
+     the file (installed copies default to `main`; `--tool-ref` moves the
+     pin explicitly). A version pin was the original intent but the package
+     is not on PyPI, and a `uv tool install skill-stats==0.1.0` line fails
+     the run at the scaffold step. The git pin preserves the invariant
+     "install the engine that rendered the rules" and keeps `--upgrade`
+     meaningful (a re-render moves the commit pin).
+   - **Pages publishing is a `ci init --pages` opt-in** (the gate on
+     public/paid repos below is the user's choice of target; private
+     non-paid repos cannot enable Pages at all). The opt-in adds a
+     `deploy-pages` job (`pages: write`, `id-token: write`, scoped to that
+     job only; `needs: skill-stats`, `concurrency: pages`), which downloads
+     the run's `skill-stats-report` artifact, renames `report.html` to
+     `index.html`, and deploys via `actions/deploy-pages` - a separate
+     deployment, not a landing commit; history is never rewritten for Pages.
+
 ## Considered Options
 
 - **Metrics-only snapshot in `.skill-stats/`**: small and simple, but org

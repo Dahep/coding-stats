@@ -92,6 +92,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     ci_init.add_argument("--no-push", action="store_true", help="render without the landing step")
     ci_init.add_argument("--upgrade", action="store_true", help="overwrite a drifted workflow")
+    ci_init.add_argument("--pages", action="store_true", help="publish report.html to GitHub Pages")
+    ci_init.add_argument(
+        "--tool-ref",
+        default=None,
+        help="git ref to install the tool from (default: this checkout's commit)",
+    )
     ci_land = ci_sub.add_parser(
         "land", help="land the artifact-update commit (Q15/Q17/Q18 rules; usable anywhere)"
     )
@@ -137,7 +143,13 @@ def main(argv: list[str] | None = None) -> None:
         if args.ci_cmd == "init":
             try:
                 for msg in ci.init(
-                    top, branch, db=args.db, push=not args.no_push, upgrade=args.upgrade
+                    top,
+                    branch,
+                    db=args.db,
+                    push=not args.no_push,
+                    upgrade=args.upgrade,
+                    tool_ref=args.tool_ref,
+                    pages=args.pages,
                 ):
                     print(msg)
             except ci.DriftError as exc:

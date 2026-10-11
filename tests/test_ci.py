@@ -228,6 +228,13 @@ def _pyproject_version() -> str:
     return str(data["project"]["version"])
 
 
+def _pyproject_version() -> str:
+    import tomllib
+
+    data = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text("utf-8"))
+    return str(data["project"]["version"])
+
+
 def test_render_workflow_is_injection_safe_for_hostile_values():
     import re
 
@@ -264,15 +271,65 @@ def test_ci_init_validates_branch_ref_name(repo):
 def test_ci_workflow_installs_tool_standalone(repo):
     ci.init(repo, "main")
     text = (repo / ".github" / "workflows" / "skill-stats.yml").read_text("utf-8")
-    version = _pyproject_version()
+    sha = ci.own_commit()
+    spec = ci.install_spec(tool_ref=sha)
     # the target repo does not depend on skill-stats: install the tool
-    # standalone, pinned to the rendering version (upgrades re-render)
-    assert f'uv tool install "skill-stats=={version}"' in text
+    # standalone, pinned to the rendering checkout's commit (not PyPI — the
+    # package is not published; git install keeps upgrades re-render
+    # testable) — from bigger repos, --tool-ref moves the pin explicitly
+    assert f"uv tool install '{spec}'" in text
+    if sha:
+        assert sha in text
     assert "uv sync" not in text  # no target-dependency assumption
     assert "uv run skill-stats" not in text
     assert "skill-stats update --db" in text  # direct invocation
     # installer is best-effort: a failed download must not abort the run
     assert "continue-on-error: true" in text
+
+
+def test_ci_pages_job_is_opt_in(repo):
+    import yaml
+
+    ci.init(repo, "main")  # default: no Pages deployment is rendered
+    text = (repo / ".github" / "workflows" / "skill-stats.yml").read_text("utf-8")
+    assert "deploy-pages" not in text
+    assert "id-token" not in text
+
+    ci.init(repo, "main", pages=True, upgrade=True)  # opt-in re-render moves it in
+    doc = yaml.safe_load(
+        (repo / ".github" / "workflows" / "skill-stats.yml").read_text("utf-8")
+    )
+    job = doc["jobs"]["deploy-pages"]
+    # scoped permissions override the workflow default job-locally: the
+    # landing commit keeps contents: write, the pages job never gets it
+    assert job["needs"] == "skill-stats"
+    assert job["permissions"] == {"pages": "write", "id-token": "write"}
+    assert job["environment"]["name"] == "github-pages"
+    uses = [step["uses"] for step in job["steps"] if "uses" in step]
+    assert any(u.startswith("actions/deploy-pages@v") for u in uses)
+    assert any(u.startswith("actions/upload-pages-artifact@v") for u in uses)
+    assert doc["jobs"]["skill-stats"].get("permissions") is None
+
+
+def test_ci_pages_job_deploys_last_landed_report(repo):
+    import yaml
+
+    ci.init(repo, "main", pages=True)
+    text = (repo / ".github" / "workflows" / "skill-stats.yml").read_text("utf-8")
+    assert "actions/download-artifact@v4" in text
+    assert "mv site/report.html site/index.html" in text
+    doc = yaml.safe_load(text)
+    deploys = doc["jobs"]["deploy-pages"]
+    assert deploys["concurrency"]["group"] == "pages"
+    assert "- name: skill-stats-report" not in text  # no artifact name drift
+
+
+def test_ci_init_refuses_drift_unless_upgrade_pages(repo):
+    """--pages is itself part of the rendered content: flipping it without
+    --upgrade is drift and refuses, never silently halves the scaffold."""
+    ci.init(repo, "main")
+    with pytest.raises(ci.DriftError, match="--upgrade"):
+        ci.init(repo, "main", pages=True)
 
 
 def test_ci_init_drift_preflight_is_all_or_nothing(repo):

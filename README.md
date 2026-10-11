@@ -37,10 +37,13 @@ See `DESIGN.md` (decisions) and `CONTEXT.md` (domain language).
    on a later run.
 7. `ci` — `skill-stats ci init` writes `.github/workflows/skill-stats.yml`
    (plus `.skill-stats/.gitignore` for the throwaway DB) idempotently,
-   refusing drifted files unless `--upgrade`; `skill-stats ci land` (called by
-   the workflow, usable locally) lands the artifact-update commit: no-op
-   updates push nothing, superseded runs abandon neutrally, everything else
-   commits as `skill-stats[bot]` and pushes with `GITHUB_TOKEN`.
+   refusing drifted files unless `--upgrade`; `ci init --pages` adds a
+   deploy-pages job that publishes the run's report.html as the site root
+   (opt-in: Pages only works on public or paid repos); `skill-stats ci land`
+   (called by the workflow, usable locally) lands the artifact-update
+   commit: no-op updates push nothing, superseded runs abandon neutrally,
+   everything else commits as `skill-stats[bot]` and pushes with
+   `GITHUB_TOKEN`.
 8. `gather` — `skill-stats gather --db union.db <repo|artifact>...` ingests
    N artifacts into a union DB keyed by Repository key. Ingest verifies each
    artifact first, is idempotent per key (identical artifact = no-op, a newer
