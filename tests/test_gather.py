@@ -333,3 +333,96 @@ def test_union_sampling_complete_is_least_complete(tmp_path):
     page = htmlreport.build(conn)
     assert "sampling incomplete" not in page.lower()
     conn.close()
+
+
+# ------------------------- ownership preflight + input error boundaries -----
+
+
+def test_preflight_rejects_multi_repository_artifact(tmp_path):
+    from test_artifact_security import _rechecksum
+
+    repo = _updated_repo(
+        tmp_path,
+        "alpha-repo",
+        [("feature one", {"a.txt": "a1\n"})],
+        ['{"k":"new","title":"one","about":"x","why":"y"}'],
+    )
+    art = repo / ".skill-stats" / "skill-stats.sql"
+    stray = (
+        "\nINSERT INTO repositories (id, repo_key, slug, branch, clone_url, added_at)"
+        " VALUES (99, 'local:other@main', 'other', 'main', NULL, '');\n"
+    )
+    art.write_bytes(_rechecksum(art.read_bytes() + stray.encode()))
+    union = tmp_path / "union.db"
+    with pytest.raises(SystemExit) as excinfo:
+        main(["gather", "--db", str(union), str(repo)])
+    msg = str(excinfo.value)
+    assert "alpha-repo" in msg  # source named
+    assert "repositories" in msg and "1" in msg  # the anomaly named
+    assert not union.exists()
+
+
+def test_preflight_rejects_stray_foreign_commit_id(tmp_path):
+    from test_artifact_security import _rechecksum
+
+    repo = _updated_repo(
+        tmp_path,
+        "alpha-repo",
+        [("feature one", {"a.txt": "a1\n"})],
+        ['{"k":"new","title":"one","about":"x","why":"y"}'],
+    )
+    art = repo / ".skill-stats" / "skill-stats.sql"
+    stray = (
+        "\nINSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output,"
+        " model, run_id, classified_at) VALUES (999, 'fix', 'r', 'raw', 'm', NULL, 'd');\n"
+    )
+    art.write_bytes(_rechecksum(art.read_bytes() + stray.encode()))
+    union = tmp_path / "union.db"
+    with pytest.raises(SystemExit) as excinfo:
+        main(["gather", "--db", str(union), str(repo)])
+    msg = str(excinfo.value)
+    assert "commit_verdicts" in msg  # the stray edge named
+    assert not union.exists()
+
+
+def test_gather_dest_not_skill_stats_database(tmp_path):
+    repo = _updated_repo(
+        tmp_path,
+        "alpha-repo",
+        [("feature one", {"a.txt": "a1\n"})],
+        ['{"k":"new","title":"one","about":"x","why":"y"}'],
+    )
+    dest = tmp_path / "other.db"
+    conn = sqlite3.connect(dest)
+    conn.execute("CREATE TABLE other_tool(x)")
+    conn.commit()
+    conn.close()
+    with pytest.raises(SystemExit) as excinfo:
+        main(["gather", "--db", str(dest), str(repo)])
+    msg = str(excinfo.value)
+    assert str(dest) in msg  # destination named
+    assert "not a skill-stats database" in msg  # actionable hint
+
+
+def test_gather_malformed_artifact_clean_error(tmp_path):
+    from test_artifact_security import _rechecksum
+
+    repo = _updated_repo(
+        tmp_path,
+        "alpha-repo",
+        [("feature one", {"a.txt": "a1\n"})],
+        ['{"k":"new","title":"one","about":"x","why":"y"}'],
+    )
+    art = repo / ".skill-stats" / "skill-stats.sql"
+    art.write_bytes(_rechecksum(art.read_bytes() + b"\nINSERT INTO features (id\n"))
+    union = tmp_path / "union.db"
+    with pytest.raises(SystemExit) as excinfo:
+        main(["gather", "--db", str(union), str(repo)])
+    assert "alpha-repo" in str(excinfo.value)  # clean error naming the source
+    assert not union.exists()
+
+    art.write_bytes(b"")  # empty file
+    with pytest.raises(SystemExit) as excinfo:
+        main(["gather", "--db", str(union), str(repo)])
+    assert "alpha-repo" in str(excinfo.value)
+    assert not union.exists()

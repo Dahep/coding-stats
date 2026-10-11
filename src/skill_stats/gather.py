@@ -175,15 +175,20 @@ def _existing_keys(union_path: Path) -> dict[str, str]:
     exist yet — read-only peek so refusals never create the file)."""
     if not union_path.exists():
         return {}
-    conn = sqlite3.connect(union_path)
-    conn.row_factory = sqlite3.Row
     try:
-        return {
-            str(r["repo_key"]): str(r["slug"])
-            for r in conn.execute("SELECT repo_key, slug FROM repositories")
-        }
-    finally:
-        conn.close()
+        conn = sqlite3.connect(union_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            return {
+                str(r["repo_key"]): str(r["slug"])
+                for r in conn.execute("SELECT repo_key, slug FROM repositories")
+            }
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise GatherError(
+            f"{union_path}: not a skill-stats database (does it have skill-stats tables?): {exc}"
+        ) from exc
 
 
 def _refuse_slug_collisions(ingests: list[_Ingest], existing: dict[str, str]) -> None:

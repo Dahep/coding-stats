@@ -389,6 +389,7 @@ def materialize(conn: sqlite3.Connection, data: bytes) -> None:
     finally:
         conn.set_authorizer(None)
     _check_shape(conn)
+    _check_ownership(conn)
 
 
 def stamp_schema_steps(conn: sqlite3.Connection, data: bytes) -> None:
@@ -466,6 +467,60 @@ def _check_shape(conn: sqlite3.Connection) -> None:
         if actual != list(cols):
             raise MaterializeError(
                 f"artifact refused: table {name} has columns {actual}, expected {list(cols)}"
+            )
+
+
+def _check_ownership(conn: sqlite3.Connection) -> None:
+    """Defense in depth: an artifact is ONE repository's rows. Exactly one
+    repositories row, and every row in every table must belong to it — a
+    crafted artifact must not smuggle rows that relabel onto another repo
+    during ingest (the remap would silently adopt them)."""
+    repos = conn.execute("SELECT id FROM repositories ORDER BY id").fetchall()
+    if len(repos) != 1:
+        raise MaterializeError(
+            f"artifact refused: {len(repos)} repositories rows (expected exactly 1)"
+        )
+    rid = int(repos[0]["id"])
+    in_commits = "(SELECT id FROM commits)"
+    in_features = "(SELECT id FROM features)"
+    foreign = [
+        ("commits", f"SELECT COUNT(*) c FROM commits WHERE repo_id != {rid}"),
+        ("features", f"SELECT COUNT(*) c FROM features WHERE repo_id != {rid}"),
+        (
+            "commit_verdicts",
+            f"SELECT COUNT(*) c FROM commit_verdicts WHERE commit_id NOT IN {in_commits}",
+        ),
+        (
+            "commits_features",
+            f"SELECT COUNT(*) c FROM commits_features WHERE commit_id NOT IN {in_commits}"
+            f" OR feature_id NOT IN {in_features}",
+        ),
+        (
+            "fix_touches",
+            f"SELECT COUNT(*) c FROM fix_touches WHERE fix_commit_id NOT IN {in_commits}"
+            f" OR source_commit_id NOT IN {in_commits}",
+        ),
+        (
+            "fix_targets",
+            f"SELECT COUNT(*) c FROM fix_targets WHERE fix_commit_id NOT IN {in_commits}"
+            f" OR target_commit_id NOT IN {in_commits}",
+        ),
+        (
+            "fixes_features",
+            f"SELECT COUNT(*) c FROM fixes_features WHERE fix_commit_id NOT IN {in_commits}"
+            f" OR feature_id NOT IN {in_features}"
+            f" OR (via_fix_commit_id IS NOT NULL AND via_fix_commit_id NOT IN {in_commits})",
+        ),
+        (
+            "feature_line_samples",
+            f"SELECT COUNT(*) c FROM feature_line_samples WHERE feature_id NOT IN {in_features}",
+        ),
+    ]
+    for table, sql in foreign:
+        n = int(conn.execute(sql).fetchone()["c"])
+        if n:
+            raise MaterializeError(
+                f"artifact refused: {table} has {n} row(s) outside the artifact's repository"
             )
 
 
