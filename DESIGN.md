@@ -42,6 +42,16 @@ matplotlib scripts over SQL queries. Build git-only phase first.
   commits); canonical title locked, later titles kept as history. Incremental
   runs only classify new commits. Raw LLM verdicts stored per commit for
   auditability.
+- **Classification backend (ADR-0004)**: the ADR-0001 rolling session is one
+  implementation of a classify-protocol; a System One decision model (jev)
+  is the second: stateless, one choice question per commit (six verdicts)
+  plus optional Feature-citation question, rationale slot carries confidence
+  + probabilities instead of prose. Live dogfeed A/B on this repo (19
+  commits): 95% verdict-level agreement with the LLM session, zero
+  unparsable replies, ~81k input tokens (~$0.003 at list price), 17s
+  wall-clock; both disagreements arrived low-confidence (0.40/0.51), so a
+  confidence gate (escalate <0.7 to the LLM backend) would have caught both
+  at ~37% escalation volume.
 - **User metrics**: dropped for now (single human, 5 author-strings). Author
 - normalization is out of scope.
 

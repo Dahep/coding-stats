@@ -1,9 +1,14 @@
-"""Commit verdict classification via a rolling opencode CLI session.
+"""Commit verdict classification backends.
 
 Per ADR-0001: walk commits chronologically, ask "new Feature or existing one?",
 persist the Feature registry and the CLI session id in settings so runs are
 resumable and only new commits get classified. Exactly one verdict per commit
 drives metrics; blame evidence is a hint only.
+
+Two interchangeable backends produce the (Reply, raw text) pair per commit:
+the opencode rolling session (OpencodeBackend, ADR-0001) and one System One
+decision-model call per commit (skill_stats.systemone.SystemOneBackend,
+ADR-0004). classify_pending only knows the protocol.
 """
 
 import json
@@ -13,6 +18,7 @@ import sqlite3
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 DEFAULT_MODEL = "opencode/glm-5.3-flash"
 SESSION_DIR = Path("/tmp/opencode/skill-stats-classifier")
@@ -94,6 +100,48 @@ def parse_reply(text: str) -> Reply:
     if data.get("k") not in {"new", "existing", "fix", "refactor", "revert", "cleanup"}:
         raise ValueError(f"unknown k={data.get('k')!r}")
     return Reply(kind=data["k"], payload=data)
+
+
+class Backend(Protocol):
+    """Anything that produces one (Reply, raw) pair per walked commit. The
+    optional `session_id` property is the opencode rolling session's
+    resumability handle (settings key classify_session_id); stateless backends
+    return None."""
+
+    @property
+    def session_id(self) -> str | None: ...
+
+    def classify(self, conn: sqlite3.Connection, walk_index: int) -> tuple[Reply, str]: ...
+
+
+class OpencodeBackend:
+    """ADR-0001 rolling opencode CLI session: one commit per turn, one JSON
+    reply per turn, one repair turn when the reply doesn't parse. The
+    conversation (feature registry persisted in the session) is what makes
+    "new or existing?" work — see SystemOneBackend (ADR-0004) for the
+    stateless variant."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    @property
+    def session_id(self) -> str | None:
+        return self.session.session_id
+
+    def classify(self, conn: sqlite3.Connection, walk_index: int) -> tuple[Reply, str]:
+        msg = commit_prompt(conn, walk_index)
+        text = self.session.send(msg)
+        try:
+            return parse_reply(text), text
+        except (ValueError, json.JSONDecodeError, IndexError) as exc:
+            repair = self.session.send(
+                f"Your last reply was not one JSON object line ({exc.__class__.__name__})."
+                " Reply with exactly one JSON object line for the SAME commit, nothing else."
+            )
+            try:
+                return parse_reply(repair), repair
+            except (ValueError, json.JSONDecodeError, IndexError):
+                return Reply("unknown", {}), repair
 
 
 def feature_registry(conn: sqlite3.Connection, feature_cap: int = 180) -> str:
@@ -228,9 +276,10 @@ def commit_at(conn: sqlite3.Connection, commit_id: int) -> sqlite3.Row:
 
 
 def classify_pending(
-    repo: Path, conn: sqlite3.Connection, model: str, session: Session, limit: int | None = None
+    conn: sqlite3.Connection, model: str, backend: Backend, limit: int | None = None
 ) -> list[int]:
-    """Resume-aware rolling classification. Returns processed commit ids."""
+    """Resume-aware classification over any backend exposing
+    `classify(conn, walk_index) -> (Reply, raw)`. Returns processed commit ids."""
     pending = conn.execute(
         """SELECT id, committed_at, walk_index FROM commits
            LEFT JOIN commit_verdicts v ON v.commit_id = commits.id
@@ -239,7 +288,6 @@ def classify_pending(
     ).fetchall()
     processed: list[int] = []
     for row in pending:
-        msg = commit_prompt(conn, row["walk_index"])
         crow = conn.execute("SELECT kind, diff FROM commits WHERE id = ?", (row["id"],)).fetchone()
         assert crow is not None
         if crow["kind"] == "merge" and not crow["diff"]:
@@ -251,27 +299,16 @@ def classify_pending(
                     (row["id"], model),
                 )
             continue
-        text = session.send(msg)
-        try:
-            reply = parse_reply(text)
-        except (ValueError, json.JSONDecodeError, IndexError) as exc:
-            repair = session.send(
-                f"Your last reply was not one JSON object line ({exc.__class__.__name__})."
-                " Reply with exactly one JSON object line for the SAME commit, nothing else."
-            )
-            try:
-                reply = parse_reply(repair)
-                text = repair
-            except (ValueError, json.JSONDecodeError, IndexError):
-                with conn:
-                    conn.execute(
-                        "INSERT INTO commit_verdicts"
-                        " (commit_id, verdict, rationale, raw_llm_output, model, classified_at)"
-                        " VALUES (?, 'unknown', 'unparsable LLM reply', ?, ?, datetime('now'))",
-                        (row["id"], text, model),
-                    )
-                processed.append(row["id"])
-                continue
-        apply_reply(conn, row["id"], row["committed_at"], reply, text, model)
+        reply, raw = backend.classify(conn, row["walk_index"])
+        if reply.kind == "unknown":
+            with conn:
+                conn.execute(
+                    "INSERT INTO commit_verdicts"
+                    " (commit_id, verdict, rationale, raw_llm_output, model, classified_at)"
+                    " VALUES (?, 'unknown', 'unparsable reply', ?, ?, datetime('now'))",
+                    (row["id"], raw, model),
+                )
+        else:
+            apply_reply(conn, row["id"], row["committed_at"], reply, raw, model)
         processed.append(row["id"])
     return processed
