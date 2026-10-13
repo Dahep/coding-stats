@@ -9,19 +9,11 @@ See `DESIGN.md` (decisions) and `CONTEXT.md` (domain language).
 1. `walk` — first-parent chronological walk of the Target branch (`main`).
    Squash-merged work appears once as its main-branch commit; `git patch-id`
    is stored per commit so patch-equivalent commits can be reconciled.
-2. `classify` — one verdict per commit from an interchangeable backend:
-   the ADR-0001 rolling LLM session via the opencode CLI (one commit per
-   turn, one JSON reply per turn: `new | existing | fix | refactor |
-   revert | cleanup`), or ADR-0004's System One decision call (one POST per
-   commit: `jev` choice over the same six verdicts + citation of the
-   Feature it continues). Checkpointed into SQLite per turn so runs are
-   resumable. Raw backend output is stored per commit for auditability;
-   the single verdict drives what metrics count (blame evidence never
-   does). Backend selection: `init --backend` forces it, otherwise the
-   model id decides (`jev*` = System One). Routes/keyring: Zen
-   (`OPENCODE_API_KEY`), OpenRouter (`OPENROUTER_API_KEY`), TypeSafe direct
-   (`TYPESAFE_API_KEY`) — exactly one, or `SKILL_STATS_SYSTEMONE_PROVIDER`
-   must name the vendor.
+2. `classify` — rolling LLM session via the opencode CLI (ADR-0001): one
+   commit per turn, one JSON reply per turn (`new | existing | fix |
+   refactor | revert | cleanup`), checkpointed into SQLite per turn so runs
+   are resumable. Raw LLM output is stored per commit for auditability; the
+   single LLM verdict drives what metrics count (blame evidence never does).
 3. `detect` — for `fix`-verdict commits only: blame deleted/rewritten lines
    at the first parent (`git blame -w -C --first-parent --porcelain`) and
    record `fix_touches` (raw hits) and `fix_targets` (hits ≥

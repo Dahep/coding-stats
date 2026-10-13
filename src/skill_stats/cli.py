@@ -11,14 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from . import ci, db, gitwalk, identity
-from .classify import (
-    DEFAULT_MODEL,
-    SESSION_DIR,
-    Backend,
-    OpencodeBackend,
-    Session,
-    classify_pending,
-)
+from .classify import DEFAULT_MODEL, SESSION_DIR, Session, classify_pending
 from .lineage import close_lineage
 from .targets import annotate_all
 
@@ -27,20 +20,6 @@ def _settings(conn: sqlite3.Connection) -> dict[str, Any]:
     return {
         r["key"]: json.loads(r["value"]) for r in conn.execute("SELECT key, value FROM settings")
     }
-
-
-def _backend(settings: dict[str, Any]) -> Backend:
-    """Build the classification backend (ADR-0004): `systemone` when the
-    settings force it (init --backend) or the model id names a decision model
-    (jev), else the ADR-0001 opencode rolling session."""
-    model = str(settings.get("model", DEFAULT_MODEL))
-    if settings.get("backend") == "systemone" or "jev" in model.lower():
-        from .systemone import SystemOneBackend
-
-        return SystemOneBackend(model)
-    SESSION_DIR.mkdir(parents=True, exist_ok=True)
-    sid = settings.get("classify_session_id") or None
-    return OpencodeBackend(Session(model, sid))
 
 
 def _set(conn: sqlite3.Connection, key: str, value: Any) -> None:
@@ -66,12 +45,6 @@ def main(argv: list[str] | None = None) -> None:
     init.add_argument("repo")
     init.add_argument("--branch", default=None)
     init.add_argument("--model", default=DEFAULT_MODEL)
-    init.add_argument(
-        "--backend",
-        default=None,
-        choices=["opencode", "systemone"],
-        help="classification backend (default: derived from --model)",
-    )
     init.add_argument("--min-target-lines", type=int, default=1)
     init.add_argument("--db", default="skill-stats.db")
 
@@ -154,15 +127,10 @@ def main(argv: list[str] | None = None) -> None:
             "model": args.model,
             "min_target_lines": args.min_target_lines,
         }
-        if args.backend:
-            cfg["backend"] = args.backend
         for key, value in cfg.items():
             _set(conn, key, value)
         conn.close()
-        backend_note = f", backend {args.backend}" if args.backend else ""
-        print(
-            f"initialized {db_path} for {repo} (branch {branch}, model {args.model}{backend_note})"
-        )
+        print(f"initialized {db_path} for {repo} (branch {branch}, model {args.model})")
         return
 
     if args.cmd == "ci":
@@ -214,22 +182,17 @@ def main(argv: list[str] | None = None) -> None:
         print(f"walked {n} new commits (total {total})")
     elif args.cmd == "classify":
         assert repo_dir is not None, "run init first"
-        if args.fresh and "classify_session_id" in settings:
-            conn.execute("DELETE FROM settings WHERE key = 'classify_session_id'")
-            conn.commit()
-            settings.pop("classify_session_id")
-        backend = _backend(settings)
-        model = str(settings.get("model", DEFAULT_MODEL))
+        SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        sid = None if args.fresh else (settings.get("classify_session_id") or None)
+        session = Session(settings.get("model", DEFAULT_MODEL), sid)
         try:
-            done = classify_pending(conn, model, backend, limit=args.limit)
+            done = classify_pending(
+                repo_dir, conn, settings.get("model", DEFAULT_MODEL), session, limit=args.limit
+            )
         finally:
-            if backend.session_id:
-                _set(conn, "classify_session_id", backend.session_id)
-        session_note = getattr(backend, "session_id", None)
-        print(
-            f"classified {len(done)} commits"
-            + (f" (session {session_note})" if session_note else "")
-        )
+            if session.session_id:
+                _set(conn, "classify_session_id", session.session_id)
+        print(f"classified {len(done)} commits (session {session.session_id})")
     elif args.cmd == "detect":
         assert repo_dir is not None, "run init first"
         n_fixes = annotate_all(repo_dir, conn, int(settings.get("min_target_lines", 1)))
@@ -351,25 +314,23 @@ def _run_update(
     if not args.no_classify:
         pending_before = _pending_count(conn)
         try:
-            backend = _backend(settings)
-            model = str(settings.get("model", DEFAULT_MODEL))
+            SESSION_DIR.mkdir(parents=True, exist_ok=True)
+            sid = settings.get("classify_session_id") or None
+            session = Session(settings.get("model", DEFAULT_MODEL), sid)
             try:
-                done = classify_pending(conn, model, backend)
+                done = classify_pending(
+                    repo_dir, conn, settings.get("model", DEFAULT_MODEL), session
+                )
             finally:
-                if backend.session_id:
-                    _set(conn, "classify_session_id", backend.session_id)
-            session_note = getattr(backend, "session_id", None)
-            print(
-                f"classified {len(done)} commits"
-                + (f" (session {session_note})" if session_note else "")
-            )
+                if session.session_id:
+                    _set(conn, "classify_session_id", session.session_id)
+            print(f"classified {len(done)} commits")
         except (OSError, RuntimeError, ValueError) as exc:
             # ValueError covers bad model replies reaching apply_reply (cited
-            # unknown feature ids; JSONDecodeError is one) and System One
-            # credential/route errors. classify_pending aborts mid-loop: what
-            # landed stays counted, the raising commit and the rest wait for a
-            # later update (Q13), and nothing below is blocked. The `classify`
-            # plumbing verb keeps raising.
+            # unknown feature ids; JSONDecodeError is one). classify_pending
+            # aborts mid-loop: what landed stays counted, the raising commit
+            # and the rest wait for a later update (Q13), and nothing below is
+            # blocked. The `classify` plumbing verb keeps raising.
             processed = pending_before - _pending_count(conn)
             print(
                 f"WARNING: classification unavailable ({exc}); {processed} classified"

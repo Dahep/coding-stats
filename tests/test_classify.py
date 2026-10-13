@@ -4,7 +4,6 @@ import pytest
 
 from conftest import add_feature, make_db
 from skill_stats.classify import (
-    OpencodeBackend,
     Reply,
     apply_reply,
     classify_pending,
@@ -26,10 +25,6 @@ class FakeSession:
     def send(self, message: str) -> str:
         self.prompts.append(message)
         return self.replies.pop(0)
-
-
-def _backend(replies) -> OpencodeBackend:
-    return OpencodeBackend(FakeSession(replies))
 
 
 @pytest.fixture()
@@ -153,7 +148,8 @@ def test_classify_pending_processes_in_order_and_stores_raw(walked, shas):
         '{"k":"fix","why":"repair of previous fix"}',
         '{"k":"cleanup","why":"whitespace"}',
     ]
-    done = classify_pending(walked, "m", OpencodeBackend(FakeSession(replies)))
+    session = FakeSession(replies)
+    done = classify_pending("/dev/null-repo-unused", walked, "m", session)
     assert len(done) == 9
     verdicts = [
         r[0]
@@ -179,11 +175,13 @@ def test_classify_pending_processes_in_order_and_stores_raw(walked, shas):
 
 
 def test_classify_pending_is_resumable(walked, shas):
-    replies = [
-        '{"k":"new","title":"alpha module","about":"first","why":"defs"}',
-        '{"k":"new","title":"beta index","about":"second","why":"defs2"}',
-    ]
-    classify_pending(walked, "m", _backend(replies), limit=2)
+    session = FakeSession(
+        [
+            '{"k":"new","title":"alpha module","about":"first","why":"defs"}',
+            '{"k":"new","title":"beta index","about":"second","why":"defs2"}',
+        ]
+    )
+    classify_pending("/dev/null-repo-unused", walked, "m", session, limit=2)
     assert len(walked.execute("SELECT * FROM commit_verdicts").fetchall()) == 2
     # resume: remaining 7 commits, with a session repair to boot
     session2 = FakeSession(
@@ -198,7 +196,7 @@ def test_classify_pending_is_resumable(walked, shas):
             '{"k":"cleanup","why":"w"}',
         ]
     )
-    done = classify_pending(walked, "m", OpencodeBackend(session2))
+    done = classify_pending("/dev/null-repo-unused", walked, "m", session2)
     assert len(done) == 7
     roles = [
         r[0]
@@ -212,19 +210,21 @@ def test_classify_pending_is_resumable(walked, shas):
 
 
 def test_classify_pending_unparsable_marks_unknown(walked, shas):
-    replies = [
-        "not json at all\neither",
-        "still not json",
-        '{"k":"cleanup","why":"w"}',
-        '{"k":"cleanup","why":"w"}',
-        '{"k":"cleanup","why":"w"}',
-        '{"k":"cleanup","why":"w"}',
-        '{"k":"cleanup","why":"w"}',
-        '{"k":"cleanup","why":"w"}',
-        '{"k":"cleanup","why":"w"}',
-        '{"k":"cleanup","why":"w"}',
-    ]
-    done = classify_pending(walked, "m", OpencodeBackend(FakeSession(replies)))
+    session = FakeSession(
+        [
+            "not json at all\neither",
+            "still not json",
+            '{"k":"cleanup","why":"w"}',
+            '{"k":"cleanup","why":"w"}',
+            '{"k":"cleanup","why":"w"}',
+            '{"k":"cleanup","why":"w"}',
+            '{"k":"cleanup","why":"w"}',
+            '{"k":"cleanup","why":"w"}',
+            '{"k":"cleanup","why":"w"}',
+            '{"k":"cleanup","why":"w"}',
+        ]
+    )
+    done = classify_pending("/dev/null-repo-unused", walked, "m", session)
     assert len(done) == 9
     first_verdict = walked.execute(
         "SELECT v.verdict FROM commit_verdicts v JOIN commits c ON c.id = v.commit_id"
