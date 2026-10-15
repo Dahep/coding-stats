@@ -160,9 +160,10 @@ env:
       - run: uv tool install '{spec}'
 
       # Classification is best-effort (Q13): it needs the opencode CLI and
-      # the OPENCODE_API_KEY repository secret (Settings -> Secrets). Without
-      # them update still runs the deterministic stages and reports the
-      # backlog — nothing here is required for the run to succeed.
+      # a provider key — the OPENCODE_API_KEY secret (Go/Zen subscription)
+      # or OPENROUTER_API_KEY (OpenRouter LLM). Without any key update still
+      # runs the deterministic stages and reports the backlog — nothing here
+      # is required for the run to succeed.
       - name: install opencode CLI
         continue-on-error: true  # best-effort: a failed download must not abort the run
         run: curl -fsSL https://opencode.ai/install | bash
@@ -170,6 +171,7 @@ env:
         run: skill-stats update --db "$SKILL_STATS_DB"
         env:
           OPENCODE_API_KEY: ${{{{ secrets.OPENCODE_API_KEY }}}}
+          OPENROUTER_API_KEY: ${{{{ secrets.OPENROUTER_API_KEY }}}}
 {land}      - name: upload report
         if: always()  # backlog/failed-classify runs still publish the report
         uses: actions/upload-artifact@v4
