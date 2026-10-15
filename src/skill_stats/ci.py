@@ -161,10 +161,9 @@ env:
 
       # Classification is best-effort (Q13): it needs the opencode CLI and
       # a provider key — the OPENCODE_API_KEY secret (Go/Zen subscription)
-      # or OPENROUTER_API_KEY (OpenRouter, including System One / jev
-      # classification per ADR-0004). Without any key update still runs the
-      # deterministic stages and reports the backlog — nothing here is
-      # required for the run to succeed.
+      # or OPENROUTER_API_KEY (OpenRouter LLM). Without any key update still
+      # runs the deterministic stages and reports the backlog — nothing here
+      # is required for the run to succeed.
       - name: install opencode CLI
         continue-on-error: true  # best-effort: a failed download must not abort the run
         run: curl -fsSL https://opencode.ai/install | bash

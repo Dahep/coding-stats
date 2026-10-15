@@ -36,3 +36,17 @@ removed. Practical acceptance criteria that this run surfaced for the record:
   live Oct 2026, priced at $0.042/MTok input (output free).
 - If the tool ever outgrows per-commit LLM cost, the measured numbers above
   — plus a confidence-gated hybrid — are the return path.
+
+## Consequences
+
+- Classification stays single-backend through the opencode CLI: one code
+  path (Session/parse_reply/apply_reply), keys owned entirely by opencode's
+  credential store, provider switched per-repo via the stored `--model` —
+  `openrouter/…` on company machines, `opencode-go/…` on personal ones. No
+  env-var keys locally; the workflow template now also passes the
+  `OPENROUTER_API_KEY` secret so CI can run either provider.
+- Every commit keeps paying an LLM session turn; the ~63% per-commit cost
+  cut the Jev A/B measured is forgone for canonical-title fidelity.
+- This ADR is the anchor for any future System One revisit (direct-HTTP
+  client, pinned zen alias, confidence gate) alongside the experiment
+  commit in git history.
