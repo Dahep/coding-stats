@@ -2,8 +2,8 @@
 -- format: 1
 -- schema-step: 2
 -- repository-key: https://github.com/Dahep/skill-stats@main
--- covered-through: 2c2d504fdd9054ffd72bed97c1157826e90a3797
--- digest: 228f9965e6f4c579b1c2037f6fae383a38b4422edcf37c2a2807a2f666e2fdca
+-- covered-through: b7ad4f830ee66a4f8c321d300b729c3218eb115e
+-- digest: 2d447593bcb8b9ca98e7d6ca15a2ac57aec51372c58217d2d13d1d14a2999507
 CREATE TABLE repositories (
                id INTEGER PRIMARY KEY,
                repo_key TEXT NOT NULL UNIQUE,
@@ -481,6 +481,37 @@ resolved-equal hosts keep canonicalizing. ssh config file injectable
 for tests. Found in dogfooding: the alias-baked key in the accidental
 artifact landing blocked CI''s seeded working DB on the relabel refusal
 gate (run 38157341104). ADR-0003 amendment + CONTEXT.md avoid-rule.', 'e33d4c63058a72fcf7cacff18c106cf3810f746f', 25, 'normal', '', 107, 4, 111);
+INSERT INTO commits (id, repo_id, sha, parent_sha, tree_sha, committed_at, author_name, title, message, subject_patch_id, walk_index, kind, diff, added_lines, deleted_lines, churn_lines) VALUES (21, 1, 'b7ad4f830ee66a4f8c321d300b729c3218eb115e', '03a8a8dddd350477eb23ff5696fb4f9b5ee490f3', '8d3595df3d760725ca9501e62db08ac8b897f073', '2026-10-15T12:29:19-03:00', 'Daniel Herrmann', 'Reject System One (Jev) backend; CI carries the OpenRouter key as well (#15)', 'Reject System One (Jev) backend; CI carries the OpenRouter key as well (#15)
+
+* feat: System One (jev) classification backend + CI key routing (ADR-0004)
+
+classify becomes a backend protocol (Backend.classify -> Reply+raw): the
+ADR-0001 opencode rolling session keeps its semantics under
+OpencodeBackend, and SystemOneBackend sends one POST per commit — a Choice
+question over the six verdicts plus a Feature-citation question, with
+confidence+probabilities stored as rationale. Routes: zen
+(OPENCODE_API_KEY), openrouter (OPENROUTER_API_KEY), typesafe direct; the
+CI workflow passes both secrets so company (OpenRouter) and personal
+(Go/Zen) repos need no per-repo code. init grows --backend.
+
+Live A/B on this repo (19 first-parent commits, Zen route): 95%
+verdict-level agreement with the committed LLM session, zero unparsable
+replies, 81k input tokens (~$0.003), 17s; both disagreements arrived at
+confidence < 0.7 — a hybrid gate would catch them at ~37% escalation.
+
+* drop System One backend (ADR-0004 rejected); keep OpenRouter CI secret
+
+Jev''s blocking constraint hit exactly where it hurts: a decision model
+cannot generate text, so Feature canonical titles/about degrade to
+verbatim commit subjects and the fix needs an LLM in the write path
+anyway. Backend protocol, systemone client and tests removed; measured
+A/B numbers preserved in the ADR as the recorded rejection.
+
+Stays: the workflow template now passes OPENROUTER_API_KEY alongside
+OPENCODE_API_KEY so company (OpenRouter) and personal (Go/Zen) repos
+pick per-repo config --model with no code changes.
+
+* fix ADR-0004 comment drift (jev citation) + add Consequences section', 'a2cd402723d3ff174d872e5b038f1f8d438423ed', 27, 'normal', '', 57, 3, 60);
 CREATE TABLE commit_verdicts (
                commit_id INTEGER PRIMARY KEY,
                verdict TEXT NOT NULL CHECK (verdict IN ('feature', 'fix', 'refactor',
@@ -512,6 +543,7 @@ INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output, mode
 INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output, model, run_id, classified_at) VALUES (18, 'fix', 'Corrects live-lines binary accounting: the earlier unattributed bucketing surfaced 154k fake lines from NUL-containing blobs; now skipped to match numstat churn semantics, with replace-decode blame for weird-text blobs.', '{"k":"fix","why":"Corrects live-lines binary accounting: the earlier unattributed bucketing surfaced 154k fake lines from NUL-containing blobs; now skipped to match numstat churn semantics, with replace-decode blame for weird-text blobs."}', 'opencode/glm-5.3-flash', NULL, '2026-10-11 18:56:55');
 INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output, model, run_id, classified_at) VALUES (19, 'feature', 'Small README addition documenting the CI/Pages dogfooding deployment enabled by the CI scaffold feature; docs continuation of that scope, no repair.', '{"k":"existing","f":"dahep-skill-stats-12","why":"Small README addition documenting the CI/Pages dogfooding deployment enabled by the CI scaffold feature; docs continuation of that scope, no repair."}', 'opencode/glm-5.3-flash', NULL, '2026-10-11 18:57:06');
 INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output, model, run_id, classified_at) VALUES (20, 'fix', 'Repairs normalize_clone_url from the earlier identity work: it baked machine-local SSH alias hosts (github-personal) into Repository keys, which the relabel refusal gate then rejected in CI; now ssh -G detects alias-resolving hosts and returns None, restoring the documented machine-local-never-ident', '{"k":"fix","why":"Repairs normalize_clone_url from the earlier identity work: it baked machine-local SSH alias hosts (github-personal) into Repository keys, which the relabel refusal gate then rejected in CI; now ssh -G detects alias-resolving hosts and returns None, restoring the documented machine-local-never-identity invariant."}', 'opencode/glm-5.3-flash', NULL, '2026-10-11 19:48:43');
+INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output, model, run_id, classified_at) VALUES (21, 'feature', 'Net diff only adds the ADR and an OPENROUTER_API_KEY env line; the prototyped backend was added and dropped inside the squash, so no landed work is repaired or undone.', '{"k":"new","title":"System One rejection ADR","about":"Adds ADR-0004 recording the measured rejection of the System One (Jev) backend and extends the CI workflow template to pass the OpenRouter key.","why":"Net diff only adds the ADR and an OPENROUTER_API_KEY env line; the prototyped backend was added and dropped inside the squash, so no landed work is repaired or undone."}', 'opencode/glm-5.3-flash', NULL, '2026-10-15 15:30:17');
 CREATE TABLE features (
                id TEXT PRIMARY KEY,
                title TEXT NOT NULL,
@@ -525,8 +557,9 @@ CREATE TABLE features (
 INSERT INTO features (id, title, about, title_history_json, created_at, created_run_id, repo_id, live_lines) VALUES ('dahep-skill-stats-1', 'Foundational design docs', 'Adds CONTEXT.md glossary, DESIGN.md, and ADR-0001/0002 defining the git/opencode analysis vocabulary and key decisions.', '[]', '2026-10-02T16:37:03-03:00', NULL, 1, 227);
 INSERT INTO features (id, title, about, title_history_json, created_at, created_run_id, repo_id, live_lines) VALUES ('dahep-skill-stats-10', 'Multi-repo schema migration', 'Implements ADR-0003 wave 1: repositories table, (repo,sha)-keyed commits with churn columns, repo-prefixed feature ids, atomic migration, and .skill-stats/** exclusion in walk/blame.', '[]', '2026-10-10T09:10:17-03:00', NULL, 1, 2019);
 INSERT INTO features (id, title, about, title_history_json, created_at, created_run_id, repo_id, live_lines) VALUES ('dahep-skill-stats-11', 'Artifact serializer and live-lines', 'Implements ADR-0003 wave 2: deterministic SQL-text artifact with digest verification, update verb, live-lines tip/blame attribution with Sample backfill, and report/chart additions.', '[]', '2026-10-11T01:05:32-03:00', NULL, 1, 1862);
-INSERT INTO features (id, title, about, title_history_json, created_at, created_run_id, repo_id, live_lines) VALUES ('dahep-skill-stats-12', 'Partial recompute and CI', 'Implements ADR-0003 wave 3: digest-mismatch partial recompute anchored at the newest self-verifying artifact version, plus ci init/ci land workflow rendering and artifact-landing verb.', '[]', '2026-10-11T11:29:49-03:00', NULL, 1, 1696);
+INSERT INTO features (id, title, about, title_history_json, created_at, created_run_id, repo_id, live_lines) VALUES ('dahep-skill-stats-12', 'Partial recompute and CI', 'Implements ADR-0003 wave 3: digest-mismatch partial recompute anchored at the newest self-verifying artifact version, plus ci init/ci land workflow rendering and artifact-landing verb.', '[]', '2026-10-11T11:29:49-03:00', NULL, 1, 1693);
 INSERT INTO features (id, title, about, title_history_json, created_at, created_run_id, repo_id, live_lines) VALUES ('dahep-skill-stats-13', 'Gather union DB', 'Implements ADR-0003 wave 4: gather verb ingesting verified artifacts into a Repository-key union DB with idempotent ingest, slug-collision refusal, org report surface, and least-complete sampling.', '[]', '2026-10-11T13:13:42-03:00', NULL, 1, 1642);
+INSERT INTO features (id, title, about, title_history_json, created_at, created_run_id, repo_id, live_lines) VALUES ('dahep-skill-stats-14', 'System One rejection ADR', 'Adds ADR-0004 recording the measured rejection of the System One (Jev) backend and extends the CI workflow template to pass the OpenRouter key.', '[]', '2026-10-15T12:29:19-03:00', NULL, 1, 57);
 INSERT INTO features (id, title, about, title_history_json, created_at, created_run_id, repo_id, live_lines) VALUES ('dahep-skill-stats-2', 'SQLite schema scaffold', 'Introduces the uv package scaffold with the initial SQLite schema (commits, features, fix tables) and migration mechanism.', '[]', '2026-10-05T10:10:03-03:00', NULL, 1, 1063);
 INSERT INTO features (id, title, about, title_history_json, created_at, created_run_id, repo_id, live_lines) VALUES ('dahep-skill-stats-3', 'Target-branch git walk', 'Adds gitwalk module: first-parent chronological Target-branch commit import into the DB with patch-id evidence, resumable walk, and rewritten-history detection, plus tests.', '[]', '2026-10-05T10:10:03-03:00', NULL, 1, 335);
 INSERT INTO features (id, title, about, title_history_json, created_at, created_run_id, repo_id, live_lines) VALUES ('dahep-skill-stats-4', 'LLM commit classification', 'Adds classify module: rolling opencode-CLI session that assigns one verdict per commit, persists the feature registry, and resumes from per-commit checkpoints.', '[]', '2026-10-05T10:10:03-03:00', NULL, 1, 394);
@@ -558,6 +591,7 @@ INSERT INTO commits_features (commit_id, feature_id, role) VALUES (14, 'dahep-sk
 INSERT INTO commits_features (commit_id, feature_id, role) VALUES (15, 'dahep-skill-stats-12', 'touches');
 INSERT INTO commits_features (commit_id, feature_id, role) VALUES (17, 'dahep-skill-stats-12', 'touches');
 INSERT INTO commits_features (commit_id, feature_id, role) VALUES (19, 'dahep-skill-stats-12', 'touches');
+INSERT INTO commits_features (commit_id, feature_id, role) VALUES (21, 'dahep-skill-stats-14', 'defines');
 CREATE TABLE fix_touches (
                fix_commit_id INTEGER NOT NULL,
                source_commit_id INTEGER NOT NULL,
@@ -621,6 +655,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-1', 'a9a2149664d465d8d363e89d0a52a1fcb5c47fc6', 227);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-1', 'ae43736da29ae81139769ab1a8c6335e9d4a0065', 227);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-1', 'b04223b4dfe071528bc2cce640b5371b3652d965', 185);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-1', 'b7ad4f830ee66a4f8c321d300b729c3218eb115e', 227);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-1', 'b962f225b1bf29df253169cecbb5fd6c1ab1d4a8', 227);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-1', 'c7e966a38cb3eae5ed83e29e0e789ddf5cbfaad9', 227);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-1', 'c9409dc81199a73fca430c568055340bfadadda1', 227);
@@ -633,6 +668,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-10', 'a7357b86f9adfdd5cfbe2d940d65c542b24528da', 1915);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-10', 'a9a2149664d465d8d363e89d0a52a1fcb5c47fc6', 1915);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-10', 'ae43736da29ae81139769ab1a8c6335e9d4a0065', 1911);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-10', 'b7ad4f830ee66a4f8c321d300b729c3218eb115e', 2019);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-10', 'b962f225b1bf29df253169cecbb5fd6c1ab1d4a8', 1915);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-10', 'c7e966a38cb3eae5ed83e29e0e789ddf5cbfaad9', 1915);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-10', 'fb62a1504040479027cb455e4c30f23760e7daff', 1915);
@@ -642,6 +678,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-11', 'a7357b86f9adfdd5cfbe2d940d65c542b24528da', 1783);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-11', 'a9a2149664d465d8d363e89d0a52a1fcb5c47fc6', 1805);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-11', 'ae43736da29ae81139769ab1a8c6335e9d4a0065', 1773);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-11', 'b7ad4f830ee66a4f8c321d300b729c3218eb115e', 1862);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-11', 'b962f225b1bf29df253169cecbb5fd6c1ab1d4a8', 1862);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-11', 'c7e966a38cb3eae5ed83e29e0e789ddf5cbfaad9', 1751);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-11', 'fb62a1504040479027cb455e4c30f23760e7daff', 1805);
@@ -650,6 +687,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-12', '870a7439351a086b07a40978ee855c29e50b9930', 1592);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-12', 'a7357b86f9adfdd5cfbe2d940d65c542b24528da', 1427);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-12', 'a9a2149664d465d8d363e89d0a52a1fcb5c47fc6', 1592);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-12', 'b7ad4f830ee66a4f8c321d300b729c3218eb115e', 1693);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-12', 'b962f225b1bf29df253169cecbb5fd6c1ab1d4a8', 1696);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-12', 'c7e966a38cb3eae5ed83e29e0e789ddf5cbfaad9', 1421);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-12', 'fb62a1504040479027cb455e4c30f23760e7daff', 1690);
@@ -657,9 +695,11 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-13', '80802547b5142cd82882ad3cca5750a7ce775693', 1642);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-13', '870a7439351a086b07a40978ee855c29e50b9930', 1642);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-13', 'a9a2149664d465d8d363e89d0a52a1fcb5c47fc6', 1642);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-13', 'b7ad4f830ee66a4f8c321d300b729c3218eb115e', 1642);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-13', 'b962f225b1bf29df253169cecbb5fd6c1ab1d4a8', 1642);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-13', 'c7e966a38cb3eae5ed83e29e0e789ddf5cbfaad9', 1642);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-13', 'fb62a1504040479027cb455e4c30f23760e7daff', 1642);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-14', 'b7ad4f830ee66a4f8c321d300b729c3218eb115e', 57);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-2', '1071f03aa2742cc7fb662e049eb76ec3dbd024cd', 1030);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-2', '1bbe64a60d3a3ec30fc891a01439c9025edb9b2e', 1030);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-2', '2c2d504fdd9054ffd72bed97c1157826e90a3797', 1063);
@@ -675,6 +715,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-2', 'a9a2149664d465d8d363e89d0a52a1fcb5c47fc6', 1063);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-2', 'ae43736da29ae81139769ab1a8c6335e9d4a0065', 1064);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-2', 'b04223b4dfe071528bc2cce640b5371b3652d965', 1030);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-2', 'b7ad4f830ee66a4f8c321d300b729c3218eb115e', 1063);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-2', 'b962f225b1bf29df253169cecbb5fd6c1ab1d4a8', 1063);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-2', 'c7e966a38cb3eae5ed83e29e0e789ddf5cbfaad9', 1063);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-2', 'c9409dc81199a73fca430c568055340bfadadda1', 1030);
@@ -693,6 +734,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-3', 'a9a2149664d465d8d363e89d0a52a1fcb5c47fc6', 269);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-3', 'ae43736da29ae81139769ab1a8c6335e9d4a0065', 217);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-3', 'b04223b4dfe071528bc2cce640b5371b3652d965', 243);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-3', 'b7ad4f830ee66a4f8c321d300b729c3218eb115e', 335);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-3', 'b962f225b1bf29df253169cecbb5fd6c1ab1d4a8', 335);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-3', 'c7e966a38cb3eae5ed83e29e0e789ddf5cbfaad9', 217);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-3', 'c9409dc81199a73fca430c568055340bfadadda1', 243);
@@ -710,6 +752,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-4', 'a7357b86f9adfdd5cfbe2d940d65c542b24528da', 394);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-4', 'a9a2149664d465d8d363e89d0a52a1fcb5c47fc6', 394);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-4', 'ae43736da29ae81139769ab1a8c6335e9d4a0065', 394);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-4', 'b7ad4f830ee66a4f8c321d300b729c3218eb115e', 394);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-4', 'b962f225b1bf29df253169cecbb5fd6c1ab1d4a8', 394);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-4', 'c7e966a38cb3eae5ed83e29e0e789ddf5cbfaad9', 394);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-4', 'c9409dc81199a73fca430c568055340bfadadda1', 454);
@@ -726,6 +769,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-5', 'a7357b86f9adfdd5cfbe2d940d65c542b24528da', 365);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-5', 'a9a2149664d465d8d363e89d0a52a1fcb5c47fc6', 365);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-5', 'ae43736da29ae81139769ab1a8c6335e9d4a0065', 365);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-5', 'b7ad4f830ee66a4f8c321d300b729c3218eb115e', 365);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-5', 'b962f225b1bf29df253169cecbb5fd6c1ab1d4a8', 365);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-5', 'c7e966a38cb3eae5ed83e29e0e789ddf5cbfaad9', 365);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-5', 'c9409dc81199a73fca430c568055340bfadadda1', 384);
@@ -741,6 +785,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-6', 'a7357b86f9adfdd5cfbe2d940d65c542b24528da', 490);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-6', 'a9a2149664d465d8d363e89d0a52a1fcb5c47fc6', 489);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-6', 'ae43736da29ae81139769ab1a8c6335e9d4a0065', 489);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-6', 'b7ad4f830ee66a4f8c321d300b729c3218eb115e', 489);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-6', 'b962f225b1bf29df253169cecbb5fd6c1ab1d4a8', 489);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-6', 'c7e966a38cb3eae5ed83e29e0e789ddf5cbfaad9', 489);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-6', 'c9409dc81199a73fca430c568055340bfadadda1', 534);
@@ -755,6 +800,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-7', 'a7357b86f9adfdd5cfbe2d940d65c542b24528da', 79);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-7', 'a9a2149664d465d8d363e89d0a52a1fcb5c47fc6', 79);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-7', 'ae43736da29ae81139769ab1a8c6335e9d4a0065', 79);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-7', 'b7ad4f830ee66a4f8c321d300b729c3218eb115e', 79);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-7', 'b962f225b1bf29df253169cecbb5fd6c1ab1d4a8', 79);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-7', 'c7e966a38cb3eae5ed83e29e0e789ddf5cbfaad9', 79);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-7', 'c9409dc81199a73fca430c568055340bfadadda1', 90);
@@ -767,6 +813,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-8', 'a7357b86f9adfdd5cfbe2d940d65c542b24528da', 667);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-8', 'a9a2149664d465d8d363e89d0a52a1fcb5c47fc6', 656);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-8', 'ae43736da29ae81139769ab1a8c6335e9d4a0065', 665);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-8', 'b7ad4f830ee66a4f8c321d300b729c3218eb115e', 656);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-8', 'b962f225b1bf29df253169cecbb5fd6c1ab1d4a8', 656);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-8', 'c7e966a38cb3eae5ed83e29e0e789ddf5cbfaad9', 656);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-8', 'c9409dc81199a73fca430c568055340bfadadda1', 701);
@@ -778,11 +825,12 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-9', 'a7357b86f9adfdd5cfbe2d940d65c542b24528da', 241);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-9', 'a9a2149664d465d8d363e89d0a52a1fcb5c47fc6', 237);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-9', 'ae43736da29ae81139769ab1a8c6335e9d4a0065', 244);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-9', 'b7ad4f830ee66a4f8c321d300b729c3218eb115e', 335);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-9', 'b962f225b1bf29df253169cecbb5fd6c1ab1d4a8', 237);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-9', 'c7e966a38cb3eae5ed83e29e0e789ddf5cbfaad9', 237);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-9', 'c9409dc81199a73fca430c568055340bfadadda1', 244);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-skill-stats-9', 'fb62a1504040479027cb455e4c30f23760e7daff', 237);
 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-INSERT INTO settings (key, value) VALUES ('backfill_state', '{"status": "done", "max_classified_walk_index": 25}');
+INSERT INTO settings (key, value) VALUES ('backfill_state', '{"status": "done", "max_classified_walk_index": 27}');
 INSERT INTO settings (key, value) VALUES ('branch', '"main"');
 INSERT INTO settings (key, value) VALUES ('unattributed_lines', '0');
