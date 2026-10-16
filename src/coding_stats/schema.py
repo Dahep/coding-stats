@@ -1,4 +1,4 @@
-"""SQLite schema for skill-stats.
+"""SQLite schema for coding-stats.
 
 Migrations are ordered steps applied to a fresh DB or an existing file; a step
 is either SQL text or a function applied to the connection. db.connect applies

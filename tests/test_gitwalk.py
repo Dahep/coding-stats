@@ -2,8 +2,7 @@
 
 import pytest
 
-from conftest import commit_files, make_db
-from skill_stats.gitwalk import (
+from coding_stats.gitwalk import (
     commit_kind,
     diff_for,
     list_commits,
@@ -12,6 +11,7 @@ from skill_stats.gitwalk import (
     to_row,
     walk,
 )
+from conftest import commit_files, make_db
 
 
 def test_walk_imports_in_order(repo, shas):
@@ -108,23 +108,23 @@ def test_merge_commit_diffs_vs_first_parent(repo, shas):
 
 
 # ---------------------------------------------------------------- exclusion --
-# ADR-0003 clause 4: paths under .skill-stats/ (any depth) are dropped from
+# ADR-0003 clause 4: paths under .coding-stats/ (any depth) are dropped from
 # every commit's diff before storage; store-only commits are skipped entirely.
 
 
 def test_exclusion_skips_store_only_and_strips_mixed(repo):
     c1 = commit_files(repo, "normal content", {"n.txt": "one\ntwo\n"})
-    commit_files(repo, "artifact update", {".skill-stats/artifact.sql": "INSERT\n"})
+    commit_files(repo, "artifact update", {".coding-stats/artifact.sql": "INSERT\n"})
     c3 = commit_files(
         repo,
         "mixed content",
         {
             "n.txt": "ONE\ntwo\n",
-            ".skill-stats/report.html": "<html>\n",
+            ".coding-stats/report.html": "<html>\n",
         },
     )
-    commit_files(repo, "nested artifact", {"sub/.skill-stats/x.txt": "x\n"})
-    c5 = commit_files(repo, "near miss name", {".skill-stats-keep/c.txt": "c\n"})
+    commit_files(repo, "nested artifact", {"sub/.coding-stats/x.txt": "x\n"})
+    c5 = commit_files(repo, "near miss name", {".coding-stats-keep/c.txt": "c\n"})
     db = make_db(repo / "w.db", repo)
     assert walk(repo, db, "main") == 3
     rows = db.execute("SELECT sha, walk_index, diff FROM commits ORDER BY walk_index").fetchall()
@@ -132,9 +132,9 @@ def test_exclusion_skips_store_only_and_strips_mixed(repo):
     assert [r["sha"] for r in rows] == [c1, c3, c5]
     # skipped commits leave walk_index gaps; ids/order of the rest stay stable
     assert [r["walk_index"] for r in rows] == [1, 3, 5]
-    assert ".skill-stats" not in rows[1]["diff"]
+    assert ".coding-stats" not in rows[1]["diff"]
     assert "n.txt" in rows[1]["diff"]
-    assert ".skill-stats-keep" in rows[2]["diff"]
+    assert ".coding-stats-keep" in rows[2]["diff"]
 
 
 def test_churn_columns_match_diff_churn_rules(repo):
@@ -145,7 +145,7 @@ def test_churn_columns_match_diff_churn_rules(repo):
         "mixed with store",
         {
             "n.txt": "ONE\nTWO\nthree\n",
-            ".skill-stats/artifact.sql": "+INSERT\n+MORE\n",
+            ".coding-stats/artifact.sql": "+INSERT\n+MORE\n",
         },
     )
     db = make_db(repo / "w.db", repo)
@@ -161,7 +161,7 @@ def test_churn_columns_match_diff_churn_rules(repo):
 
 def test_walk_resumes_across_skipped_commits(repo):
     commit_files(repo, "normal content", {"n.txt": "one\n"})
-    commit_files(repo, "artifact update", {".skill-stats/artifact.sql": "INSERT\n"})
+    commit_files(repo, "artifact update", {".coding-stats/artifact.sql": "INSERT\n"})
     commit_files(repo, "more content", {"n.txt": "one\ntwo\n"})
     db = make_db(repo / "w.db", repo)
     assert walk(repo, db, "main") == 2
@@ -197,27 +197,34 @@ def test_prepare_diff_strips_store_sections_any_depth():
         "@@ -1 +1 @@\n"
         "-one\n"
         "+ONE\n"
-        "diff --git a/.skill-stats/a.sql b/.skill-stats/a.sql\n"
-        "--- a/.skill-stats/a.sql\n"
-        "+++ b/.skill-stats/a.sql\n"
+        "diff --git a/.coding-stats/a.sql b/.coding-stats/a.sql\n"
+        "--- a/.coding-stats/a.sql\n"
+        "+++ b/.coding-stats/a.sql\n"
         "@@ -0,0 +1 @@\n"
         "+INSERT\n"
-        "diff --git a/sub/.skill-stats/b.txt b/sub/.skill-stats/b.txt\n"
-        "--- a/sub/.skill-stats/b.txt\n"
-        "+++ b/sub/.skill-stats/b.txt\n"
+        "diff --git a/sub/.coding-stats/b.txt b/sub/.coding-stats/b.txt\n"
+        "--- a/sub/.coding-stats/b.txt\n"
+        "+++ b/sub/.coding-stats/b.txt\n"
         "@@ -0,0 +1 @@\n"
         "+nested\n"
-        "diff --git a/.skill-stats-keep/c.txt b/.skill-stats-keep/c.txt\n"
-        "--- a/.skill-stats-keep/c.txt\n"
-        "+++ b/.skill-stats-keep/c.txt\n"
+        "diff --git a/.coding-stats-keep/c.txt b/.coding-stats-keep/c.txt\n"
+        "--- a/.coding-stats-keep/c.txt\n"
+        "+++ b/.coding-stats-keep/c.txt\n"
         "@@ -0,0 +1 @@\n"
         "+kept\n"
+        # legacy pre-rename artifacts committed in history stay excluded too
+        "diff --git a/.skill-stats/old.sql b/.skill-stats/old.sql\n"
+        "--- a/.skill-stats/old.sql\n"
+        "+++ b/.skill-stats/old.sql\n"
+        "@@ -0,0 +1 @@\n"
+        "+OLD\n"
     )
     stat = prepare_diff(diff)
-    assert ".skill-stats/a.sql" not in stat.diff
-    assert "sub/.skill-stats" not in stat.diff
+    assert ".coding-stats/a.sql" not in stat.diff
+    assert "sub/.coding-stats" not in stat.diff
     assert "+nested" not in stat.diff
-    assert ".skill-stats-keep" in stat.diff and "+kept" in stat.diff
+    assert ".coding-stats-keep" in stat.diff and "+kept" in stat.diff
+    assert ".skill-stats/old.sql" not in stat.diff and "+OLD" not in stat.diff
     # only -one/+ONE/+kept count
     assert (stat.added, stat.deleted, stat.churn) == (2, 1, 3)
 
@@ -229,7 +236,7 @@ def test_prepare_diff_strips_store_sections_any_depth():
 
 
 def test_parse_diff_header_bare_and_quoted():
-    from skill_stats.gitwalk import parse_diff_header
+    from coding_stats.gitwalk import parse_diff_header
 
     assert parse_diff_header("diff --git a/x.txt b/x.txt") == ("x.txt", "x.txt")
     assert parse_diff_header('diff --git "a/n\\303\\244me.txt" "b/n\\303\\244me.txt"') == (
@@ -237,9 +244,9 @@ def test_parse_diff_header_bare_and_quoted():
         "näme.txt",
     )
     assert parse_diff_header('diff --git "a/t\\t x" "b/t\\t x"') == ("t\t x", "t\t x")
-    assert parse_diff_header('diff --git "a/.skill-stats/\\303\\244.sql" "b/.skill-stats/x"') == (
-        ".skill-stats/ä.sql",
-        ".skill-stats/x",
+    assert parse_diff_header('diff --git "a/.coding-stats/\\303\\244.sql" "b/.coding-stats/x"') == (
+        ".coding-stats/ä.sql",
+        ".coding-stats/x",
     )
     assert parse_diff_header("not a header") is None
 
@@ -251,7 +258,7 @@ def test_quoted_store_section_after_normal_does_not_leak(repo):
         "mixed quoted",
         {
             "näme.txt": "one\nTWO\n",
-            "z/.skill-stats/ärger.sql": "INSERT\n",
+            "z/.coding-stats/ärger.sql": "INSERT\n",
         },
     )
     db = make_db(repo / "w.db", repo)
@@ -272,7 +279,7 @@ def test_quoted_store_section_before_normal_does_not_swallow(repo):
         repo,
         "mixed quoted",
         {
-            ".skill-stats/ärger.sql": "INSERT\n",
+            ".coding-stats/ärger.sql": "INSERT\n",
             "n.txt": "one\nTWO\n",
         },
     )
@@ -295,9 +302,9 @@ def test_prepare_diff_resets_state_at_every_header():
         "@@ -1 +1 @@\n"
         "-old\n"
         "+new\n"
-        'diff --git "a/.skill-stats/\\303\\244.sql" "b/.skill-stats/\\303\\244.sql"\n'
-        '--- "a/.skill-stats/\\303\\244.sql"\n'
-        '+++ "b/.skill-stats/\\303\\244.sql"\n'
+        'diff --git "a/.coding-stats/\\303\\244.sql" "b/.coding-stats/\\303\\244.sql"\n'
+        '--- "a/.coding-stats/\\303\\244.sql"\n'
+        '+++ "b/.coding-stats/\\303\\244.sql"\n'
         "@@ -0,0 +1 @@\n"
         "+INSERT\n"
         "diff --git a/b.txt b/b.txt\n"

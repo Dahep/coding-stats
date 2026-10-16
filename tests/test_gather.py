@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
+from coding_stats.cli import main
+from coding_stats.metrics import churn_per_feature, snapshot
 from conftest import commit_files, run
-from skill_stats.cli import main
-from skill_stats.metrics import churn_per_feature, snapshot
 
 
 class Scripted:
@@ -59,7 +59,7 @@ def _repo_with_artifact(
             sent.append(message)
             return super().send(message)
 
-    with mock.patch("skill_stats.cli.Session", lambda model, sid=None: Session(list(replies))):
+    with mock.patch("coding_stats.cli.Session", lambda model, sid=None: Session(list(replies))):
         flags = ["--no-detect", "--no-lineage", "--no-report"]
         if no_classify:
             flags.append("--no-classify")
@@ -100,7 +100,7 @@ def test_gather_unions_two_repos_deterministically(tmp_path, monkeypatch):
     )
     union = tmp_path / "union.db"
     # one source as repo checkout, one as explicit artifact file path
-    main(["gather", "--db", str(union), str(a), str(b / ".skill-stats" / "skill-stats.sql")])
+    main(["gather", "--db", str(union), str(a), str(b / ".coding-stats" / "coding-stats.sql")])
 
     repos = _rows(union, "SELECT * FROM repositories ORDER BY repo_key")
     assert [r["repo_key"] for r in repos] == ["local:alpha-repo@main", "local:beta-repo@main"]
@@ -126,7 +126,7 @@ def test_gather_unions_two_repos_deterministically(tmp_path, monkeypatch):
     # — intentional provenance of where each artifact was read from, which
     # differs by construction and is excluded on that basis.
     union2 = tmp_path / "union2.db"
-    main(["gather", "--db", str(union2), str(a / ".skill-stats" / "skill-stats.sql"), str(b)])
+    main(["gather", "--db", str(union2), str(a / ".coding-stats" / "coding-stats.sql"), str(b)])
     for table in (
         "repositories",
         "commits",
@@ -167,7 +167,7 @@ def test_gather_upserts_newer_artifact_of_same_key(tmp_path):
 
     db_path = str(tmp_path / "solo-repo.db")
     with mock.patch(
-        "skill_stats.cli.Session",
+        "coding_stats.cli.Session",
         lambda model, sid=None: Scripted(
             [
                 '{"k":"new","title":"one","about":"x","why":"y"}',
@@ -214,7 +214,7 @@ def test_gather_refuses_non_verifying_artifact(tmp_path):
         [("feature one", {"a.txt": "a1\n"})],
         ['{"k":"new","title":"one","about":"x","why":"y"}'],
     )
-    art = a / ".skill-stats" / "skill-stats.sql"
+    art = a / ".coding-stats" / "coding-stats.sql"
     art.write_bytes(art.read_bytes() + b"\n-- tampered\n")
     union = tmp_path / "union.db"
     with pytest.raises(SystemExit) as excinfo:
@@ -264,11 +264,11 @@ def test_union_report_repo_column_and_org_branding(tmp_path):
     union = tmp_path / "union.db"
     main(["gather", "--db", str(union), str(a), str(b)])
     conn = _connect(union)
-    from skill_stats import htmlreport
-    from skill_stats.report import text_report
+    from coding_stats import htmlreport
+    from coding_stats.report import text_report
 
     page = htmlreport.build(conn)
-    assert "skill-stats report · 2 repos" in page  # org branding
+    assert "coding-stats report · 2 repos" in page  # org branding
     assert "<th>Repo</th>" in page  # REPO column in the ranking table
     assert "alpha-repo" in page and "beta-repo" in page
     text = text_report(conn)
@@ -287,14 +287,14 @@ def test_single_repo_report_renders_unchanged(tmp_path):
     union = tmp_path / "union.db"
     main(["gather", "--db", str(union), str(a)])
     conn = _connect(union)
-    from skill_stats import htmlreport
-    from skill_stats.report import text_report
+    from coding_stats import htmlreport
+    from coding_stats.report import text_report
 
     page = htmlreport.build(conn)
     text = text_report(conn)
     assert "<th>Repo</th>" not in page  # single-repo: zero visual diff
     assert "repos" not in page.split("<title>")[1].split("</title>")[0]
-    assert "skill-stats report · alpha-repo" in page  # slug branding when single
+    assert "coding-stats report · alpha-repo" in page  # slug branding when single
     assert "alpha-repo " not in text.split("top 15 features by fixes:")[1].splitlines()[1]
     conn.close()
 
@@ -321,7 +321,7 @@ def test_union_sampling_complete_is_least_complete(tmp_path):
     union = tmp_path / "union.db"
     main(["gather", "--db", str(union), str(a), str(b)])
     conn = _connect(union)
-    from skill_stats import htmlreport
+    from coding_stats import htmlreport
 
     page = htmlreport.build(conn)
     assert "Feature size over time" in page
@@ -330,7 +330,7 @@ def test_union_sampling_complete_is_least_complete(tmp_path):
 
     # clear the backlog -> re-gather -> the union is complete
     with mock.patch(
-        "skill_stats.cli.Session",
+        "coding_stats.cli.Session",
         lambda model, sid=None: Scripted(['{"k":"new","title":"later","about":"x","why":"y"}']),
     ):
         main(["update", "--db", a_db, "--no-detect", "--no-lineage", "--no-report"])
@@ -353,7 +353,7 @@ def test_preflight_rejects_multi_repository_artifact(tmp_path):
         [("feature one", {"a.txt": "a1\n"})],
         ['{"k":"new","title":"one","about":"x","why":"y"}'],
     )
-    art = repo / ".skill-stats" / "skill-stats.sql"
+    art = repo / ".coding-stats" / "coding-stats.sql"
     stray = (
         "\nINSERT INTO repositories (id, repo_key, slug, branch, clone_url, added_at)"
         " VALUES (99, 'local:other@main', 'other', 'main', NULL, '');\n"
@@ -377,7 +377,7 @@ def test_preflight_rejects_stray_foreign_commit_id(tmp_path):
         [("feature one", {"a.txt": "a1\n"})],
         ['{"k":"new","title":"one","about":"x","why":"y"}'],
     )
-    art = repo / ".skill-stats" / "skill-stats.sql"
+    art = repo / ".coding-stats" / "coding-stats.sql"
     stray = (
         "\nINSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output,"
         " model, run_id, classified_at) VALUES (999, 'fix', 'r', 'raw', 'm', NULL, 'd');\n"
@@ -391,7 +391,7 @@ def test_preflight_rejects_stray_foreign_commit_id(tmp_path):
     assert not union.exists()
 
 
-def test_gather_dest_not_skill_stats_database(tmp_path):
+def test_gather_dest_not_coding_stats_database(tmp_path):
     repo = _repo_with_artifact(
         tmp_path,
         "alpha-repo",
@@ -407,7 +407,7 @@ def test_gather_dest_not_skill_stats_database(tmp_path):
         main(["gather", "--db", str(dest), str(repo)])
     msg = str(excinfo.value)
     assert str(dest) in msg  # destination named
-    assert "not a skill-stats database" in msg  # actionable hint
+    assert "not a coding-stats database" in msg  # actionable hint
 
 
 def test_gather_malformed_artifact_clean_error(tmp_path):
@@ -419,7 +419,7 @@ def test_gather_malformed_artifact_clean_error(tmp_path):
         [("feature one", {"a.txt": "a1\n"})],
         ['{"k":"new","title":"one","about":"x","why":"y"}'],
     )
-    art = repo / ".skill-stats" / "skill-stats.sql"
+    art = repo / ".coding-stats" / "coding-stats.sql"
     art.write_bytes(_rechecksum(art.read_bytes() + b"\nINSERT INTO features (id\n"))
     union = tmp_path / "union.db"
     with pytest.raises(SystemExit) as excinfo:
@@ -440,7 +440,7 @@ def test_gather_malformed_artifact_clean_error(tmp_path):
 def _crafted_union(path):
     """Union DB with two repositories sharing one SHA (a fork) and staggered
     sample points — crafted directly in the union shape."""
-    from skill_stats.db import connect
+    from coding_stats.db import connect
 
     conn = connect(path)
     conn.executescript(
@@ -472,7 +472,7 @@ def _crafted_union(path):
 
 
 def test_union_chart_repo_scoped_totals_and_staggered_lines(tmp_path):
-    from skill_stats.htmlreport import _size_series
+    from coding_stats.htmlreport import _size_series
 
     conn = _crafted_union(tmp_path / "union.db")
     labels, series, total = _size_series(conn)
@@ -486,7 +486,7 @@ def test_union_chart_repo_scoped_totals_and_staggered_lines(tmp_path):
 
 
 def test_union_chart_single_feature_regression(tmp_path):
-    from skill_stats.htmlreport import _size_series
+    from coding_stats.htmlreport import _size_series
 
     conn = _crafted_union(tmp_path / "union.db")
     conn.execute("DELETE FROM feature_line_samples WHERE feature_id = 'b-1'")
@@ -517,7 +517,7 @@ def test_union_report_links_by_feature_repository(tmp_path):
     union = tmp_path / "union.db"
     main(["gather", "--db", str(union), str(a), str(b)])
     conn = _connect(union)
-    from skill_stats import htmlreport
+    from coding_stats import htmlreport
 
     page = htmlreport.build(conn)
     conn.close()
@@ -536,7 +536,7 @@ def test_machine_db_link_falls_back_to_settings_repo(tmp_path):
     run(repo, "remote", "add", "origin", "git@github.com:dahep/alpha.git")
     db_path = tmp_path / "alpha-repo.db"
     conn = _connect(db_path)
-    from skill_stats import htmlreport
+    from coding_stats import htmlreport
 
     page = htmlreport.build(conn)
     conn.close()
@@ -554,7 +554,7 @@ def test_union_branch_branding(tmp_path):
     union = tmp_path / "union.db"
     main(["gather", "--db", str(union), str(a)])
     conn = _connect(union)
-    from skill_stats import htmlreport
+    from coding_stats import htmlreport
 
     page = htmlreport.build(conn)
     conn.close()
@@ -588,7 +588,7 @@ def test_gather_adopts_canonical_key_for_shim_artifact(tmp_path):
         [("feature one", {"a.txt": "a1\n"})],
         ['{"k":"new","title":"one","about":"x","why":"y"}'],
     )
-    art = repo / ".skill-stats" / "skill-stats.sql"
+    art = repo / ".coding-stats" / "coding-stats.sql"
     before = art.read_bytes()
     run(repo, "remote", "add", "origin", "git@github.com:dahep/dotfiles.git")
     union = tmp_path / "union.db"
@@ -605,7 +605,7 @@ def test_gather_adopts_canonical_key_for_shim_artifact(tmp_path):
         "dahep-dotfiles-1"
     ]
     assert art.read_bytes() == before  # union-only normalization: store untouched
-    from skill_stats import htmlreport
+    from coding_stats import htmlreport
 
     assert "dahep-dotfiles-1" in htmlreport.build(_connect(union))
 
@@ -624,7 +624,7 @@ def test_gather_keeps_shim_when_no_origin_resolves(tmp_path):
     ]
     # an explicit artifact file has no checkout context: stays shim-keyed too
     union2 = tmp_path / "union2.db"
-    main(["gather", "--db", str(union2), str(repo / ".skill-stats" / "skill-stats.sql")])
+    main(["gather", "--db", str(union2), str(repo / ".coding-stats" / "coding-stats.sql")])
     assert _rows(union2, "SELECT repo_key, slug FROM repositories") == [
         {"repo_key": "local:dotfiles@main", "slug": "dotfiles"}
     ]
@@ -651,7 +651,7 @@ def test_gather_aliases_shim_and_canonical_artifacts_of_one_repo(tmp_path):
     db2 = str(tmp_path / "dotfiles-clone.db")
     main(["init", str(repo2), "--db", db2])  # canonical: origin resolves now
     with mock.patch(
-        "skill_stats.cli.Session",
+        "coding_stats.cli.Session",
         lambda model, sid=None: Scripted(
             [
                 '{"k":"new","title":"one","about":"x","why":"y"}',

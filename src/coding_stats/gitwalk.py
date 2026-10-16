@@ -4,7 +4,7 @@ Scope: first-parent walk of the Target branch (main), chronological. Each
 commit covers a squash merge as a single main-branch commit. Patch-id captures
 the commit's diff so later duplicate/patch-equivalent content can be detected.
 
-Exclusion (ADR-0003 clause 4): paths under ``.skill-stats/`` (any depth) are
+Exclusion (ADR-0003 clause 4): paths under ``.coding-stats/`` (any depth) are
 dropped from every commit's diff before storage; a commit whose stripped diff
 is empty is skipped entirely and nothing about it is stored. The rule is a
 path pattern, so re-inits, fork history, and CI-created commits are covered.
@@ -23,7 +23,11 @@ from typing import cast
 
 from . import identity
 
-STORE_DIR_NAME = ".skill-stats"
+STORE_DIR_NAME = ".coding-stats"
+# Pre-rename artifacts committed in git history (`.skill-stats/`) stay excluded
+# forever: excluding only the new name would make historical report.html/sql
+# count as analyzable churn in repos that dogfooded the old name.
+_LEGACY_STORE_DIR_NAME = ".skill-stats"
 
 _DIFF_GIT_PREFIX = "diff --git "
 _QUOTED_TOKEN_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
@@ -41,8 +45,10 @@ _SIMPLE_ESCAPES = {
 
 
 def is_store_path(path: str) -> bool:
-    """True when any path component names the artifact store dir (any depth)."""
-    return STORE_DIR_NAME in PurePosixPath(path).parts
+    """True when any path component names the artifact store dir (any depth),
+    current or legacy (pre-rename artifacts live in history forever)."""
+    parts = PurePosixPath(path).parts
+    return STORE_DIR_NAME in parts or _LEGACY_STORE_DIR_NAME in parts
 
 
 def _unquote_git_path(token: str) -> str:

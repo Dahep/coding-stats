@@ -4,10 +4,10 @@ import json
 
 import pytest
 
+from coding_stats.cli import main
+from coding_stats.gitwalk import walk
+from coding_stats.metrics import snapshot, snapshot_to_json
 from conftest import add_feature, make_db
-from skill_stats.cli import main
-from skill_stats.gitwalk import walk
-from skill_stats.metrics import snapshot, snapshot_to_json
 
 
 @pytest.fixture()
@@ -56,8 +56,8 @@ def test_snapshot_json_shape(classified):
 
 
 def test_populate_fix_rows_then_metrics(classified, repo, shas):
-    from skill_stats.lineage import close_lineage
-    from skill_stats.targets import annotate_all
+    from coding_stats.lineage import close_lineage
+    from coding_stats.targets import annotate_all
 
     n = annotate_all(repo, classified)
     assert n == 2
@@ -90,7 +90,7 @@ def test_cli_init_walk(tmp_path, repo, shas, capsys, monkeypatch):
 
 def test_cli_report_text(classified, capsys):
     with pytest.MonkeyPatch.context() as mp:
-        import skill_stats.report as report
+        import coding_stats.report as report
 
         mp.setattr(report, "snapshot", lambda conn, top=15: snapshot(conn, top))
         main(["report"])
@@ -99,9 +99,9 @@ def test_cli_report_text(classified, capsys):
 
 
 def test_rolling_and_timeline(classified, repo):
-    from skill_stats.lineage import close_lineage
-    from skill_stats.metrics import features_timeline, fixes_rolling
-    from skill_stats.targets import annotate_all
+    from coding_stats.lineage import close_lineage
+    from coding_stats.metrics import features_timeline, fixes_rolling
+    from coding_stats.targets import annotate_all
 
     assert annotate_all(repo, classified) == 2
     close_lineage(classified)
@@ -119,8 +119,8 @@ def test_rolling_and_timeline(classified, repo):
 
 
 def test_rolling_and_timeline_empty_db(tmp_path):
-    from skill_stats.db import connect
-    from skill_stats.metrics import features_timeline, fixes_rolling
+    from coding_stats.db import connect
+    from coding_stats.metrics import features_timeline, fixes_rolling
 
     conn = connect(tmp_path / "empty.db")
     assert features_timeline(conn) == []
@@ -128,17 +128,17 @@ def test_rolling_and_timeline_empty_db(tmp_path):
 
 
 def test_html_report(tmp_path, classified, repo):
-    from skill_stats.htmlreport import write_report
-    from skill_stats.lineage import close_lineage
-    from skill_stats.metrics import feature_ranking
-    from skill_stats.targets import annotate_all
+    from coding_stats.htmlreport import write_report
+    from coding_stats.lineage import close_lineage
+    from coding_stats.metrics import feature_ranking
+    from coding_stats.targets import annotate_all
 
     assert annotate_all(repo, classified) == 2
     close_lineage(classified)
 
     out = write_report(classified, tmp_path / "r.html")
     text = out.read_text(encoding="utf-8")
-    assert "<svg" in text and "skill-stats report" in text
+    assert "<svg" in text and "coding-stats report" in text
     assert "alpha" in text  # fixture feature named in ranking table
     ranking = feature_ranking(classified)[:5]
     assert ranking and ranking[0].fid == "repo-1" and ranking[0].fixes == 2

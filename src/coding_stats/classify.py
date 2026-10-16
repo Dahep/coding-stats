@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_MODEL = "opencode/glm-5.3-flash"
-SESSION_DIR = Path("/tmp/opencode/skill-stats-classifier")
+SESSION_DIR = Path("/tmp/opencode/coding-stats-classifier")
 DIFF_CAP = 12000
 BODY_CAP = 2500
 

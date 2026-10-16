@@ -27,7 +27,7 @@ from pathlib import Path
 
 from . import artifact, db, gitwalk, identity
 
-STORE_PATH = ".skill-stats/skill-stats.sql"
+STORE_PATH = ".coding-stats/coding-stats.sql"
 
 # machine-local + user config survive a rebuild; derived measurement state
 # never does (it is re-derived, or travels with the artifact's own rows)
@@ -107,7 +107,7 @@ def rebuild(
         _carry_settings(old, fresh)
         identity.register_repository(fresh, repo_dir, branch)
         if data is not None:
-            _rehydrate_diffs(fresh, repo_dir)
+            rehydrate_diffs(fresh, repo_dir)
         fresh.commit()
     finally:
         fresh.close()
@@ -121,13 +121,14 @@ def rebuild(
     return db.connect(db_path)
 
 
-def _rehydrate_diffs(conn: sqlite3.Connection, repo_dir: Path) -> int:
+def rehydrate_diffs(conn: sqlite3.Connection, repo_dir: Path) -> int:
     """Refill commits.diff for PENDING commits (no verdict row) from git,
     through the walk's own diff+strip path (store paths out, merge diffs vs
     first parent). The artifact format stores '' for the machine-derivable
     payload; without this, restored backlog would be classified against noise
     (merges would even pass the empty-merge shortcut). Classified commits
-    keep '' — their diffs are already consumed."""
+    keep '' — their diffs are already consumed. Public: the migration seed
+    path (ADR-0005) re-uses it after materializing a legacy artifact."""
     rows = conn.execute(
         """SELECT c.id, c.sha FROM commits c LEFT JOIN commit_verdicts v
            ON v.commit_id = c.id WHERE v.commit_id IS NULL"""

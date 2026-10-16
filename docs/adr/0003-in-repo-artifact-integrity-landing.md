@@ -14,7 +14,7 @@ travels with its repo, survives machine switches, and any clone can read it.
 Decision, per grill rounds recorded in `docs/decisions-trail.tsv`:
 
 1. **Artifact = per-repo analysis store, not a metrics snapshot.** Each Target
-   repo commits a `.skill-stats/` directory holding the complete analysis state
+   repo commits a `.coding-stats/` directory holding the complete analysis state
    of that repo (verdicts, features, fix attribution, lineage, computed line
    columns) plus a regenerated standard HTML report. Org-wide stats are later
    built by gathering artifacts; nothing in this ADR depends on the gather
@@ -42,7 +42,7 @@ Decision, per grill rounds recorded in `docs/decisions-trail.tsv`:
    horizon, re-run detect/lineage/report, and write a fresh version. Full
    recompute (everything re-classified) is the fallback when the history
    itself was rewritten so no verifiable version remains.
-4. **Exclusion: `.skill-stats/**` only.** Walk skips commits whose stripped
+4. **Exclusion: `.skill-stats/**` and `.coding-stats/**`.** Walk skips commits whose stripped
    diff is empty; mixed commits lose the artifact paths before
    classification/churn; blame parsing ignores store paths. The rule is a path
    pattern, not a commit list, so re-inits, fork history, and CI-created

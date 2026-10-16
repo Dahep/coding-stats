@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from skill_stats.identity import (
+from coding_stats.identity import (
     local_identity,
     normalize_clone_url,
     register_repository,
@@ -106,7 +106,7 @@ def test_register_repository_prefers_origin_url(repo, tmp_path):
         check=True,
         capture_output=True,
     )
-    from skill_stats.db import connect
+    from coding_stats.db import connect
 
     conn = connect(tmp_path / "i.db")
     rid = register_repository(conn, repo, "main")
@@ -127,7 +127,7 @@ def test_register_repository_prefers_origin_url(repo, tmp_path):
 
 
 def test_register_repository_shim_without_origin(repo, tmp_path):
-    from skill_stats.db import connect
+    from coding_stats.db import connect
 
     conn = connect(tmp_path / "i.db")
     rid = register_repository(conn, repo, "main")
@@ -138,7 +138,7 @@ def test_register_repository_shim_without_origin(repo, tmp_path):
 
 
 def test_repo_id_for_requires_registration(tmp_path):
-    from skill_stats.db import connect
+    from coding_stats.db import connect
 
     conn = connect(tmp_path / "i.db")
     with pytest.raises(RuntimeError, match="run init first"):
@@ -179,7 +179,7 @@ def _add_commit_row(conn, rid, walk_index=1):
 def test_reregister_same_key_is_idempotent_noop(repo, tmp_path):
     import warnings
 
-    from skill_stats.db import connect
+    from coding_stats.db import connect
 
     _set_origin(repo, "git@github.com:dahep/dotfiles.git")
     conn = connect(tmp_path / "i.db")
@@ -192,7 +192,7 @@ def test_reregister_same_key_is_idempotent_noop(repo, tmp_path):
 
 
 def test_reregister_replaces_when_no_data(repo, tmp_path):
-    from skill_stats.db import connect
+    from coding_stats.db import connect
 
     _set_origin(repo, "git@github.com:dahep/dotfiles.git")
     conn = connect(tmp_path / "i.db")
@@ -207,7 +207,7 @@ def test_reregister_replaces_when_no_data(repo, tmp_path):
 
 
 def test_reregister_refuses_relabel_with_data(repo, tmp_path):
-    from skill_stats.db import connect
+    from coding_stats.db import connect
 
     _set_origin(repo, "git@github.com:dahep/dotfiles.git")
     conn = connect(tmp_path / "i.db")
@@ -221,7 +221,7 @@ def test_reregister_refuses_relabel_with_data(repo, tmp_path):
 
 
 def test_reregister_refuses_branch_relabel_with_data(repo, tmp_path):
-    from skill_stats.db import connect
+    from coding_stats.db import connect
 
     _set_origin(repo, "git@github.com:dahep/dotfiles.git")
     conn = connect(tmp_path / "i.db")
@@ -232,7 +232,7 @@ def test_reregister_refuses_branch_relabel_with_data(repo, tmp_path):
 
 
 def test_reregister_never_downgrades_canonical_to_shim(repo, tmp_path):
-    from skill_stats.db import connect
+    from coding_stats.db import connect
 
     _set_origin(repo, "git@github.com:dahep/dotfiles.git")
     conn = connect(tmp_path / "i.db")
@@ -246,7 +246,7 @@ def test_reregister_never_downgrades_canonical_to_shim(repo, tmp_path):
 
 
 def test_reregister_upgrades_shim_to_canonical_with_data(repo, tmp_path):
-    from skill_stats.db import connect
+    from coding_stats.db import connect
 
     _set_origin(repo, None)
     conn = connect(tmp_path / "i.db")

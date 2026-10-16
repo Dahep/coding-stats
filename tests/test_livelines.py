@@ -6,12 +6,12 @@ import subprocess
 
 import pytest
 
+from coding_stats.blame import _porcelain_shas
+from coding_stats.gitwalk import walk
+from coding_stats.lineage import close_lineage
+from coding_stats.livelines import _line_counts_at, sample_points, update_live_lines
+from coding_stats.targets import annotate_all
 from conftest import add_feature, commit_files, make_db, run
-from skill_stats.blame import _porcelain_shas
-from skill_stats.gitwalk import walk
-from skill_stats.lineage import close_lineage
-from skill_stats.livelines import _line_counts_at, sample_points, update_live_lines
-from skill_stats.targets import annotate_all
 
 
 def _verdict(conn, sha, verdict):
@@ -210,7 +210,7 @@ def test_porcelain_parser_on_real_blame_output(repo, shas):
 
 
 def test_report_renders_live_lines_column_and_size_chart(repo, tmp_path):
-    from skill_stats import htmlreport
+    from coding_stats import htmlreport
 
     h1 = commit_files(repo, "feature a", {"f.txt": "a1\na2\n"})
     h2 = commit_files(repo, "feature b", {"g.txt": "b1\n"})
@@ -230,7 +230,7 @@ def test_report_renders_live_lines_column_and_size_chart(repo, tmp_path):
 
 
 def test_report_graceful_without_samples(repo, tmp_path):
-    from skill_stats import htmlreport
+    from coding_stats import htmlreport
 
     h1 = commit_files(repo, "feature a", {"f.txt": "a1\na2\n"})
     conn = make_db(tmp_path / "l.db", repo)
@@ -241,7 +241,7 @@ def test_report_graceful_without_samples(repo, tmp_path):
     page = htmlreport.build(conn)  # live-lines never ran: no samples
     assert "Live lines" in page
     assert "Feature size over time" not in page  # section omitted, page still renders
-    assert "skill-stats report" in page
+    assert "coding-stats report" in page
 
 
 # ------------------------------------- quoted names + first-parent blaming --
@@ -252,7 +252,7 @@ def test_live_lines_handles_non_ascii_names_and_quoted_store_paths(repo, tmp_pat
     # listing must use raw names, and store-path exclusion must see decoded
     # names even when the store file itself is non-ASCII
     h1 = commit_files(repo, "feature a", {"café.txt": "a1\na2\n"})
-    commit_files(repo, "store only", {".skill-stats/ünïcode.sql": "INSERT\n"})
+    commit_files(repo, "store only", {".coding-stats/ünïcode.sql": "INSERT\n"})
     h3 = commit_files(repo, "tip work", {"k.txt": "k1\n"})
     conn = make_db(tmp_path / "l.db", repo)
     walk(repo, conn, "main")  # the store-only commit is skipped by the walk
@@ -314,7 +314,7 @@ def _verdicted_feature_repo(repo, tmp_path):
 
 def test_backfill_resumes_after_interruption(repo, tmp_path, monkeypatch):
     conn, fa, fb, h1, h2 = _verdicted_feature_repo(repo, tmp_path)
-    import skill_stats.livelines as livelines
+    import coding_stats.livelines as livelines
 
     real = livelines._line_counts_at
     calls = {"n": 0, "boom": True}
@@ -400,7 +400,7 @@ def test_known_commit_without_links_is_neither_feature_nor_unattributed(repo, tm
 
 
 def test_report_marks_incomplete_sampling_and_renames_total(repo, tmp_path):
-    from skill_stats import htmlreport
+    from coding_stats import htmlreport
 
     h1 = commit_files(repo, "first", {"f.txt": "a1\na2\n"})
     h2 = commit_files(repo, "second", {"g.txt": "b1\n"})
@@ -428,7 +428,7 @@ def test_report_marks_incomplete_sampling_and_renames_total(repo, tmp_path):
 
 
 def test_chart_draws_gaps_not_zeros_when_incomplete():
-    from skill_stats import htmlreport
+    from coding_stats import htmlreport
 
     chart = htmlreport._lines_chart(
         ["a", "b", "c"], [("s", [1.0, None, 3.0], "#123456")], ("t", [1.0, 1.0, 3.0], "#654321")

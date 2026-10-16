@@ -1,4 +1,4 @@
-# skill-stats
+# coding-stats
 
 A tool that mines git history (and later opencode history) to measure feature-level metrics like features/year, fixes/feature, and later cost and skill usage per feature.
 
@@ -60,7 +60,7 @@ A Skill invocation from sessions predating the plugin's existence. Most skill at
 The git working copy a Run analyzes. One checkout pairs one Repository key.
 
 **Artifact**:
-The committed `.skill-stats/` store holding a Target repo's complete git-analysis state (verdicts, features, fix attribution, lineage). Source of truth for that repo's numbers; Org-wide metrics are gathered from many Artifacts.
+The committed `.coding-stats/` store holding a Target repo's complete git-analysis state (verdicts, features, fix attribution, lineage). Source of truth for that repo's numbers; Org-wide metrics are gathered from many Artifacts.
 _Avoid_: export, dump
 
 **Artifact digest**:

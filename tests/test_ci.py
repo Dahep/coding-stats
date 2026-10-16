@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from coding_stats import ci
 from conftest import commit_files, run
-from skill_stats import ci
 
 
 def _git(repo, *args) -> str:
@@ -29,34 +29,34 @@ def _with_remote(repo, bare) -> None:
 
 
 def _store_changes(repo):
-    (repo / ".skill-stats").mkdir(exist_ok=True)
-    (repo / ".skill-stats" / "report.html").write_text("<html>report</html>", encoding="utf-8")
-    (repo / ".skill-stats" / "skill-stats.sql").write_text(
-        "-- skill-stats artifact\n-- digest:\n", encoding="utf-8"
+    (repo / ".coding-stats").mkdir(exist_ok=True)
+    (repo / ".coding-stats" / "report.html").write_text("<html>report</html>", encoding="utf-8")
+    (repo / ".coding-stats" / "coding-stats.sql").write_text(
+        "-- coding-stats artifact\n-- digest:\n", encoding="utf-8"
     )
 
 
 def test_ci_init_writes_workflow_and_is_idempotent(repo):
     ci.init(repo, "main")
-    wf = repo / ".github" / "workflows" / "skill-stats.yml"
+    wf = repo / ".github" / "workflows" / "coding-stats.yml"
     text = wf.read_text(encoding="utf-8")
     for needle in (
         "paths-ignore",
-        ".skill-stats/**",
+        ".coding-stats/**",
         "fetch-depth: 0",
         "contents: write",
         "astral-sh/setup-uv",
         "https://opencode.ai/install",
         "OPENCODE_API_KEY",
-        "skill-stats update --db",
-        "skill-stats ci land --branch",
+        "coding-stats update --db",
+        "coding-stats ci land --branch",
         "actions/upload-artifact",
         "if: always()",
         "schedule",  # cadence configurable in one obvious place
     ):
         assert needle in text
     assert "glm" not in text  # no model names: settings travel in the artifact
-    gi = repo / ".skill-stats" / ".gitignore"
+    gi = repo / ".coding-stats" / ".gitignore"
     assert "working.db" in gi.read_text(encoding="utf-8")  # throwaway DB never commits
 
     msgs = ci.init(repo, "main")  # idempotent assertion
@@ -66,7 +66,7 @@ def test_ci_init_writes_workflow_and_is_idempotent(repo):
 
 def test_ci_init_refuses_drift_unless_upgrade(repo):
     ci.init(repo, "main")
-    wf = repo / ".github" / "workflows" / "skill-stats.yml"
+    wf = repo / ".github" / "workflows" / "coding-stats.yml"
     wf.write_text(wf.read_text(encoding="utf-8") + "\n# hand edit\n", encoding="utf-8")
     with pytest.raises(ci.DriftError, match="--upgrade") as excinfo:
         ci.init(repo, "main")
@@ -78,7 +78,7 @@ def test_ci_init_refuses_drift_unless_upgrade(repo):
 
 def test_ci_init_no_push_omits_landing_step(repo):
     ci.init(repo, "main", push=False)
-    text = (repo / ".github" / "workflows" / "skill-stats.yml").read_text(encoding="utf-8")
+    text = (repo / ".github" / "workflows" / "coding-stats.yml").read_text(encoding="utf-8")
     assert "ci land" not in text
     assert "contents: write" not in text  # nothing is written without the landing step
 
@@ -102,8 +102,8 @@ def test_ci_land_commits_and_pushes(repo, tmp_path):
     assert ci.commit_or_abandon(repo, "main", "origin").status == "landed"
     assert (
         _git(repo, "log", "-1", "--format=%an|%ae|%s").strip()
-        == "skill-stats[bot]|skill-stats[bot]@users.noreply.github.com"
-        "|skill-stats artifact update (auto)"
+        == "coding-stats[bot]|coding-stats[bot]@users.noreply.github.com"
+        "|coding-stats artifact update (auto)"
     )
     head = _git(repo, "rev-parse", "HEAD").strip()
     assert _git(bare, "rev-parse", "refs/heads/main").strip() == head  # pushed
@@ -132,7 +132,7 @@ def test_ci_land_abandons_when_newer_push_landed(repo, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "::notice::" in out  # neutral annotation: never a red run (Q18)
     assert _git(bare, "rev-parse", "refs/heads/main").strip() == tip  # nothing pushed
-    assert "skill-stats artifact update (auto)" not in _git(repo, "log", "--format=%s")
+    assert "coding-stats artifact update (auto)" not in _git(repo, "log", "--format=%s")
 
 
 # ------------------------------------------- push race + single reporting ---
@@ -206,7 +206,7 @@ def test_ci_land_unrelated_push_failure_raises(repo, tmp_path, monkeypatch):
 
 
 def test_ci_land_cli_prints_status_once(tmp_path, repo, capsys, monkeypatch):
-    from skill_stats.cli import main
+    from coding_stats.cli import main
 
     commit_files(repo, "base", {"a.txt": "a\n"})
     _with_remote(repo, _bare(tmp_path))
@@ -214,7 +214,7 @@ def test_ci_land_cli_prints_status_once(tmp_path, repo, capsys, monkeypatch):
     monkeypatch.chdir(repo)
     main(["ci", "land", "--branch", "main"])
     out = capsys.readouterr().out
-    assert out.count("skill-stats ci land: landed") == 1  # printed once, by the CLI
+    assert out.count("coding-stats ci land: landed") == 1  # printed once, by the CLI
     assert out.count("landed") == 1
 
 
@@ -241,20 +241,20 @@ def test_render_workflow_is_injection_safe_for_hostile_values():
     import yaml
 
     for branch in ("feature;id", "true", "café branch", "1.0"):
-        text = ci.render_workflow(branch, db=".skill-stats/my db.sql")
+        text = ci.render_workflow(branch, db=".coding-stats/my db.sql")
         doc = yaml.safe_load(text)
         on = doc.get("on", doc.get(True))  # PyYAML 1.1 reads bare `on` as bool
         assert on["push"]["branches"] == [branch]  # clean strings: 'true' is not a bool
-        assert doc["env"]["SKILL_STATS_BRANCH"] == branch
-        assert doc["env"]["SKILL_STATS_DB"] == ".skill-stats/my db.sql"
-        for step in doc["jobs"]["skill-stats"]["steps"]:
+        assert doc["env"]["CODING_STATS_BRANCH"] == branch
+        assert doc["env"]["CODING_STATS_DB"] == ".coding-stats/my db.sql"
+        for step in doc["jobs"]["coding-stats"]["steps"]:
             run_line = step.get("run", "")
             # parameters travel via env only: no user value ever lands in a
             # run line (word-boundary check; '1.0' inside an unrelated
             # constant like ==0.1.0 is not interpolation)
             assert not re.search(rf"(?<![\w.-]){re.escape(branch)}(?![\w.-])", run_line)
             assert ";id" not in run_line  # no injection surface in run: lines
-        assert '"$SKILL_STATS_BRANCH"' in text and '"$SKILL_STATS_DB"' in text
+        assert '"$CODING_STATS_BRANCH"' in text and '"$CODING_STATS_DB"' in text
 
 
 def test_ci_init_validates_branch_ref_name(repo):
@@ -263,17 +263,17 @@ def test_ci_init_validates_branch_ref_name(repo):
     with pytest.raises(ValueError, match="café branch"):
         ci.init(repo, "café branch")  # spaces are not valid ref characters
     ci.init(repo, "feature;id")  # valid ref, hostile shell-wise: renders safely
-    doc = yaml.safe_load((repo / ".github" / "workflows" / "skill-stats.yml").read_text("utf-8"))
+    doc = yaml.safe_load((repo / ".github" / "workflows" / "coding-stats.yml").read_text("utf-8"))
     on = doc.get("on", doc.get(True))
     assert on["push"]["branches"] == ["feature;id"]
 
 
 def test_ci_workflow_installs_tool_standalone(repo):
     ci.init(repo, "main")
-    text = (repo / ".github" / "workflows" / "skill-stats.yml").read_text("utf-8")
+    text = (repo / ".github" / "workflows" / "coding-stats.yml").read_text("utf-8")
     sha = ci.own_commit()
     spec = ci.install_spec(tool_ref=sha)
-    # the target repo does not depend on skill-stats: install the tool
+    # the target repo does not depend on coding-stats: install the tool
     # standalone, pinned to the rendering checkout's commit (not PyPI — the
     # package is not published; git install keeps upgrades re-render
     # testable) — from bigger repos, --tool-ref moves the pin explicitly
@@ -281,8 +281,8 @@ def test_ci_workflow_installs_tool_standalone(repo):
     if sha:
         assert sha in text
     assert "uv sync" not in text  # no target-dependency assumption
-    assert "uv run skill-stats" not in text
-    assert "skill-stats update --db" in text  # direct invocation
+    assert "uv run coding-stats" not in text
+    assert "coding-stats update --db" in text  # direct invocation
     # installer is best-effort: a failed download must not abort the run
     assert "continue-on-error: true" in text
 
@@ -291,37 +291,37 @@ def test_ci_pages_job_is_opt_in(repo):
     import yaml
 
     ci.init(repo, "main")  # default: no Pages deployment is rendered
-    text = (repo / ".github" / "workflows" / "skill-stats.yml").read_text("utf-8")
+    text = (repo / ".github" / "workflows" / "coding-stats.yml").read_text("utf-8")
     assert "deploy-pages" not in text
     assert "id-token" not in text
 
     ci.init(repo, "main", pages=True, upgrade=True)  # opt-in re-render moves it in
     doc = yaml.safe_load(
-        (repo / ".github" / "workflows" / "skill-stats.yml").read_text("utf-8")
+        (repo / ".github" / "workflows" / "coding-stats.yml").read_text("utf-8")
     )
     job = doc["jobs"]["deploy-pages"]
     # scoped permissions override the workflow default job-locally: the
     # landing commit keeps contents: write, the pages job never gets it
-    assert job["needs"] == "skill-stats"
+    assert job["needs"] == "coding-stats"
     assert job["permissions"] == {"pages": "write", "id-token": "write"}
     assert job["environment"]["name"] == "github-pages"
     uses = [step["uses"] for step in job["steps"] if "uses" in step]
     assert any(u.startswith("actions/deploy-pages@v") for u in uses)
     assert any(u.startswith("actions/upload-pages-artifact@v") for u in uses)
-    assert doc["jobs"]["skill-stats"].get("permissions") is None
+    assert doc["jobs"]["coding-stats"].get("permissions") is None
 
 
 def test_ci_pages_job_deploys_last_landed_report(repo):
     import yaml
 
     ci.init(repo, "main", pages=True)
-    text = (repo / ".github" / "workflows" / "skill-stats.yml").read_text("utf-8")
+    text = (repo / ".github" / "workflows" / "coding-stats.yml").read_text("utf-8")
     assert "actions/download-artifact@v4" in text
     assert "mv site/report.html site/index.html" in text
     doc = yaml.safe_load(text)
     deploys = doc["jobs"]["deploy-pages"]
     assert deploys["concurrency"]["group"] == "pages"
-    assert "- name: skill-stats-report" not in text  # no artifact name drift
+    assert "- name: coding-stats-report" not in text  # no artifact name drift
 
 
 def test_ci_init_refuses_drift_unless_upgrade_pages(repo):
@@ -333,18 +333,18 @@ def test_ci_init_refuses_drift_unless_upgrade_pages(repo):
 
 
 def test_ci_init_drift_preflight_is_all_or_nothing(repo):
-    gi = repo / ".skill-stats" / ".gitignore"
+    gi = repo / ".coding-stats" / ".gitignore"
     gi.parent.mkdir(parents=True, exist_ok=True)
     gi.write_text("# hand edited\n", encoding="utf-8")  # drifted store gitignore
     with pytest.raises(ci.DriftError, match="--upgrade"):
         ci.init(repo, "main")  # workflow is missing but must NOT be half-written
-    assert not (repo / ".github" / "workflows" / "skill-stats.yml").exists()
+    assert not (repo / ".github" / "workflows" / "coding-stats.yml").exists()
     assert gi.read_text(encoding="utf-8") == "# hand edited\n"
 
 
 def test_ci_init_custom_db_gitignore_covers_sidecars(repo):
-    ci.init(repo, "main", db=".skill-stats/ci state.db")
-    gi = (repo / ".skill-stats" / ".gitignore").read_text(encoding="utf-8")
+    ci.init(repo, "main", db=".coding-stats/ci state.db")
+    gi = (repo / ".coding-stats" / ".gitignore").read_text(encoding="utf-8")
     for entry in (
         "ci state.db\n",
         "ci state.db-wal\n",
@@ -353,5 +353,5 @@ def test_ci_init_custom_db_gitignore_covers_sidecars(repo):
     ):
         assert entry in gi  # computed from the configured db, not hardcoded
     # and the gitignore can never swallow the artifact files themselves
-    with pytest.raises(ValueError, match="skill-stats.sql"):
-        ci.init(repo, "main", db=".skill-stats/skill-stats.sql", upgrade=True)
+    with pytest.raises(ValueError, match="coding-stats.sql"):
+        ci.init(repo, "main", db=".coding-stats/coding-stats.sql", upgrade=True)
