@@ -5,12 +5,12 @@ import json
 import re
 import sqlite3
 
+from coding_stats import artifact
+from coding_stats.gitwalk import walk
+from coding_stats.lineage import close_lineage
+from coding_stats.livelines import update_live_lines
+from coding_stats.targets import annotate_all
 from conftest import add_feature, commit_files, make_db
-from skill_stats import artifact
-from skill_stats.gitwalk import walk
-from skill_stats.lineage import close_lineage
-from skill_stats.livelines import update_live_lines
-from skill_stats.targets import annotate_all
 
 CLASSIFIED_AT = "2026-01-01T00:00:00Z"
 
@@ -63,8 +63,8 @@ def test_serialize_is_byte_stable_and_digest_verifies(tmp_path, repo):
     second = artifact.serialize(conn)
     assert first == second  # byte-equal across calls
     path = artifact.write(conn, repo)
-    assert path == repo / ".skill-stats" / "skill-stats.sql"
-    assert (repo / ".skill-stats" / "report.html").exists()
+    assert path == repo / ".coding-stats" / "coding-stats.sql"
+    assert (repo / ".coding-stats" / "report.html").exists()
     assert artifact.verify(path) is None
     content = path.read_text(encoding="utf-8")
     assert artifact.digest_of(path) == _header(content, "digest")
@@ -77,7 +77,7 @@ def test_serialize_is_byte_stable_and_digest_verifies(tmp_path, repo):
     assert err is not None and "mismatch" in err
     # a missing digest line is an error, not an ok
     bare = tmp_path / "bare.sql"
-    bare.write_text("-- skill-stats artifact\n", encoding="utf-8")
+    bare.write_text("-- coding-stats artifact\n", encoding="utf-8")
     assert artifact.verify(bare) is not None
     conn.close()
 
@@ -172,7 +172,7 @@ def test_artifact_materializes_standalone_with_committed_shapes(tmp_path, repo):
 def test_header_fields(tmp_path, repo):
     conn, fa, h1, h2 = _built_db(tmp_path, repo)
     content = artifact.serialize(conn).decode("utf-8")
-    assert content.startswith("-- skill-stats artifact\n-- format: 1\n")
+    assert content.startswith("-- coding-stats artifact\n-- format: 1\n")
     assert _header(content, "schema-step") == "2"
     assert _header(content, "repository-key") == "local:repo@main"
     assert _header(content, "covered-through") == h2  # latest walked commit

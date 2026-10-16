@@ -7,16 +7,16 @@ import sqlite3
 
 import pytest
 
+from coding_stats import artifact
+from coding_stats.cli import main
+from coding_stats.gitwalk import walk
 from conftest import commit_files, make_db, run
-from skill_stats import artifact
-from skill_stats.cli import main
-from skill_stats.gitwalk import walk
 
 
 def _good_artifact(extra: bytes = b"") -> bytes:
     """A minimal self-verifying artifact blob (valid embedded digest)."""
     blank = (
-        b"-- skill-stats artifact\n-- format: 1\n-- schema-step: 2\n"
+        b"-- coding-stats artifact\n-- format: 1\n-- schema-step: 2\n"
         b"-- repository-key: x\n-- covered-through: y\n-- digest:\n"
     )
     digest = hashlib.sha256(blank + extra).hexdigest()
@@ -43,9 +43,9 @@ def _init(tmp_path, repo) -> str:
 
 
 def _land_artifact(repo) -> str:
-    """Commit the current .skill-stats/ store the way ci land does."""
-    run(repo, "add", "-A", "--", ".skill-stats")
-    run(repo, "commit", "-m", "skill-stats artifact update (auto)")
+    """Commit the current .coding-stats/ store the way ci land does."""
+    run(repo, "add", "-A", "--", ".coding-stats")
+    run(repo, "commit", "-m", "coding-stats artifact update (auto)")
     import subprocess
 
     return subprocess.run(
@@ -65,7 +65,7 @@ def test_partial_recompute_anchors_prior_committed_version(tmp_path, repo, capsy
     commit_files(repo, "feature two", {"b.txt": "b1\n"})
     db_path = _init(tmp_path, repo)
     monkeypatch.setattr(
-        "skill_stats.cli.Session",
+        "coding_stats.cli.Session",
         lambda model, sid=None: Scripted(
             [
                 '{"k":"new","title":"one","about":"x","why":"y"}',
@@ -81,12 +81,12 @@ def test_partial_recompute_anchors_prior_committed_version(tmp_path, repo, capsy
     # a second version whose committed content is hand-tampered
     commit_files(repo, "feature three", {"c.txt": "c1\n"})
     monkeypatch.setattr(
-        "skill_stats.cli.Session",
+        "coding_stats.cli.Session",
         lambda model, sid=None: Scripted(['{"k":"new","title":"three","about":"x","why":"y"}'], []),
     )
     main(["update", "--db", db_path])
     capsys.readouterr()
-    art = repo / ".skill-stats" / "skill-stats.sql"
+    art = repo / ".coding-stats" / "coding-stats.sql"
     art.write_text(
         art.read_text(encoding="utf-8")
         + "\nINSERT INTO features (id, title, about, created_at, repo_id, live_lines)"
@@ -97,7 +97,7 @@ def test_partial_recompute_anchors_prior_committed_version(tmp_path, repo, capsy
 
     log = []
     monkeypatch.setattr(
-        "skill_stats.cli.Session",
+        "coding_stats.cli.Session",
         lambda model, sid=None: Scripted(
             ['{"k":"new","title":"three","about":"x","why":"y"}'], log
         ),
@@ -120,7 +120,7 @@ def test_full_recompute_when_no_committed_version_verifies(tmp_path, repo, capsy
     commit_files(repo, "feature two", {"b.txt": "b1\n"})
     db_path = _init(tmp_path, repo)
     monkeypatch.setattr(
-        "skill_stats.cli.Session",
+        "coding_stats.cli.Session",
         lambda model, sid=None: Scripted(
             [
                 '{"k":"new","title":"one","about":"x","why":"y"}',
@@ -132,7 +132,7 @@ def test_full_recompute_when_no_committed_version_verifies(tmp_path, repo, capsy
     main(["update", "--db", db_path])
     capsys.readouterr()
     # history-rewrite case: the ONLY committed version is tampered
-    art = repo / ".skill-stats" / "skill-stats.sql"
+    art = repo / ".coding-stats" / "coding-stats.sql"
     art.write_text(
         art.read_text(encoding="utf-8")
         + "\nINSERT INTO features (id, title, about, created_at, repo_id, live_lines)"
@@ -142,7 +142,7 @@ def test_full_recompute_when_no_committed_version_verifies(tmp_path, repo, capsy
     _land_artifact(repo)
 
     monkeypatch.setattr(
-        "skill_stats.cli.Session",
+        "coding_stats.cli.Session",
         lambda model, sid=None: Scripted(
             [
                 '{"k":"new","title":"one","about":"x","why":"y"}',
@@ -167,7 +167,7 @@ def test_reclassify_only_commits_newer_than_coverage_horizon(tmp_path, repo, cap
     commit_files(repo, "feature two", {"b.txt": "b1\n"})
     db_path = _init(tmp_path, repo)
     monkeypatch.setattr(
-        "skill_stats.cli.Session",
+        "coding_stats.cli.Session",
         lambda model, sid=None: Scripted(
             [
                 '{"k":"new","title":"one","about":"x","why":"y"}',
@@ -184,11 +184,11 @@ def test_reclassify_only_commits_newer_than_coverage_horizon(tmp_path, repo, cap
 
     # tampered CURRENT FILE (uncommitted hand-edit) resolves through the same
     # MISMATCH path: the newest self-verifying committed version anchors
-    art = repo / ".skill-stats" / "skill-stats.sql"
+    art = repo / ".coding-stats" / "coding-stats.sql"
     art.write_bytes(art.read_bytes() + b"\n-- hand tamper\n")
     log = []
     monkeypatch.setattr(
-        "skill_stats.cli.Session",
+        "coding_stats.cli.Session",
         lambda model, sid=None: Scripted(
             [
                 '{"k":"new","title":"three","about":"x","why":"y"}',
@@ -210,11 +210,11 @@ def test_mismatch_without_history_falls_back_to_fresh_walk(tmp_path, repo, capsy
     commit_files(repo, "feature one", {"a.txt": "a1\n"})
     commit_files(repo, "feature two", {"b.txt": "b1\n"})
     db_path = _init(tmp_path, repo)  # no update yet: nothing committed, nothing trusted
-    art = repo / ".skill-stats" / "skill-stats.sql"
+    art = repo / ".coding-stats" / "coding-stats.sql"
     art.parent.mkdir(parents=True, exist_ok=True)
     art.write_text("garbage without a digest line\n", encoding="utf-8")
     monkeypatch.setattr(
-        "skill_stats.cli.Session",
+        "coding_stats.cli.Session",
         lambda model, sid=None: Scripted(
             [
                 '{"k":"new","title":"one","about":"x","why":"y"}',
@@ -238,7 +238,7 @@ def test_update_seeds_fresh_db_from_verified_artifact(tmp_path, repo, capsys, mo
     commit_files(repo, "feature two", {"b.txt": "b1\n"})
     db_path = _init(tmp_path, repo)
     monkeypatch.setattr(
-        "skill_stats.cli.Session",
+        "coding_stats.cli.Session",
         lambda model, sid=None: Scripted(
             [
                 '{"k":"new","title":"one","about":"x","why":"y"}',
@@ -252,9 +252,9 @@ def test_update_seeds_fresh_db_from_verified_artifact(tmp_path, repo, capsys, mo
     _land_artifact(repo)
 
     monkeypatch.chdir(repo)  # the checkout is the repo (CI semantics)
-    ci_db = str(repo / ".skill-stats" / "working.db")
+    ci_db = str(repo / ".coding-stats" / "working.db")
     log = []
-    monkeypatch.setattr("skill_stats.cli.Session", lambda model, sid=None: Scripted([], log))
+    monkeypatch.setattr("coding_stats.cli.Session", lambda model, sid=None: Scripted([], log))
     main(["update", "--db", ci_db])
     out = capsys.readouterr().out
     assert "artifact digest: ok" in out
@@ -271,8 +271,8 @@ def test_update_seeds_fresh_db_from_verified_artifact(tmp_path, repo, capsys, mo
 
 
 def test_seed_rehydrates_pending_diffs_including_merges(tmp_path, repo, capsys, monkeypatch):
+    from coding_stats import gitwalk
     from conftest import run as _run
-    from skill_stats import gitwalk
 
     commit_files(repo, "base", {"a.txt": "a1\n"})
     _run(repo, "checkout", "-q", "-b", "side")
@@ -282,16 +282,16 @@ def test_seed_rehydrates_pending_diffs_including_merges(tmp_path, repo, capsys, 
     db_path = _init(tmp_path, repo)
     # the committed store carries the backlog unclassified: artifact rows have
     # diff='' by format
-    monkeypatch.setattr("skill_stats.cli.Session", lambda model, sid=None: Scripted([], []))
+    monkeypatch.setattr("coding_stats.cli.Session", lambda model, sid=None: Scripted([], []))
     main(["update", "--db", db_path, "--no-classify"])
     capsys.readouterr()
     _land_artifact(repo)
 
     monkeypatch.chdir(repo)
-    ci_db = str(repo / ".skill-stats" / "working.db")
+    ci_db = str(repo / ".coding-stats" / "working.db")
     log = []
     monkeypatch.setattr(
-        "skill_stats.cli.Session",
+        "coding_stats.cli.Session",
         lambda model, sid=None: Scripted(['{"k":"new","title":"x","about":"x","why":"y"}'], log),
     )
     main(["update", "--db", ci_db])
@@ -314,7 +314,7 @@ def test_seed_rehydrates_pending_diffs_including_merges(tmp_path, repo, capsys, 
 
 
 def test_rebuild_swap_failure_keeps_original_db(tmp_path, repo, monkeypatch):
-    from skill_stats import recovery
+    from coding_stats import recovery
 
     commit_files(repo, "base", {"a.txt": "a1\n"})
     db_path = tmp_path / "r.db"
@@ -338,16 +338,16 @@ def test_rebuild_swap_failure_keeps_original_db(tmp_path, repo, monkeypatch):
 
 
 def test_find_anchor_scoped_to_target_branch(tmp_path, repo):
-    from skill_stats import recovery
+    from coding_stats import recovery
 
     commit_files(repo, "base", {"a.txt": "a1\n"})
     # artifact history that exists ONLY on a side branch
     from conftest import run as _run
 
     _run(repo, "checkout", "-q", "-b", "side")
-    _store = repo / ".skill-stats"
+    _store = repo / ".coding-stats"
     _store.mkdir()
-    (_store / "skill-stats.sql").write_bytes(_good_artifact())
+    (_store / "coding-stats.sql").write_bytes(_good_artifact())
     _land_artifact(repo)
     side_commit = _git_head(repo)
     _run(repo, "checkout", "-q", "main")
@@ -358,16 +358,16 @@ def test_find_anchor_scoped_to_target_branch(tmp_path, repo):
 
 
 def test_find_anchor_prefers_target_branch_version(tmp_path, repo):
+    from coding_stats import recovery
     from conftest import run as _run
-    from skill_stats import recovery
 
     commit_files(repo, "base", {"a.txt": "a1\n"})
-    (repo / ".skill-stats").mkdir()
-    (repo / ".skill-stats" / "skill-stats.sql").write_bytes(_good_artifact())
+    (repo / ".coding-stats").mkdir()
+    (repo / ".coding-stats" / "coding-stats.sql").write_bytes(_good_artifact())
     main_commit = _land_artifact(repo)
     _run(repo, "checkout", "-q", "-b", "side")
     commit_files(repo, "side work", {"s.txt": "s\n"})
-    (repo / ".skill-stats" / "skill-stats.sql").write_bytes(_good_artifact(b"# side\n"))
+    (repo / ".coding-stats" / "coding-stats.sql").write_bytes(_good_artifact(b"# side\n"))
     _land_artifact(repo)
     _run(repo, "checkout", "-q", "main")
 
@@ -380,7 +380,7 @@ def test_no_cross_branch_restore_on_mismatch(tmp_path, repo, capsys, monkeypatch
     commit_files(repo, "feature two", {"b.txt": "b1\n"})
     db_path = _init(tmp_path, repo)
     monkeypatch.setattr(
-        "skill_stats.cli.Session",
+        "coding_stats.cli.Session",
         lambda model, sid=None: Scripted(
             [
                 '{"k":"new","title":"one","about":"x","why":"y"}',
@@ -397,7 +397,7 @@ def test_no_cross_branch_restore_on_mismatch(tmp_path, repo, capsys, monkeypatch
     _run(repo, "checkout", "-q", "-b", "side")
     _land_artifact(repo)
     _run(repo, "checkout", "-q", "main")
-    art = repo / ".skill-stats" / "skill-stats.sql"
+    art = repo / ".coding-stats" / "coding-stats.sql"
     art.parent.mkdir(parents=True, exist_ok=True)
     art.write_bytes(
         _good_artifact()
@@ -406,7 +406,7 @@ def test_no_cross_branch_restore_on_mismatch(tmp_path, repo, capsys, monkeypatch
     )
 
     monkeypatch.setattr(
-        "skill_stats.cli.Session",
+        "coding_stats.cli.Session",
         lambda model, sid=None: Scripted(
             [
                 '{"k":"new","title":"one","about":"x","why":"y"}',

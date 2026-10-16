@@ -10,7 +10,7 @@ closure — so fix-owned lines accrue to the features the fix reaches, and a
 commit claimed by two features counts its lines in both. Lines whose
 introducing commit is not in the DB (work outside the walk) are counted and
 surfaced as unattributed_lines — never silently dropped. Store paths
-(``.skill-stats/**``) and submodule gitlinks are skipped.
+(``.coding-stats/**``) and submodule gitlinks are skipped.
 
 History: ``feature_line_samples`` holds one Sample per (feature, sample
 commit) for every feature alive at that commit (CONTEXT.md "Sample"). The

@@ -1,4 +1,4 @@
-"""CLI: uv run skill-stats {init,walk,classify,detect,lineage,report,update,ci}. Requires the
+"""CLI: uv run coding-stats {init,walk,classify,detect,lineage,report,update,ci}. Requires the
 opencode CLI on PATH for classify (ADR-0001 rolling session). update is the
 orchestrating verb (ADR-0003 clause 7); the stage subcommands stay plumbing;
 ci renders the workflow and lands artifact updates."""
@@ -38,7 +38,7 @@ def new_db(default: str, args: argparse.Namespace) -> Path:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(prog="skill-stats")
+    parser = argparse.ArgumentParser(prog="coding-stats")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     init = sub.add_parser("init", help="create a DB and store run config")
@@ -46,27 +46,27 @@ def main(argv: list[str] | None = None) -> None:
     init.add_argument("--branch", default=None)
     init.add_argument("--model", default=DEFAULT_MODEL)
     init.add_argument("--min-target-lines", type=int, default=1)
-    init.add_argument("--db", default="skill-stats.db")
+    init.add_argument("--db", default="coding-stats.db")
 
     walk = sub.add_parser("walk", help="walk Target branch into DB")
-    walk.add_argument("--db", default="skill-stats.db")
+    walk.add_argument("--db", default="coding-stats.db")
 
     cls = sub.add_parser("classify", help="LLM roll walk (opencode CLI)")
-    cls.add_argument("--db", default="skill-stats.db")
+    cls.add_argument("--db", default="coding-stats.db")
     cls.add_argument("--limit", type=int, default=None)
     cls.add_argument("--fresh", action="store_true", help="drop saved opencode session")
 
     det = sub.add_parser("detect", help="blame evidence -> fix_touches/fix_targets")
-    det.add_argument("--db", default="skill-stats.db")
+    det.add_argument("--db", default="coding-stats.db")
 
     lin = sub.add_parser("lineage", help="fixes_features transitive closure")
-    lin.add_argument("--db", default="skill-stats.db")
+    lin.add_argument("--db", default="coding-stats.db")
 
     rep = sub.add_parser("report", help="metrics text summary + optional charts")
-    rep.add_argument("--db", default="skill-stats.db")
+    rep.add_argument("--db", default="coding-stats.db")
     rep.add_argument("--charts", action="store_true")
-    rep.add_argument("--html", nargs="?", const="skill-stats-report.html", default=None)
-    rep.add_argument("--out", default="skill-stats-report")
+    rep.add_argument("--html", nargs="?", const="coding-stats-report.html", default=None)
+    rep.add_argument("--out", default="coding-stats-report")
     rep.add_argument("--json", action="store_true")
 
     up = sub.add_parser(
@@ -74,7 +74,7 @@ def main(argv: list[str] | None = None) -> None:
         help="verify -> walk -> classify -> detect -> lineage -> live-lines ->"
         " report -> serialize + digest",
     )
-    up.add_argument("--db", default="skill-stats.db")
+    up.add_argument("--db", default="coding-stats.db")
     up.add_argument("--no-classify", action="store_true", help="skip LLM classification")
     up.add_argument("--no-detect", action="store_true", help="skip blame-based fix detection")
     up.add_argument("--no-lineage", action="store_true", help="skip lineage closure")
@@ -84,7 +84,7 @@ def main(argv: list[str] | None = None) -> None:
     ci_grp = sub.add_parser("ci", help="CI scaffold: workflow rendering + artifact landing")
     ci_sub = ci_grp.add_subparsers(dest="ci_cmd", required=True)
     ci_init = ci_sub.add_parser(
-        "init", help="write .github/workflows/skill-stats.yml (idempotent, refuses drift)"
+        "init", help="write .github/workflows/coding-stats.yml (idempotent, refuses drift)"
     )
     ci_init.add_argument("--branch", default=None, help="Target branch (default: current)")
     ci_init.add_argument(
@@ -105,9 +105,9 @@ def main(argv: list[str] | None = None) -> None:
     ci_land.add_argument("--remote", default="origin")
 
     gath = sub.add_parser("gather", help="ingest artifacts into a union DB keyed by Repository key")
-    gath.add_argument("--db", default="skill-stats-union.db", help="union DB to build/refresh")
+    gath.add_argument("--db", default="coding-stats-union.db", help="union DB to build/refresh")
     gath.add_argument(
-        "sources", nargs="+", help="repo checkouts (read .skill-stats/) or artifact file paths"
+        "sources", nargs="+", help="repo checkouts (read .coding-stats/) or artifact file paths"
     )
 
     args = parser.parse_args(argv)
@@ -279,8 +279,8 @@ def _run_update(
         settings["branch"] = branch
     identity.register_repository(conn, repo_dir, branch)
 
-    store = repo_dir / ".skill-stats"
-    art_path = store / "skill-stats.sql"
+    store = repo_dir / ".coding-stats"
+    art_path = store / "coding-stats.sql"
     recovered = False
     if art_path.exists():
         err = artifact.verify(art_path)

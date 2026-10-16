@@ -16,9 +16,9 @@ from pathlib import Path
 
 import pytest
 
-from skill_stats.classify import create_feature
-from skill_stats.db import connect
-from skill_stats.identity import register_repository
+from coding_stats.classify import create_feature
+from coding_stats.db import connect
+from coding_stats.identity import register_repository
 
 
 def run(repo: Path, *args: str) -> None:

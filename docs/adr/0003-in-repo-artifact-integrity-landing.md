@@ -4,7 +4,7 @@
 
 ## Context & decision
 
-The git-analysis half of skill-stats was single-repo and machine-local: one DB
+The git-analysis half of coding-stats was single-repo and machine-local: one DB
 per run, stored outside the analyzed repo (`settings.repo` = absolute path),
 results never left the machine. The tool's goal moved to running on many repos
 with results owned by each repo and combinable later for organization-wide
@@ -14,7 +14,7 @@ travels with its repo, survives machine switches, and any clone can read it.
 Decision, per grill rounds recorded in `docs/decisions-trail.tsv`:
 
 1. **Artifact = per-repo analysis store, not a metrics snapshot.** Each Target
-   repo commits a `.skill-stats/` directory holding the complete analysis state
+   repo commits a `.coding-stats/` directory holding the complete analysis state
    of that repo (verdicts, features, fix attribution, lineage, computed line
    columns) plus a regenerated standard HTML report. Org-wide stats are later
    built by gathering artifacts; nothing in this ADR depends on the gather
@@ -42,7 +42,7 @@ Decision, per grill rounds recorded in `docs/decisions-trail.tsv`:
    horizon, re-run detect/lineage/report, and write a fresh version. Full
    recompute (everything re-classified) is the fallback when the history
    itself was rewritten so no verifiable version remains.
-4. **Exclusion: `.skill-stats/**` only.** Walk skips commits whose stripped
+4. **Exclusion: `.coding-stats/**` only.** Walk skips commits whose stripped
    diff is empty; mixed commits lose the artifact paths before
    classification/churn; blame parsing ignores store paths. The rule is a path
    pattern, not a commit list, so re-inits, fork history, and CI-created
@@ -75,7 +75,7 @@ Decision, per grill rounds recorded in `docs/decisions-trail.tsv`:
    would fail the fast-forward check). Such superseded runs end with a
    visible neutral status, never a red failure, and never force-push; they
    must not block the code pushes they trailed.
-7. **CI shape:** `skill-stats update` (one orchestrating verb: verify → walk →
+7. **CI shape:** `coding-stats update` (one orchestrating verb: verify → walk →
    classify → detect → lineage → live-lines (backfill + tip) → report →
    serialize + digest), with flags (`--no-classify` etc.) trimming stages for
    dev/debug; stage subcommands remain plumbing. The job runs on every push
@@ -87,15 +87,15 @@ Decision, per grill rounds recorded in `docs/decisions-trail.tsv`:
    backlog is marked visible and reprocessed by a later successful run, never
    silently skipped.
 
-   Two tested refinements (2026-10-11, dogfooding on Dahep/skill-stats):
+   Two tested refinements (2026-10-11, dogfooding on Dahep/coding-stats):
 
    - **Tool install is git-pinned, not version-pinned.** The rendered
      workflow installs the tool standalone
-     (`uv tool install 'skill-stats @ git+https://github.com/Dahep/skill-stats.git@<ref>'`),
-     where `<ref>` is the commit of the skill-stats checkout that rendered
+     (`uv tool install 'coding-stats @ git+https://github.com/Dahep/coding-stats.git@<ref>'`),
+     where `<ref>` is the commit of the coding-stats checkout that rendered
      the file (installed copies default to `main`; `--tool-ref` moves the
      pin explicitly). A version pin was the original intent but the package
-     is not on PyPI, and a `uv tool install skill-stats==0.1.0` line fails
+     is not on PyPI, and a `uv tool install coding-stats==0.1.0` line fails
      the run at the scaffold step. The git pin preserves the invariant
      "install the engine that rendered the rules" and keeps `--upgrade`
      meaningful (a re-render moves the commit pin).
@@ -103,8 +103,8 @@ Decision, per grill rounds recorded in `docs/decisions-trail.tsv`:
      public/paid repos below is the user's choice of target; private
      non-paid repos cannot enable Pages at all). The opt-in adds a
      `deploy-pages` job (`pages: write`, `id-token: write`, scoped to that
-     job only; `needs: skill-stats`, `concurrency: pages`), which downloads
-     the run's `skill-stats-report` artifact, renames `report.html` to
+     job only; `needs: coding-stats`, `concurrency: pages`), which downloads
+     the run's `coding-stats-report` artifact, renames `report.html` to
      `index.html`, and deploys via `actions/deploy-pages` - a separate
      deployment, not a landing commit; history is never rewritten for Pages.
    - **SSH-alias hosts are machine-local names, never identity.** An origin
@@ -122,7 +122,7 @@ Decision, per grill rounds recorded in `docs/decisions-trail.tsv`:
 
 ## Considered Options
 
-- **Metrics-only snapshot in `.skill-stats/`**: small and simple, but org
+- **Metrics-only snapshot in `.coding-stats/`**: small and simple, but org
   analysis can never re-ask per-commit questions; rejected to keep artifacts
   complete stores.
 - **Binary SQLite as the committed artifact**: natively openable from any

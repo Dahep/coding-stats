@@ -27,7 +27,7 @@ from pathlib import Path
 
 from . import artifact, db, gitwalk, identity
 
-STORE_PATH = ".skill-stats/skill-stats.sql"
+STORE_PATH = ".coding-stats/coding-stats.sql"
 
 # machine-local + user config survive a rebuild; derived measurement state
 # never does (it is re-derived, or travels with the artifact's own rows)

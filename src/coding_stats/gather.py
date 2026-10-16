@@ -1,6 +1,6 @@
 """Gather: ingest N artifacts into a union DB keyed by Repository key (ADR-0003).
 
-The union DB is DERIVED from artifacts — it is a normal skill-stats DB (same
+The union DB is DERIVED from artifacts — it is a normal coding-stats DB (same
 tables, same joins) so report/metrics read it unchanged; feature ids are
 already globally-unique prefixed TEXT and need no remapping (grill-r4-Q14).
 Commit ids are artifact-local integers: the union remaps them into fresh
@@ -36,7 +36,7 @@ from pathlib import Path
 
 from . import artifact, db, identity
 
-STORE_REL = ".skill-stats/skill-stats.sql"
+STORE_REL = ".coding-stats/coding-stats.sql"
 
 _UNION_ARTIFACTS_DDL = """
 CREATE TABLE IF NOT EXISTS union_artifacts (
@@ -118,7 +118,7 @@ def _load(source: Path) -> _Ingest:
         raise GatherError(f"{source}: cannot read artifact ({exc})") from exc
     header = artifact.parse_header(data)
     if header is None:
-        raise GatherError(f"{source}: not a skill-stats artifact (no valid header)")
+        raise GatherError(f"{source}: not a coding-stats artifact (no valid header)")
     err = artifact.verify_bytes(data)
     if err is not None:
         raise GatherError(f"{source}: refusing artifact ({err})")
@@ -237,7 +237,7 @@ def _existing_keys(union_path: Path) -> dict[str, str]:
             conn.close()
     except sqlite3.Error as exc:
         raise GatherError(
-            f"{union_path}: not a skill-stats database (does it have skill-stats tables?): {exc}"
+            f"{union_path}: not a coding-stats database (does it have coding-stats tables?): {exc}"
         ) from exc
 
 

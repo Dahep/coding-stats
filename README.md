@@ -1,4 +1,4 @@
-# skill-stats
+# coding-stats
 
 Mine git history to measure feature-level metrics: **features/year**,
 **fixes/feature** (overall and per feature), and **code churn per feature**.
@@ -29,22 +29,22 @@ See `DESIGN.md` (decisions) and `CONTEXT.md` (domain language).
    mismatch, partial recompute anchored at the newest self-verifying
    committed artifact version, full recompute when none verifies), then
    `walk → classify → detect → lineage → live-lines → report → serialize` +
-   digest + verify. Default `--db skill-stats.db` on a machine; CI runs pass
-   `--db .skill-stats/working.db` — the CI working DB is throwaway (runs are
+   digest + verify. Default `--db coding-stats.db` on a machine; CI runs pass
+   `--db .coding-stats/working.db` — the CI working DB is throwaway (runs are
    stateless and the committed artifact is the store), so a fresh DB adopts
    the checkout's git repo and seeds itself from the artifact. Classification
    is best-effort: a backlog stays visible in the final line and reprocesses
    on a later run.
-7. `ci` — `skill-stats ci init` writes `.github/workflows/skill-stats.yml`
-   (plus `.skill-stats/.gitignore` for the throwaway DB) idempotently,
+7. `ci` — `coding-stats ci init` writes `.github/workflows/coding-stats.yml`
+   (plus `.coding-stats/.gitignore` for the throwaway DB) idempotently,
    refusing drifted files unless `--upgrade`; `ci init --pages` adds a
    deploy-pages job that publishes the run's report.html as the site root
-   (opt-in: Pages only works on public or paid repos); `skill-stats ci land`
+   (opt-in: Pages only works on public or paid repos); `coding-stats ci land`
    (called by the workflow, usable locally) lands the artifact-update
    commit: no-op updates push nothing, superseded runs abandon neutrally,
-   everything else commits as `skill-stats[bot]` and pushes with
+   everything else commits as `coding-stats[bot]` and pushes with
    `GITHUB_TOKEN`.
-8. `gather` — `skill-stats gather --db union.db <repo|artifact>...` ingests
+8. `gather` — `coding-stats gather --db union.db <repo|artifact>...` ingests
    N artifacts into a union DB keyed by Repository key. Ingest verifies each
    artifact first, is idempotent per key (identical artifact = no-op, a newer
    one last-wins), and refuses when distinct keys share a URL-derived slug
@@ -55,23 +55,23 @@ See `DESIGN.md` (decisions) and `CONTEXT.md` (domain language).
 ## Live report (dogfooding)
 
 The tool analyzes this repository on every push to `main`; the report publishes
-to <https://dahep.github.io/skill-stats/> and the analysis artifact
-(`.skill-stats/`) commits back to `main` as `skill-stats[bot]`.
+to <https://dahep.github.io/coding-stats/> and the analysis artifact
+(`.coding-stats/`) commits back to `main` as `coding-stats[bot]`.
 
 ## Usage
 
 ```sh
 uv sync
-uv run skill-stats init ~/dotfiles --db ~/.skill-stats/skill-stats.db
-uv run skill-stats walk    --db ~/.skill-stats/skill-stats.db
-uv run skill-stats classify --db ~/.skill-stats/skill-stats.db [--limit N] [--fresh]
-uv run skill-stats detect  --db ~/.skill-stats/skill-stats.db
-uv run skill-stats lineage --db ~/.skill-stats/skill-stats.db
-uv run skill-stats report  --db ~/.skill-stats/skill-stats.db --json --charts
-uv run skill-stats update  --db ~/.skill-stats/skill-stats.db   # verify->walk->...->serialize
-uv run skill-stats ci init [--branch main] [--no-push] [--upgrade]   # in the target repo
-uv run skill-stats ci land --branch main                             # landing verb
-uv run skill-stats gather --db union.db ~/dotfiles ~/.config-repo     # union of artifacts
+uv run coding-stats init ~/dotfiles --db ~/.coding-stats/coding-stats.db
+uv run coding-stats walk    --db ~/.coding-stats/coding-stats.db
+uv run coding-stats classify --db ~/.coding-stats/coding-stats.db [--limit N] [--fresh]
+uv run coding-stats detect  --db ~/.coding-stats/coding-stats.db
+uv run coding-stats lineage --db ~/.coding-stats/coding-stats.db
+uv run coding-stats report  --db ~/.coding-stats/coding-stats.db --json --charts
+uv run coding-stats update  --db ~/.coding-stats/coding-stats.db   # verify->walk->...->serialize
+uv run coding-stats ci init [--branch main] [--no-push] [--upgrade]   # in the target repo
+uv run coding-stats ci land --branch main                             # landing verb
+uv run coding-stats gather --db union.db ~/dotfiles ~/.config-repo     # union of artifacts
 ```
 
 `classify` shells out to the `opencode` CLI (`opencode run --format json`,

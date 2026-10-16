@@ -2,8 +2,7 @@
 
 import pytest
 
-from conftest import add_feature, make_db
-from skill_stats.classify import (
+from coding_stats.classify import (
     Reply,
     apply_reply,
     classify_pending,
@@ -11,7 +10,8 @@ from skill_stats.classify import (
     feature_registry,
     parse_reply,
 )
-from skill_stats.gitwalk import walk
+from coding_stats.gitwalk import walk
+from conftest import add_feature, make_db
 
 
 class FakeSession:

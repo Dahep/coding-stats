@@ -10,9 +10,9 @@ import sqlite3
 
 import pytest
 
-import skill_stats.schema as schema
-from skill_stats.db import connect
-from skill_stats.schema import SCHEMA_STEPS
+import coding_stats.schema as schema
+from coding_stats.db import connect
+from coding_stats.schema import SCHEMA_STEPS
 
 DIFF_C1 = "--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1,3 @@\n+alpha\n+beta\n+charlie\n"
 # mixed: normal file change plus an artifact-store section
@@ -23,18 +23,18 @@ DIFF_C2 = (
     "@@ -1 +1 @@\n"
     "-one\n"
     "+ONE\n"
-    "diff --git a/.skill-stats/artifact.sql b/.skill-stats/artifact.sql\n"
-    "--- a/.skill-stats/artifact.sql\n"
-    "+++ b/.skill-stats/artifact.sql\n"
+    "diff --git a/.coding-stats/artifact.sql b/.coding-stats/artifact.sql\n"
+    "--- a/.coding-stats/artifact.sql\n"
+    "+++ b/.coding-stats/artifact.sql\n"
     "@@ -0,0 +1,2 @@\n"
     "+INSERT INTO x VALUES (1);\n"
     "+INSERT INTO x VALUES (2);\n"
 )
 # store-only: stripped diff is empty; the commit never enters stats
 DIFF_C3 = (
-    "diff --git a/.skill-stats/report.html b/.skill-stats/report.html\n"
-    "--- a/.skill-stats/report.html\n"
-    "+++ b/.skill-stats/report.html\n"
+    "diff --git a/.coding-stats/report.html b/.coding-stats/report.html\n"
+    "--- a/.coding-stats/report.html\n"
+    "+++ b/.coding-stats/report.html\n"
     "@@ -0,0 +1 @@\n"
     "+<html></html>\n"
 )
@@ -198,7 +198,7 @@ def test_migration_commits_repo_scoped_with_churn(tmp_path):
 def test_migration_strips_store_paths_from_stored_diffs(tmp_path):
     conn = migrated(tmp_path)
     diffs = {r["sha"]: r["diff"] for r in conn.execute("SELECT sha, diff FROM commits")}
-    assert ".skill-stats" not in diffs["b" * 40]
+    assert ".coding-stats" not in diffs["b" * 40]
     assert "n.txt" in diffs["b" * 40]
     assert "c" * 40 not in diffs  # store-only commit purged entirely
     conn.close()
@@ -340,14 +340,14 @@ CREATED4 = "2026-01-04T00:00:00Z"
 
 
 def test_migration_matches_fresh_walk(repo, tmp_path):
+    from coding_stats.gitwalk import author_and_time, diff_for, walk
+    from coding_stats.lineage import close_lineage
+    from coding_stats.metrics import snapshot, snapshot_to_json
+    from coding_stats.targets import annotate_all
     from conftest import add_feature, commit_files, make_db
-    from skill_stats.gitwalk import author_and_time, diff_for, walk
-    from skill_stats.lineage import close_lineage
-    from skill_stats.metrics import snapshot, snapshot_to_json
-    from skill_stats.targets import annotate_all
 
     k1 = commit_files(repo, "feature one", {"a.txt": "alpha\nbeta\ncharlie\n"})
-    k2 = commit_files(repo, "artifact update", {".skill-stats/artifact.sql": "INSERT\n"})
+    k2 = commit_files(repo, "artifact update", {".coding-stats/artifact.sql": "INSERT\n"})
     k3 = commit_files(repo, "fix alpha", {"a.txt": "ALPHA\nbeta\ncharlie\n"})
     k4 = commit_files(repo, "feature two", {"b.txt": "one\ntwo\n"})
     product_shas = [k1, k3, k4]

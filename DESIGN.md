@@ -1,4 +1,4 @@
-# skill-stats — design (post-grill)
+# coding-stats — design (post-grill)
 
 Tool that mines git history (+ later opencode history) to measure feature-level
 metrics: features/year, fixes/feature (overall, per-feature), code churn per
@@ -47,13 +47,13 @@ matplotlib scripts over SQL queries. Build git-only phase first.
 
 ## Artifact & multi-repo (settled grill 2, ADR-0003)
 
-- **Artifact**: each Target repo commits `.skill-stats/` — the whole
+- **Artifact**: each Target repo commits `.coding-stats/` — the whole
   analysis state as a deterministic SQL text snapshot (one INSERT per row,
   whole DB every version) + digest (sha256 over the file) + `covered_through`
   marker + regenerated standard HTML report. Raw diff text, `runs`, and
   machine-local settings stay out of the artifact; the walk instead stores
   per-commit `added_lines`/`deleted_lines`/`churn_lines`.
-- **Exclusion**: `.skill-stats/**` paths only (no blanket hidden-dir rule).
+- **Exclusion**: `.coding-stats/**` paths only (no blanket hidden-dir rule).
   Walk skips commits whose stripped diff is empty; mixed commits get
   artifact paths stripped; blame parsing ignores store paths. Submodules
   need no handling today: parent diffs show gitlink lines (they count
@@ -68,7 +68,7 @@ matplotlib scripts over SQL queries. Build git-only phase first.
   the features the fix targets (via fix lineage); a commit claimed by two
   features counts its lines in both. History: full-sweep backfill of the
   curve at adoption, sampled past a size cap.
-- **Update verb**: `skill-stats update` = verify digest → walk → classify →
+- **Update verb**: `coding-stats update` = verify digest → walk → classify →
   detect → lineage → live-lines (backfill + tip) → report → serialize +
   digest, with flags (`--no-classify` etc.) trimming stages for dev/debug.
   Stage subcommands remain plumbing. Lineage runs before live-lines: fix
@@ -103,7 +103,7 @@ matplotlib scripts over SQL queries. Build git-only phase first.
   distinct commit parented on the push, pushed with `GITHUB_TOKEN` (ring
   closed by exclusion); report also uploaded as an Actions artifact; Pages
   publishing gated on public/paid repos.
-- **Gather** (built: `src/skill_stats/gather.py`): ingests N artifacts into a
+- **Gather** (built: `src/coding_stats/gather.py`): ingests N artifacts into a
   union DB keyed by Repository key; verify-first ingest, idempotent per key
   (identical artifact = no-op, a newer one last-wins), slug collisions refuse
   (Q18.2). Union DB is structurally identical to any single-repo DB, so the

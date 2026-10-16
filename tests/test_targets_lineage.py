@@ -4,11 +4,11 @@ import subprocess
 
 import pytest
 
+from coding_stats.blame import blame_deleted_lines, contiguous, delete_ranges
+from coding_stats.gitwalk import walk
+from coding_stats.lineage import close_lineage
+from coding_stats.targets import annotate_all, annotate_fix
 from conftest import add_feature, commit_files, make_db, run
-from skill_stats.blame import blame_deleted_lines, contiguous, delete_ranges
-from skill_stats.gitwalk import walk
-from skill_stats.lineage import close_lineage
-from skill_stats.targets import annotate_all, annotate_fix
 
 
 @pytest.fixture()
@@ -150,9 +150,9 @@ def test_lineage_requires_defines(tmp_path, repo, shas):
 
 
 def test_blame_ignores_store_paths(repo):
-    c1 = commit_files(repo, "content", {"n.txt": "one\ntwo\n", ".skill-stats/a.sql": "old\n"})
+    c1 = commit_files(repo, "content", {"n.txt": "one\ntwo\n", ".coding-stats/a.sql": "old\n"})
     (repo / "n.txt").write_text("ONE\ntwo\n")
-    (repo / ".skill-stats" / "a.sql").unlink()
+    (repo / ".coding-stats" / "a.sql").unlink()
     run(repo, "add", "-A")
     run(repo, "commit", "-m", "drop store, rewrite content")
     c2 = subprocess.run(
@@ -167,9 +167,9 @@ def test_blame_ignores_store_paths(repo):
 def test_blame_rename_into_store_contributes_no_fix_attribution(repo, shas=None):
     c1 = commit_files(repo, "content", {"lib.ts": "one\ntwo\nthree\n", "data.txt": "a\nb\n"})
     # one commit: a modified rename of lib.ts INTO the store + a genuine fix
-    (repo / ".skill-stats").mkdir()
-    run(repo, "mv", "lib.ts", ".skill-stats/lib.ts")
-    (repo / ".skill-stats" / "lib.ts").write_text("one\nTWO\nthree\n")
+    (repo / ".coding-stats").mkdir()
+    run(repo, "mv", "lib.ts", ".coding-stats/lib.ts")
+    (repo / ".coding-stats" / "lib.ts").write_text("one\nTWO\nthree\n")
     (repo / "data.txt").write_text("a\n")  # genuine product fix: drop line b
     run(repo, "add", "-A")
     run(repo, "commit", "-m", "fix: drop b, park lib in store")

@@ -26,7 +26,7 @@ repository against the ADR-0001 rolling LLM session.
 
 ## Decision
 
-Dropped. `skill-stats` classifies commits through the opencode CLI only
+Dropped. `coding-stats` classifies commits through the opencode CLI only
 (ADR-0001); the backend protocol, System One client, and A/B harness were
 removed. Practical acceptance criteria that this run surfaced for the record:
 
