@@ -7,6 +7,7 @@ from new-format ones in exactly the header tag.
 """
 
 import hashlib
+import shutil
 import sqlite3
 
 import pytest
@@ -130,6 +131,7 @@ def test_migrate_renamed_repo_reuses_db_and_relabels(tmp_path, repo, monkeypatch
 
 
 def test_migrate_without_db_rebuilds_from_artifact(tmp_path, repo, monkeypatch, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path))  # pin the implicit legacy-DB lookup
     monkeypatch.setattr(
         "coding_stats.identity.normalize_clone_url",
         lambda url, ssh_config=None: (
@@ -141,7 +143,7 @@ def test_migrate_without_db_rebuilds_from_artifact(tmp_path, repo, monkeypatch, 
     dest = tmp_path / "fresh-rebuild.db"
     monkeypatch.setattr("coding_stats.cli.Session", lambda model, sid=None: FakeSession([]))
 
-    main(["migrate", str(repo), "--db", str(dest), "--legacy-db", str(tmp_path / "absent.db")])
+    main(["migrate", str(repo), "--db", str(dest)])
     out = capsys.readouterr().out
     assert "seed: rebuild-artifact" in out
     assert "no legacy machine DB found" in out
@@ -191,24 +193,17 @@ def test_migrate_refuses_explicit_foreign_legacy_db(tmp_path, repo):
     assert (repo / ".skill-stats" / "skill-stats.sql").exists()  # untouched
 
 
-def test_migrate_falls_back_to_fresh_on_corrupt_legacy_artifact(tmp_path, repo, capsys):
+def test_migrate_falls_back_to_fresh_on_corrupt_legacy_artifact(
+    tmp_path, repo, monkeypatch, capsys
+):
+    monkeypatch.setenv("HOME", str(tmp_path))  # pin the implicit legacy-DB lookup
     _legacy_repo(tmp_path, repo)
     art = repo / ".skill-stats" / "skill-stats.sql"
     data = art.read_bytes()
     art.write_bytes(data.replace(b"feature a", b"feather a", 1))
     dest = tmp_path / "corrupt.db"
 
-    main(
-        [
-            "migrate",
-            str(repo),
-            "--db",
-            str(dest),
-            "--legacy-db",
-            str(tmp_path / "absent.db"),
-            "--no-classify",
-        ]
-    )
+    main(["migrate", str(repo), "--db", str(dest), "--no-classify"])
     out = capsys.readouterr().out
     assert "legacy artifact fails verification" in out
     assert "seed: fresh" in out
@@ -258,16 +253,158 @@ def test_migrate_ci_writes_new_workflow(tmp_path, repo, monkeypatch, capsys):
 
 def test_old_format_artifact_is_the_new_one_with_swapped_header(tmp_path):
     """The migration premise, pinned as a test: pre-rename artifacts are the
-    current format with only the header tag changed — one replace apart."""
+    current format with only the header tag changed — one replace apart.
+    Ingestion (require_tag default) refuses them; migration reads them past
+    the tag check on purpose."""
     from coding_stats.db import connect
 
     conn = connect(tmp_path / "x.db")
     conn.row_factory = sqlite3.Row
     data = artifact.serialize(conn)
     old = old_format_bytes(conn)
-    assert artifact.parse_header(old) is not None
+    assert artifact.parse_header(old) is None  # ingestion refuses the old marker
+    header = artifact.parse_header(old, require_tag=False)
+    assert header is not None
     assert artifact.verify_bytes(old) is None
-    assert artifact.parse_header(old).repository_key == artifact.parse_header(data).repository_key
+    assert header.repository_key == artifact.parse_header(data).repository_key
+
+
+def test_gather_rejects_old_format(tmp_path, repo):
+    """The promised one-way format break: gather refuses a legacy artifact,
+    even though its digest self-verifies."""
+    from coding_stats.gather import GatherError
+    from coding_stats.gather import gather as run_gather
+
+    _legacy_repo(tmp_path, repo)
+    union = tmp_path / "union.db"
+    with pytest.raises(GatherError):
+        run_gather(union, [repo / ".skill-stats" / "skill-stats.sql"])
+
+
+def test_migrate_db_behind_artifact_seeds_from_artifact(tmp_path, repo, monkeypatch, capsys):
+    """A machine-local DB that lags the committed artifact must not win:
+    its migration would drop the artifact's newer verdicts. The artifact
+    side wins (verdict rows travel inside it)."""
+    monkeypatch.setattr(
+        "coding_stats.identity.normalize_clone_url",
+        lambda url, ssh_config=None: (
+            "https://github.com/Dahep/" + url.rpartition("/")[2].removesuffix(".git")
+        ),
+    )
+    _legacy_repo(tmp_path, repo, monkeypatch)
+    stale = tmp_path / "stale.db"
+    shutil.copy(tmp_path / "legacy.db", stale)
+    commit_files(repo, "feature c", {"h.txt": "c1\n"})
+    commit_files(repo, "feature d", {"i.txt": "d1\n"})
+    replies = [
+        '{"k":"new","title":"feature c","about":"x","why":"y"}',
+        '{"k":"new","title":"feature d","about":"x","why":"y"}',
+    ]
+    monkeypatch.setattr("coding_stats.cli.Session", lambda model, sid=None: FakeSession(replies))
+    main(["update", "--db", str(tmp_path / "legacy.db"), "--no-serialize", "--no-report"])
+    monkeypatch.setattr("coding_stats.cli.Session", lambda model, sid=None: FakeSession([]))
+    store = repo / ".skill-stats"
+    conn = sqlite3.connect(tmp_path / "legacy.db")
+    conn.row_factory = sqlite3.Row
+    (store / "skill-stats.sql").write_bytes(old_format_bytes(conn))
+    conn.close()
+    dest = tmp_path / "behind.db"
+
+    main(["migrate", str(repo), "--db", str(dest), "--legacy-db", str(stale)])
+    out = capsys.readouterr().out
+    assert "seed: rebuild-artifact" in out
+    assert "classifies ahead" in out
+    assert _counts(dest) == (4, 4)  # the artifact's newer verdicts, not the stale DB's two
+    assert artifact.verify(repo / ".coding-stats" / "coding-stats.sql") is None
+
+
+def test_migrate_refuses_to_overwrite_a_foreign_destination(tmp_path, repo, capsys):
+    _legacy_repo(tmp_path, repo)
+    dest = tmp_path / "dest.db"
+    conn = sqlite3.connect(dest)
+    conn.execute("CREATE TABLE repositories (id INTEGER PRIMARY KEY, repo_key TEXT)")
+    conn.execute("CREATE TABLE commits (id INTEGER PRIMARY KEY, sha TEXT, walk_index INTEGER)")
+    conn.execute("INSERT INTO repositories (repo_key) VALUES ('https://github.com/other/y@main')")
+    conn.execute("INSERT INTO commits (sha, walk_index) VALUES ('abc', 1)")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(SystemExit, match="refusing to overwrite"):
+        main(["migrate", str(repo), "--db", str(dest)])
+    assert _db_key(dest) == "https://github.com/other/y@main"  # destination untouched
+    assert (repo / ".skill-stats" / "skill-stats.sql").exists()
+
+
+def test_migrate_fresh_refuses_an_existing_destination(tmp_path, repo):
+    _legacy_repo(tmp_path, repo)
+    dest = tmp_path / "occupied.db"
+    conn = sqlite3.connect(dest)
+    conn.execute("CREATE TABLE commits (id INTEGER PRIMARY KEY, sha TEXT, walk_index INTEGER)")
+    conn.execute("INSERT INTO commits (sha, walk_index) VALUES ('abc', 1)")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(SystemExit, match="unknown content"):
+        main(["migrate", str(repo), "--db", str(dest), "--fresh"])
+    assert dest.exists()
+
+
+def test_migrate_fresh_overrides_an_already_migrated_repo(tmp_path, repo, monkeypatch, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path))  # pin the implicit legacy-DB lookup
+    _legacy_repo(tmp_path, repo, monkeypatch)
+    dest = tmp_path / "first.db"
+    monkeypatch.setattr("coding_stats.cli.Session", lambda model, sid=None: FakeSession([]))
+    main(["migrate", str(repo), "--db", str(dest)])
+    assert artifact.verify(repo / ".coding-stats" / "coding-stats.sql") is None
+
+    monkeypatch.setattr("coding_stats.cli.Session", lambda model, sid=None: FakeSession([]))
+    dest2 = tmp_path / "second.db"
+    main(["migrate", str(repo), "--db", str(dest2), "--fresh", "--no-classify"])
+    out = capsys.readouterr().out
+    assert "seed: fresh" in out  # --fresh recomputes even though 'already' would apply
+    assert artifact.verify(repo / ".coding-stats" / "coding-stats.sql") is None
+
+
+def test_migrate_explicit_absent_legacy_db_is_an_error(tmp_path, repo):
+    _legacy_repo(tmp_path, repo)
+    with pytest.raises(SystemExit, match="does not exist"):
+        main(["migrate", str(repo), "--legacy-db", str(tmp_path / "nothere.db"), "--dry-run"])
+
+
+def test_migrate_default_destination_mirror_respects_home(tmp_path, repo, monkeypatch):
+    """The documented layout mirror: a legacy DB at the default location and
+    no --db migrates it to ~/.coding-stats/coding-stats.db (HOME-pinned)."""
+    monkeypatch.setenv("HOME", str(tmp_path))  # pin the implicit lookup AND the mirror
+    monkeypatch.setattr(
+        "coding_stats.identity.normalize_clone_url",
+        lambda url, ssh_config=None: (
+            "https://github.com/Dahep/" + url.rpartition("/")[2].removesuffix(".git")
+        ),
+    )
+    legacy_db = tmp_path / ".skill-stats" / "skill-stats.db"
+    commit_files(repo, "feature a", {"f.txt": "a1\n"})
+    run(repo, "remote", "add", "origin", "https://github.com/Dahep/skill-stats.git")
+    monkeypatch.setattr(
+        "coding_stats.cli.Session",
+        lambda model, sid=None: FakeSession(
+            ['{"k":"new","title":"feature a","about":"x","why":"y"}']
+        ),
+    )
+    legacy_db.parent.mkdir()
+    main(["init", str(repo), "--db", str(legacy_db), "--branch", "main"])
+    main(["update", "--db", str(legacy_db), "--no-serialize", "--no-report"])
+    conn = sqlite3.connect(legacy_db)
+    conn.row_factory = sqlite3.Row
+    store = repo / ".skill-stats"
+    store.mkdir()
+    (store / "skill-stats.sql").write_bytes(old_format_bytes(conn))
+    conn.close()
+    # implicit both ways: legacy DB at the default location, destination at the mirror
+    main(["migrate", str(repo), "--no-classify"])
+    dest = tmp_path / ".coding-stats" / "coding-stats.db"
+    assert dest.exists()
+    assert _counts(dest) == (1, 1)
+    assert artifact.verify(repo / ".coding-stats" / "coding-stats.sql") is None
 
 
 def test_legacy_repo_fixture_cleans_new_format_store(tmp_path, repo, monkeypatch):

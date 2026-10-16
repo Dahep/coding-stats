@@ -350,9 +350,14 @@ def unhdr(text: str) -> str:
     return out.decode("utf-8", "surrogateescape")
 
 
-def parse_header(data: bytes) -> ArtifactHeader | None:
+def parse_header(data: bytes, require_tag: bool = True) -> ArtifactHeader | None:
     """Parse (and decode) the artifact header; None when it is not a
-    coding-stats artifact."""
+    coding-stats artifact. With the default require_tag, ingestion demands
+    the current marker line — legacy skill-stats artifacts (old marker,
+    same body) are refused here. Migration reads them with
+    require_tag=False (ADR-0005)."""
+    if require_tag and not data.startswith(b"-- coding-stats artifact\n"):
+        return None
     fields = {m.group(1).decode("ascii"): m.group(2) for m in _HEADER_FIELD_RE.finditer(data)}
     digest_m = _DIGEST_LINE_RE.search(data)
     if (
