@@ -57,7 +57,10 @@ One clean break — no compatibility shims for the tool's own name surfaces:
 ## Migration of existing users
 
 Per consumer, in dependency order (tool upgrade last — the rename PR ships
-the new tool; consumers move after both the merge and the GitHub rename):
+the new tool; consumers move after both the merge and the GitHub rename).
+The procedure is automated by the `migrate` verb shipped in this same
+change, driven from the repository skill
+`.agents/skills/migrate-skill-stats/SKILL.md`:
 
 - **CI consumers** (`ci init` was run): the old `skill-stats.yml` keeps
   working through GitHub's redirect — it installs the OLD tool at the pinned

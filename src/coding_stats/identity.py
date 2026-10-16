@@ -132,6 +132,18 @@ def origin_url(repo: Path) -> str | None:
     return out or None
 
 
+def resolved_identity(repo: Path) -> tuple[str, str, str | None]:
+    """(key base, slug, clone URL) the way register_repository resolves them:
+    canonical https identity when the origin URL canonicalizes, the ``local:``
+    shim (clone URL None) when it does not — machine-local path, ssh alias
+    host, or no origin at all."""
+    url = origin_url(repo)
+    canon = normalize_clone_url(url) if url else None
+    if canon:
+        return canon, slug_from_clone_url(canon), canon
+    return *local_identity(str(repo)), None
+
+
 def register_repository(conn: sqlite3.Connection, repo: Path, branch: str | None) -> int:
     """Create or update THE repositories row for this DB from the repo's origin
     URL (local: shim when unavailable) and store its id in settings.repo_id so
@@ -145,12 +157,7 @@ def register_repository(conn: sqlite3.Connection, repo: Path, branch: str | None
 
     Wave 1: a DB manages exactly one repository (the row the DB was init'd
     against); a second row is refused rather than silently half-supported."""
-    url = origin_url(repo)
-    canon = normalize_clone_url(url) if url else None
-    if canon:
-        base, slug, clone_url = canon, slug_from_clone_url(canon), canon
-    else:
-        base, slug, clone_url = *local_identity(str(repo)), None
+    base, slug, clone_url = resolved_identity(repo)
     key = repo_key(base, branch)
     existing = conn.execute("SELECT id, repo_key FROM repositories ORDER BY id").fetchall()
     if len(existing) > 1:

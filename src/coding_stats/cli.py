@@ -1,7 +1,9 @@
-"""CLI: uv run coding-stats {init,walk,classify,detect,lineage,report,update,ci}. Requires the
+"""CLI: uv run coding-stats {init,walk,classify,detect,lineage,report,update,ci,gather,migrate}.
+Requires the
 opencode CLI on PATH for classify (ADR-0001 rolling session). update is the
 orchestrating verb (ADR-0003 clause 7); the stage subcommands stay plumbing;
-ci renders the workflow and lands artifact updates."""
+ci renders the workflow and lands artifact updates; migrate moves a legacy
+skill-stats layout to coding-stats (ADR-0005)."""
 
 import argparse
 import json
@@ -110,6 +112,31 @@ def main(argv: list[str] | None = None) -> None:
         "sources", nargs="+", help="repo checkouts (read .coding-stats/) or artifact file paths"
     )
 
+    mig = sub.add_parser(
+        "migrate",
+        help="one-time migration from the legacy skill-stats layout (ADR-0005)",
+        epilog="Moves the committed artifact (.skill-stats/ -> a regenerated .coding-stats/"
+        " store), the machine-local working DB (reused when it corresponds to the legacy"
+        " artifact, else rebuilt from its verdicts), and the CI scaffold; relabels the"
+        " repository key when the GitHub rename changed it.",
+    )
+    mig.add_argument("repo", nargs="?", default=".")
+    mig.add_argument("--db", default=None, help="destination working DB (default: coding-stats.db)")
+    mig.add_argument(
+        "--legacy-db",
+        default=None,
+        help="legacy working DB to reuse (default: ~/.skill-stats/skill-stats.db when present)",
+    )
+    mig.add_argument("--branch", default=None, help="Target branch (default: current)")
+    mig.add_argument(
+        "--fresh", action="store_true", help="ignore legacy artifact and DB: full recompute"
+    )
+    mig.add_argument("--no-classify", action="store_true", help="skip LLM classification")
+    mig.add_argument(
+        "--ci", action="store_true", help="also write the coding-stats CI scaffold (ci init)"
+    )
+    mig.add_argument("--dry-run", action="store_true", help="print the plan, change nothing")
+
     args = parser.parse_args(argv)
 
     settings: dict[str, Any] = {}
@@ -169,6 +196,31 @@ def main(argv: list[str] | None = None) -> None:
         print(
             f"{args.db}: {result.ingested} ingested, {result.skipped} skipped (identical artifact)"
         )
+        return
+
+    if args.cmd == "migrate":
+        from . import migration
+
+        repo = Path(args.repo).resolve()
+        if identity.toplevel(repo) is None:
+            sys.exit(f"not a git repo: {repo}")
+        branch = args.branch or gitwalk.current_branch(repo) or "main"
+        try:
+            plan = migration.detect(repo, args.db, args.legacy_db, args.fresh, branch)
+        except migration.MigrationError as exc:
+            sys.exit(f"error: {exc}")
+        for line in migration.describe(plan):
+            print(line)
+        if args.dry_run:
+            return
+        try:
+            for line in migration.run(plan, repo, no_classify=args.no_classify):
+                print(line)
+        except migration.MigrationError as exc:
+            sys.exit(f"error: {exc}")
+        if args.ci:
+            for msg in migration.init_ci(repo, branch):
+                print(msg)
         return
 
     conn = db.connect(Path(args.db))

@@ -35,7 +35,14 @@ See `DESIGN.md` (decisions) and `CONTEXT.md` (domain language).
    the checkout's git repo and seeds itself from the artifact. Classification
    is best-effort: a backlog stays visible in the final line and reprocesses
    on a later run.
-7. `ci` — `coding-stats ci init` writes `.github/workflows/coding-stats.yml`
+7. `migrate` — one-time migration from the legacy `skill-stats` layout
+   (ADR-0005): verifies the legacy artifact, reuses the machine-local DB
+   when it corresponds (verdicts survive), relabels the repository key when
+   the GitHub rename changed it, regenerates the store under
+   `.coding-stats/`, removes the legacy `skill-stats.yml` workflow (`--ci`
+   writes the new scaffold), and only then deletes `.skill-stats/`.
+   Idempotent; `--dry-run` prints the plan first.
+8. `ci` — `coding-stats ci init` writes `.github/workflows/coding-stats.yml`
    (plus `.coding-stats/.gitignore` for the throwaway DB) idempotently,
    refusing drifted files unless `--upgrade`; `ci init --pages` adds a
    deploy-pages job that publishes the run's report.html as the site root
@@ -44,7 +51,7 @@ See `DESIGN.md` (decisions) and `CONTEXT.md` (domain language).
    commit: no-op updates push nothing, superseded runs abandon neutrally,
    everything else commits as `coding-stats[bot]` and pushes with
    `GITHUB_TOKEN`.
-8. `gather` — `coding-stats gather --db union.db <repo|artifact>...` ingests
+9. `gather` — `coding-stats gather --db union.db <repo|artifact>...` ingests
    N artifacts into a union DB keyed by Repository key. Ingest verifies each
    artifact first, is idempotent per key (identical artifact = no-op, a newer
    one last-wins), and refuses when distinct keys share a URL-derived slug
