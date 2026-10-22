@@ -383,6 +383,7 @@ def run(plan: Plan, repo: Path, no_classify: bool = False) -> list[str]:
                 no_report=False,
                 no_serialize=False,
             ),
+            legacy_store=True,
         )
     finally:
         conn.close()

@@ -20,6 +20,7 @@ on:
 env:
   CODING_STATS_BRANCH: 'main'
   CODING_STATS_DB: '.coding-stats/working.db'
+  CODING_STATS_STORE: '.git/coding-stats-store/main'
 
 # Landing the artifact-update commit is the only write (Q17: GITHUB_TOKEN;
 # no PAT bits, no extra secrets).
@@ -64,7 +65,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: coding-stats-report
-          path: .coding-stats/report.html
+          path: ${{ env.CODING_STATS_STORE }}/.coding-stats/report.html
 
   # Pages publish (an opt-in via `ci init --pages`; the Pages API errors on
   # private unpaid repos, so the gate is the user's choice of repo/plan):

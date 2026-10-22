@@ -34,9 +34,10 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import artifact, db, identity
+from . import artifact, datastore, db, identity
 
 STORE_REL = ".coding-stats/coding-stats.sql"
+_STORE_TREE_PATH = ".coding-stats/coding-stats.sql"
 
 _UNION_ARTIFACTS_DDL = """
 CREATE TABLE IF NOT EXISTS union_artifacts (
@@ -82,7 +83,10 @@ def gather(union_path: Path, sources: list[Path]) -> GatherResult:
     DB at `union_path`. Refusals happen before anything is written."""
     if not sources:
         raise GatherError("no artifact sources given")
-    ingests = [_load(source) for source in sources]
+    ingests: list[_Ingest] = []
+    for source in sources:
+        for art_path in _artifact_paths(source):
+            ingests.append(_load(source, art_path))
     ingests.sort(key=lambda i: (i.key,))  # deterministic ingest order
 
     existing = _existing_keys(union_path)
@@ -110,8 +114,22 @@ def gather(union_path: Path, sources: list[Path]) -> GatherResult:
         conn.close()
 
 
-def _load(source: Path) -> _Ingest:
-    path = source / STORE_REL if source.is_dir() else source
+def _artifact_paths(source: Path) -> list[Path]:
+    """The artifact files a source names: an explicit file, a checkout's
+    committed store, or — for Data-branch-layout repos (ADR-0006) — every
+    mounted Data-branch store found in the checkout."""
+    if not source.is_dir():
+        return [source]
+    p = source / STORE_REL
+    if p.exists():
+        return [p]
+    roots = source / ".git" / datastore.STORE_DIR
+    if not roots.is_dir():
+        return [p]  # missing on purpose: the reader names the error
+    return sorted(roots.glob(f"*/{_STORE_TREE_PATH}"))
+
+
+def _load(source: Path, path: Path) -> _Ingest:
     try:
         data = path.read_bytes()
     except OSError as exc:

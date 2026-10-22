@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import ci, db, gitwalk, identity
+from . import ci, datastore, db, gitwalk, identity
 from .classify import DEFAULT_MODEL, SESSION_DIR, Session, classify_pending
 from .lineage import close_lineage
 from .targets import annotate_all
@@ -182,7 +182,14 @@ def main(argv: list[str] | None = None) -> None:
             except ci.DriftError as exc:
                 sys.exit(f"error: {exc}")
         else:
-            ci.report_landing(ci.commit_or_abandon(top, branch, args.remote))
+            try:
+                store = datastore.prepare(top, branch, remote=args.remote, sync=False)
+            except datastore.StoreSkip as exc:
+                ci.report_landing(ci.Landing("skipped", str(exc)))
+            else:
+                ci.report_landing(
+                    ci.land(store, top, args.remote),
+                )
         return
 
     if args.cmd == "gather":
@@ -223,6 +230,7 @@ def main(argv: list[str] | None = None) -> None:
                 print(msg)
         return
 
+    Path(args.db).parent.mkdir(parents=True, exist_ok=True)  # throwaway CI DBs nest deep
     conn = db.connect(Path(args.db))
     settings = _settings(conn)
     repo_dir: Path | None = Path(settings["repo"]) if "repo" in settings else None
@@ -291,7 +299,7 @@ def _pending_count(conn: sqlite3.Connection) -> int:
 
 
 def _run_update(
-    conn: sqlite3.Connection, db_path: Path, args: argparse.Namespace
+    conn: sqlite3.Connection, db_path: Path, args: argparse.Namespace, legacy_store: bool = False
 ) -> sqlite3.Connection:
     """One orchestrating run (ADR-0003 clause 7, Q11): verify the existing
     artifact first, then walk -> classify -> detect -> lineage -> live-lines ->
@@ -300,11 +308,20 @@ def _run_update(
     pending, is printed loudly, and reprocesses on a later successful update
     (Q13). The exit code stays 0 with a backlog.
 
+    ADR-0006 clause 1: the store is the Data branch `coding-stats/<target>` —
+    prepare mounts its worktree, and the artifact is verified / rebuilt /
+    written there; `ci land` pushes it while the Target branch never
+    receives artifact commits. Layout skips (a Target branch under
+    coding-stats/, a Data-branch ref-path clash, a legacy committed store
+    with no Data branch) end with a neutral notice instead of silently
+    re-classifying.
+
     On digest MISMATCH the run recovers per ADR-0003 clause 3 (partial
     recompute anchored at the newest self-verifying committed artifact
-    version; full recompute when none verifies). A fresh/throwaway working DB
-    (CI runs are stateless — the artifact is the store) adopts the git repo at
-    the current directory and seeds itself from a verified artifact."""
+    version — found in the Data branch's history now; full recompute when
+    none verifies). A fresh/throwaway working DB (CI runs are stateless — the
+    artifact is the store) adopts the git repo at the current directory and
+    seeds itself from a verified artifact."""
     import os as _os
 
     from . import artifact, livelines, recovery
@@ -331,10 +348,41 @@ def _run_update(
         settings["branch"] = branch
     identity.register_repository(conn, repo_dir, branch)
 
-    store = repo_dir / ".coding-stats"
-    art_path = store / "coding-stats.sql"
+    if legacy_store:
+        # the ADR-0005 migration verb regenerates the store ON the Target
+        # checkout (legacy layout); the skips below apply only to the
+        # default Data-branch layout
+        store_dir = repo_dir
+        art_path = repo_dir / ".coding-stats" / "coding-stats.sql"
+    else:
+        try:
+            store = datastore.prepare(repo_dir, branch)
+        except datastore.StoreSkip as exc:
+            print(f"::notice::coding-stats update skipped: {exc}")
+            ci.step_summary(f"### coding-stats update skipped: {exc}")
+            print("update skipped; nothing was walked, classified, or landed")
+            return conn
+        store_dir = store.worktree
+        art_path = store_dir / ".coding-stats" / "coding-stats.sql"
+    legacy_path = repo_dir / ".coding-stats" / "coding-stats.sql"
     recovered = False
-    if art_path.exists():
+    if not art_path.exists():
+        if not legacy_store and legacy_path.exists():
+            exposed = "coding-stats update skipped: the Target branch carries a committed"
+            msg = (
+                f"::notice::{exposed} .coding-stats/ store (ADR-0003 layout) but its Data"
+                f" branch {store.data_branch} has no artifact yet, so updates would"
+                " silently re-classify the whole history. Run `coding-stats migrate`"
+                " to move the committed artifact onto the Data branch with its"
+                " classified history, or delete the Target branch's .coding-stats/"
+                " to start coverage fresh."
+            )
+            print(msg)
+            ci.step_summary(f"### {exposed} artifact — migration needed")
+            print("update skipped; nothing was walked, classified, or landed")
+            return conn
+        print("artifact: none yet (first run)")
+    else:
         err = artifact.verify(art_path)
         if err is None:
             print("artifact digest: ok")
@@ -346,7 +394,12 @@ def _run_update(
                 print("seeded working db from the artifact")
         else:
             print(f"artifact digest: MISMATCH ({err})")
-            rec, conn = recovery.recover(conn, db_path, repo_dir, branch)
+            anchor = (
+                f"refs/heads/{branch}"
+                if legacy_store
+                else datastore.anchor_ref(repo_dir, store.data_branch)
+            )
+            rec, conn = recovery.recover(conn, db_path, repo_dir, branch, anchor)
             settings = _settings(conn)
             recovered = True
             if rec.mode == "restored":
@@ -357,8 +410,6 @@ def _run_update(
                     "FULL-RECOMPUTE: no committed artifact version verifies;"
                     " rebuilding from scratch"
                 )
-    else:
-        print("artifact: none yet (first run)")
 
     n = gitwalk.walk(repo_dir, conn, branch)
     print(f"walked {n} new commits")
@@ -404,10 +455,10 @@ def _run_update(
     )
 
     if not args.no_report:
-        report_path = write_report(conn, store / "report.html")
+        report_path = write_report(conn, store_dir / ".coding-stats" / "report.html")
         print(f"wrote {report_path}")
     if not args.no_serialize:
-        path = artifact.write(conn, repo_dir, with_report=False)
+        path = artifact.write(conn, store_dir, with_report=False)
         err = artifact.verify(path)
         print(f"wrote {path} (digest {'ok' if err is None else 'MISMATCH ' + str(err)})")
         if recovered:

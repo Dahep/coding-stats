@@ -1,7 +1,8 @@
 """Partial recompute on Artifact digest failure (ADR-0003 clause 3).
 
 On a digest MISMATCH the tampered artifact content is never trusted. The
-artifact file's own git history is searched for the newest committed version
+DATA branch's git history (ADR-0006 clause 1: the artifact lives on
+``coding-stats/<target>``) is searched for the newest committed version
 whose embedded digest self-verifies; that version ANCHORS the rebuild: its
 rows are materialized into a fresh working DB (discarding whatever the
 tampered state carried beyond it — correct, it cannot be trusted), and the
@@ -25,7 +26,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import artifact, db, gitwalk, identity
+from . import artifact, datastore, db, gitwalk, identity
 
 STORE_PATH = ".coding-stats/coding-stats.sql"
 
@@ -42,15 +43,17 @@ class Recovery:
     anchor_sha: str | None  # committed artifact version the rebuild anchors at
 
 
-def find_anchor(repo_dir: Path, branch: str) -> tuple[str, bytes] | None:
-    """(commit sha, bytes) of the newest committed artifact version on the
-    TARGET branch whose embedded digest self-verifies; None when no committed
-    version does. Scoped to `branch` on purpose: versions reachable only from
-    another ref (feature-branch artifact commits) must never anchor a restore
-    — their rows would make the Target walk look rewritten."""
+def find_anchor(repo_dir: Path, ref: str | None) -> tuple[str, bytes] | None:
+    """(commit sha, bytes) of the newest committed artifact version on `ref`
+    whose embedded digest self-verifies; None when no committed version does.
+    The caller pins the ref (datastore.anchor_ref picks the Target's own Data
+    branch): versions reachable only from another branch's refs must never
+    anchor a restore — their rows would make the walk look rewritten."""
+    if not ref:
+        return None
     try:
         log = subprocess.run(
-            ["git", "-C", str(repo_dir), "log", branch, "--format=%H", "--", STORE_PATH],
+            ["git", "-C", str(repo_dir), "log", ref, "--format=%H", "--", STORE_PATH],
             capture_output=True,
             text=True,
             check=True,
@@ -69,13 +72,26 @@ def find_anchor(repo_dir: Path, branch: str) -> tuple[str, bytes] | None:
 
 
 def recover(
-    conn: sqlite3.Connection, db_path: Path, repo_dir: Path, branch: str | None
+    conn: sqlite3.Connection,
+    db_path: Path,
+    repo_dir: Path,
+    branch: str | None,
+    anchor_ref: str | None = None,
 ) -> tuple[Recovery, sqlite3.Connection]:
     """Rebuild the working DB after a digest MISMATCH. Returns the recovery
-    verdict and a fresh connection to the rebuilt DB (the old one is closed)."""
-    anchor = find_anchor(repo_dir, branch) if branch else None
-    if anchor is not None:
-        sha, data = anchor
+    verdict and a fresh connection to the rebuilt DB (the old one is closed).
+
+    The anchor search walks the ref the artifact lives in: the DATA branch's
+    history by default (ADR-0006 clause 1), scoped per Target branch so
+    restoring never reaches across branches; `branch` itself stays the
+    identity branch of the re-registered repository. The legacy-layout
+    migration passes the Target branch's ref instead (its store is committed
+    there)."""
+    if anchor_ref is None and branch:
+        anchor_ref = datastore.anchor_ref(repo_dir, datastore.data_branch(branch))
+    anchor_found = find_anchor(repo_dir, anchor_ref)
+    if anchor_found is not None:
+        sha, data = anchor_found
         return Recovery("restored", sha), rebuild(db_path, data, conn, repo_dir, branch)
     return Recovery("full-recompute", None), rebuild(db_path, None, conn, repo_dir, branch)
 

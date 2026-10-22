@@ -3,13 +3,14 @@ deterministic ingest order, idempotence, last-wins upsert, slug-collision
 refusal, non-verifying refusal. Artifacts are REAL: update wrote them."""
 
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from coding_stats.cli import main
 from coding_stats.metrics import churn_per_feature, snapshot
-from conftest import commit_files, run
+from conftest import commit_files, run, store_worktree
 
 
 class Scripted:
@@ -64,7 +65,7 @@ def _repo_with_artifact(
         if no_classify:
             flags.append("--no-classify")
         main(["update", "--db", db_path, *flags])
-    return repo
+    return store_worktree(repo, branch)  # the Data-branch checkout gathers as a source
 
 
 def _rows(db_path, sql):
@@ -631,7 +632,6 @@ def test_gather_keeps_shim_when_no_origin_resolves(tmp_path):
 
 
 def test_gather_aliases_shim_and_canonical_artifacts_of_one_repo(tmp_path):
-    import shutil
     import unittest.mock as mock
 
     repo1 = _repo_with_artifact(
@@ -644,10 +644,17 @@ def test_gather_aliases_shim_and_canonical_artifacts_of_one_repo(tmp_path):
         ],
     )  # shim-keyed artifact, range = two commits
     repo2 = tmp_path / "dotfiles-clone"
-    shutil.copytree(repo1, repo2)
+    subprocess.run(["git", "clone", "-q", str(repo1), str(repo2)], check=True)
+    run(repo2, "config", "user.name", "T")
+    run(repo2, "config", "user.email", "t@t.io")
+    run(repo2, "checkout", "-q", "-B", "main", "origin/main")  # clone-head hygiene
     commit_files(repo2, "feature three", {"c.txt": "c1\n"})
     for r in (repo1, repo2):
-        run(r, "remote", "add", "origin", "git@github.com:dahep/dotfiles.git")
+        if r == repo1:
+            run(r, "remote", "add", "origin", "git@github.com:dahep/dotfiles.git")
+        else:
+            run(r, "remote", "set-url", "origin", "git@github.com:dahep/dotfiles.git")
+        subprocess.run(["git", "-C", r, "config", "commit.gpgsign", "false"], check=True)
     db2 = str(tmp_path / "dotfiles-clone.db")
     main(["init", str(repo2), "--db", db2])  # canonical: origin resolves now
     with mock.patch(

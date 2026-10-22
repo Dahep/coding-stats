@@ -53,6 +53,17 @@ def add_feature(conn, title: str, about: str = "", created_at: str = "2026-01-01
     return create_feature(conn, repo_id, title, about, created_at)
 
 
+def store_worktree(repo: Path, branch: str = "main") -> Path:
+    """The Data-branch worktree the engine defaults to (datastore.
+    default_worktree's .git-dir case): ci land commits/pushes from here."""
+    return repo / ".git" / "coding-stats-store" / branch
+
+
+def store_dir(repo: Path, branch: str = "main") -> Path:
+    """The artifact store inside the Data-branch worktree."""
+    return store_worktree(repo, branch) / ".coding-stats"
+
+
 @pytest.fixture()
 def repo(tmp_path: Path) -> Path:
     r = tmp_path / "repo"

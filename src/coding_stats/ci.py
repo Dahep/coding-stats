@@ -1,4 +1,5 @@
-"""CI scaffold (ADR-0003 clauses 6-7): workflow rendering and artifact landing.
+"""CI scaffold (ADR-0003 clauses 6-7, ADR-0006 clause 1): workflow rendering
+and Data-branch artifact landing.
 
 ``ci init`` writes ``.github/workflows/coding-stats.yml`` (plus the store's
 ``.gitignore`` for the throwaway CI working DB) idempotently: identical
@@ -7,20 +8,23 @@ unless ``--upgrade`` — the same replace-vs-refuse semantics as
 identity.register_repository.
 
 ``ci land`` is the push-side verb the workflow calls (``uv run coding-stats ci
-land``): it keeps the landing rules (Q15 -> a distinct artifact-update commit
-parented on the push, Q17 -> GITHUB_TOKEN so no PAT, Q18 -> no-op/stale/
-abandon) in Python where they are engine-testable instead of inline shell.
-It may be run anywhere (no CI-env restriction documented by choice); it acts
-on the repository passed in, pushing HEAD to exactly the given branch.
-"""
+land``): it keeps the landing rules — Q15 -> a distinct artifact-update
+commit, Q17 -> GITHUB_TOKEN so no PAT, Q18 -> no-op/stale/abandon — in Python
+where they are engine-testable instead of inline shell.  ADR-0006 retargeted
+it: the landing commits the `.coding-stats/` store of the Data-branch
+worktree (mounted by ``datastore.prepare``) and pushes HEAD to exactly the
+Data branch ``coding-stats/<target>`` — the Target branch never receives bot
+commits.  It may be run anywhere (no CI-env restriction documented by
+choice)."""
 
 import difflib
 import os
-import re
 import subprocess
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path, PurePosixPath
+
+from . import datastore
 
 DEFAULT_CI_DB = ".coding-stats/working.db"
 WORKFLOW_REL = ".github/workflows/coding-stats.yml"
@@ -32,6 +36,7 @@ DEFAULT_TOOL_REF = "main"
 SUBJECT = "coding-stats artifact update (auto)"
 BOT_NAME = "coding-stats[bot]"
 BOT_EMAIL = "coding-stats[bot]@users.noreply.github.com"
+_STORE_PATH = ".coding-stats"
 
 
 class DriftError(RuntimeError):
@@ -43,7 +48,7 @@ class Landing:
     """The landing outcome. The verb itself stays silent: reporting is the
     CLI's job, so the status is printed exactly once."""
 
-    status: str  # 'landed' | 'noop' | 'abandoned'
+    status: str  # 'landed' | 'noop' | 'abandoned' | 'skipped'
     detail: str
 
 
@@ -141,10 +146,14 @@ on:
       - ".skill-stats/**"
 
 # Parameters travel via env (quoted "$VAR" in run lines): hostile branch or
-# db values can never inject shell or YAML.
+# db values can never inject shell or YAML. CODING_STATS_STORE names the
+# Data-branch worktree the engine mounts itself (ADR-0006): the artifact
+# lives on the orphan branch coding-stats/<branch>, and the store's report is
+# read from there — the Target branch never receives artifact commits.
 env:
   CODING_STATS_BRANCH: {b}
   CODING_STATS_DB: {_yaml_scalar(db)}
+  CODING_STATS_STORE: {_yaml_scalar(f".git/{datastore.STORE_DIR}/" + branch)}
 
 {perms}jobs:
   coding-stats:
@@ -178,7 +187,7 @@ env:
         uses: actions/upload-artifact@v4
         with:
           name: coding-stats-report
-          path: .coding-stats/report.html
+          path: ${{{{ env.CODING_STATS_STORE }}}}/.coding-stats/report.html
 {pages_job}"""
 
 
@@ -281,27 +290,13 @@ def init(
     return out
 
 
-_INVALID_REF_RE = re.compile(r"[\x00-\x1f\x7f ~^:?*\[\\]")
+_INVALID_REF_RE = datastore._INVALID_REF_RE
 
 
 def _validate_branch(branch: str) -> None:
-    """Ref-name rules of git/GitHub (check-ref-format). Rendering is safe for
-    any string; this refuses names git itself would reject."""
-    bad = (
-        not branch
-        or bool(_INVALID_REF_RE.search(branch))
-        or ".." in branch
-        or "@{" in branch
-        or branch == "@"
-        or branch.startswith("/")
-        or branch.endswith("/")
-        or "//" in branch
-        or branch.endswith(".")
-        or branch.endswith(".lock")
-        or any(p.startswith(".") or p.endswith(".lock") for p in branch.split("/"))
-    )
-    if bad:
-        raise ValueError(f"invalid branch name {branch!r}: not a valid git/GitHub ref")
+    """Ref-name rules of git/GitHub (check-ref-format) — shared with the
+    Data-branch store (datastore.validate_ref)."""
+    datastore.validate_ref(branch)
 
 
 def _validate_db(db: str) -> None:
@@ -311,31 +306,67 @@ def _validate_db(db: str) -> None:
         raise ValueError(f"db path {db!r} collides with a committed artifact file")
 
 
-def commit_or_abandon(repo: Path, branch: str, remote: str = "origin") -> Landing:
-    """The landing verb (ADR-0003 clause 6, Q15/Q17/Q18):
-    'noop' — .coding-stats/ is unchanged (no-op discipline: nothing is pushed);
-    'abandoned' — the checked-out push is behind the branch tip (a newer push
-    landed while this run worked, including the check-to-push race window) or
-    history diverged (never force);
-    'landed' — the artifact update is committed as coding-stats[bot] and pushed
-    to exactly `branch`. Unrelated push failures (auth, network) raise."""
-    if not _store_dirty(repo):
+def report_landing(landing: Landing) -> None:
+    """Print the landing outcome exactly once (the CLI's reporting step):
+    neutral ::notice:: annotation + step summary for abandonment and skips
+    (Q18/ADR-0006: never a red failure for superseded or skipped runs), a
+    plain line otherwise."""
+    line = f"coding-stats ci land: {landing.status} — {landing.detail}"
+    if landing.status in ("abandoned", "skipped"):
+        print(f"::notice::{line}")
+    else:
+        print(line)
+    step_summary(line)
+
+
+def step_summary(line: str) -> None:
+    """Append one line to the GITHUB_STEP_SUMMARY (noop outside Actions)."""
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as fh:
+            fh.write(f"### {line}\n")
+
+
+def land(store: datastore.DataStore, repo: Path, remote: str = "origin") -> Landing:
+    """The landing verb, retargeted to the Data branch (ADR-0006 clause 1 —
+    the ADR-0003 rules Q15/Q17/Q18 stand):
+
+    'noop' — the store worktree's .coding-stats/ is unchanged (nothing is
+    pushed, so unchanged data never lands);
+    'skipped' — the caller refused the Target branch (under coding-stats/ or
+    a Data-branch ref-path clash): a neutral notice, never a red run;
+    'abandoned' — the Data branch tip moved under this run since it was read
+    (another run landed first, including the check-to-push race) or the
+    history diverged (never force); a run whose *Target* moved on is judged
+    on the Data branch alone and still lands its cumulative Artifact;
+    'landed' — the artifact update is committed as coding-stats[bot] in the
+    Data-branch worktree (its parent is the previous Data tip, or none for
+    the first commit of a fresh orphan branch) and pushed to exactly
+    refs/heads/<data-branch>. Unrelated push failures (auth, network) raise.
+
+    Identity: `store.target` stays the Repository key's branch — the Data
+    branch never becomes one. Remote ops run from `repo` (the main checkout)
+    because remote URLs may be relative; only index/worktree ops run inside
+    the worktree."""
+    if not _store_dirty(store.worktree):
         return Landing("noop", "no artifact changes to land")
-    base = _git(repo, "rev-parse", "HEAD").strip()
-    _fetch_tip(repo, branch, remote)
-    tip = _tip(repo, branch, remote)
-    if tip != base:
-        if _is_ancestor(repo, base, tip):
+    base = _head(store.worktree)  # None on an unborn (first-run) branch
+    remote_ok = datastore.remote_url(repo, remote) is not None
+    tip = datastore.fetch_tip(repo, store.data_branch, remote) if remote_ok else None
+    if tip is not None and tip != base:
+        if base is None or _is_ancestor(repo, base, tip):
             return Landing(
                 "abandoned",
-                f"a newer push landed on {branch} while this run worked;"
+                f"a newer push landed on {store.data_branch} while this run worked;"
                 " its own run covers the data",
             )
         if not _is_ancestor(repo, tip, base):
-            return Landing("abandoned", f"history diverged from {remote}/{branch}; never force")
-    _git(repo, "add", "-A", "--", ".coding-stats")
+            return Landing(
+                "abandoned", f"history diverged from {remote}/{store.data_branch}; never force"
+            )
+    _git(store.worktree, "add", "-A", "--", _STORE_PATH)
     _git(
-        repo,
+        store.worktree,
         "-c",
         f"user.name={BOT_NAME}",
         "-c",
@@ -344,52 +375,44 @@ def commit_or_abandon(repo: Path, branch: str, remote: str = "origin") -> Landin
         "-m",
         SUBJECT,
         "--",
-        ".coding-stats",
+        _STORE_PATH,
     )
+    head = _git(store.worktree, "rev-parse", "HEAD").strip()
+    if not remote_ok:
+        return Landing("landed", f"{store.data_branch} committed locally; no remote to push")
     try:
-        _push(repo, remote, branch)
+        _push(repo, remote, store.data_branch, head)
     except subprocess.CalledProcessError as exc:
-        # Q18 race: the branch advanced between our staleness check and this
-        # push and the push was rejected. Superseded runs end neutrally —
-        # never force, never block; anything else (auth, network) is a real
+        # Q18 race: the Data branch advanced between our staleness check and
+        # this push and the push was rejected. Superseded runs end neutrally
+        # — never force, never block; anything else (auth, network) is a real
         # error and must surface.
-        _fetch_tip(repo, branch, remote)
-        tip = _tip(repo, branch, remote)
-        if tip != base and not _is_ancestor(repo, tip, base):
+        tip = datastore.fetch_tip(repo, store.data_branch, remote)
+        if tip is not None and (base is None or not _is_ancestor(repo, tip, base)):
             return Landing(
                 "abandoned",
-                f"a newer push landed on {branch} during the landing attempt;"
+                f"a newer push landed on {store.data_branch} during the landing attempt;"
                 " superseded (the local artifact commit stays unpushed)",
             )
         raise exc
-    return Landing("landed", f"artifact-update commit pushed to {remote} {branch}")
+    return Landing("landed", f"artifact-update commit pushed to {remote} {store.data_branch}")
 
 
-def report_landing(landing: Landing) -> None:
-    """Print the landing outcome exactly once (the CLI's reporting step):
-    neutral ::notice:: annotation + step summary for abandonment (Q18: never
-    a red failure for superseded runs), a plain line otherwise."""
-    line = f"coding-stats ci land: {landing.status} — {landing.detail}"
-    if landing.status == "abandoned":
-        print(f"::notice::{line}")
-    else:
-        print(line)
-    summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary:
-        with open(summary, "a", encoding="utf-8") as fh:
-            fh.write(f"### {line}\n")
+def _push(repo: Path, remote: str, branch: str, head: str) -> None:
+    # by sha, not HEAD: HEAD inside the worktree is the landing commit, but
+    # remote URLs may be relative and resolve against the main checkout
+    _git(repo, "push", remote, f"{head}:refs/heads/{branch}")
 
 
-def _push(repo: Path, remote: str, branch: str) -> None:
-    _git(repo, "push", remote, f"HEAD:refs/heads/{branch}")
-
-
-def _fetch_tip(repo: Path, branch: str, remote: str) -> None:
-    _git(repo, "fetch", remote, f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}")
-
-
-def _tip(repo: Path, branch: str, remote: str) -> str:
-    return _git(repo, "rev-parse", f"refs/remotes/{remote}/{branch}").strip()
+def _head(repo: Path) -> str | None:
+    """HEAD sha, or None on an unborn branch (a fresh orphan Data branch)."""
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", "HEAD"],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    return proc.stdout.strip() or None if proc.returncode == 0 else None
 
 
 def _diff(rel: str, current: str, generated: str) -> str:
