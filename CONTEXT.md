@@ -7,10 +7,10 @@ A tool that mines git history (and later opencode history) to measure feature-le
 ### Git domain
 
 **Repository key**:
-A Target repo's identity across machines and clones: clone URL plus the repository's Target branch. Machine-local paths are never identity; SSH config alias hosts are machine-local names and never identity either. Gather keys on a Repository key, two clones of the same repository are one.
+A Target repo's identity across machines and clones: clone URL plus the repository's Target branch. Machine-local paths are never identity; SSH config alias hosts are machine-local names and never identity either. Gather keys on a Repository key, two clones of the same repository on the same Target branch are one; one repository on two Target branches is two keys.
 
 **Feature id**:
-A Feature's identifier. Locally unique within a repo; globally disambiguated by its Repository key so gathered unions need no remapping.
+A Feature's identifier, globally unique: it names its repository and the Target branch that first classified it. A Feature reached by several Target branches through Shared commits keeps one id.
 
 **Fix**:
 A commit that modifies lines belonging to existing commits (of a Feature or of another Fix) without adding a Feature.
@@ -60,7 +60,7 @@ A Skill invocation from sessions predating the plugin's existence. Most skill at
 The git working copy a Run analyzes. One checkout pairs one Repository key.
 
 **Artifact**:
-The committed `.coding-stats/` store holding a Target repo's complete git-analysis state (verdicts, features, fix attribution, lineage). Source of truth for that repo's numbers; Org-wide metrics are gathered from many Artifacts.
+The `.coding-stats/` store holding one Target branch's complete git-analysis state (verdicts, features, fix attribution, lineage), committed on that branch's Data branch. Source of truth for that branch's numbers; Org-wide metrics are gathered from many Artifacts.
 _Avoid_: export, dump
 
 **Artifact digest**:
@@ -78,5 +78,16 @@ _Avoid_: checkpoint, snapshot
 What an Artifact digest failure triggers: trust is rebuilt from the newest prior artifact version that still verifies, and work newer than it is re-analyzed. Falls back to a full recompute when no verifiable version survives.
 
 **Target branch**:
-The single branch a git analysis run walks (main or an explicitly configured alternative). All metrics are computed on Target-branch commits only.
+The single branch a git analysis run walks (main or an explicitly configured alternative). All metrics are computed on Target-branch commits only; a repo may track several Target branches independently.
 _Avoid_: all branches, full history
+
+**Data branch**:
+The orphan branch `coding-stats/<Target branch>` that carries one Target branch's Artifact.
+_Avoid_: stats branch, gh-pages
+
+**Seeding**:
+Reusing the analysis held by another Data branch of the same repository for Shared commits, so shared history is classified once.
+_Avoid_: seed (for restoring a branch from its own Artifact — that is Partial recompute or a plain rebuild)
+
+**Shared commit**:
+A commit walked by more than one tracked Target branch of the same repository. Counted once in gathered metrics.
