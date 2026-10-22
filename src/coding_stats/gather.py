@@ -29,7 +29,6 @@ as the LEAST complete constituent (see metrics.sampling_complete).
 """
 
 import json
-import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -175,8 +174,10 @@ def _load(source: Path, path: Path) -> _Ingest:
             branch = str(repo_row["branch"] or "")
             canon_key = identity.repo_key(canon, branch)
             if key.startswith("local:") or key == canon_key:
-                canon_slug = identity.slug_from_clone_url(canon)
-                _reprefix_features(rows, canon_slug)
+                canon_slug = identity.repo_slug(
+                    identity.slug_from_clone_url(canon), branch
+                )
+                identity.reprefix_features(rows, canon_slug)
                 key, slug, clone_url = canon_key, canon_slug, canon
     return _Ingest(
         source=source,
@@ -191,32 +192,6 @@ def _load(source: Path, path: Path) -> _Ingest:
         min_target_lines=_as_int(_setting_json(rows, "min_target_lines", 1)),
         rows=rows,
     )
-
-
-def _reprefix_features(rows: sqlite3.Connection, new_slug: str) -> None:
-    """Re-prefix every feature id of the ingested rows to {new_slug}-{n}
-    (local numbers preserved) across features, commits_features,
-    fixes_features and feature_line_samples."""
-    pat = re.compile(r"^(.+)-(\d+)$")
-
-    def rewrite(value: str) -> str:
-        m = pat.match(value)
-        return f"{new_slug}-{m.group(2)}" if m else value
-
-    for old_id in [str(r["id"]) for r in rows.execute("SELECT id FROM features")]:
-        new_id = rewrite(old_id)
-        if new_id != old_id:
-            rows.execute("UPDATE features SET id = ? WHERE id = ?", (new_id, old_id))
-    for table, col in (
-        ("commits_features", "feature_id"),
-        ("fixes_features", "feature_id"),
-        ("feature_line_samples", "feature_id"),
-    ):
-        for r in rows.execute(f"SELECT DISTINCT {col} v FROM {table}"):
-            old_val = str(r["v"])
-            new_val = rewrite(old_val)
-            if new_val != old_val:
-                rows.execute(f"UPDATE {table} SET {col} = ? WHERE {col} = ?", (new_val, old_val))
 
 
 def _as_int(value: object) -> int:

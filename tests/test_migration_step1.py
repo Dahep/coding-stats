@@ -146,7 +146,7 @@ def test_migration_creates_shim_repository_row(tmp_path):
     row = conn.execute("SELECT * FROM repositories").fetchone()
     # machine path is never identity: documented local: shim, key = base@branch
     assert row["repo_key"] == "local:dotfiles@main"
-    assert row["slug"] == "dotfiles"
+    assert row["slug"] == "dotfiles@main"
     assert row["branch"] == "main"
     assert row["clone_url"] is None
     rid = conn.execute("SELECT value FROM settings WHERE key = 'repo_id'").fetchone()[0]
@@ -159,23 +159,23 @@ def test_migration_prefixes_feature_ids(tmp_path):
     rows = conn.execute("SELECT id, title, about, created_at FROM features ORDER BY id").fetchall()
     # feature 9 (defined only by the store-only commit) is purged as an orphan
     assert [(r["id"], r["title"], r["about"]) for r in rows] == [
-        ("dotfiles-3", "alpha module", "first"),
-        ("dotfiles-7", "beta index", "second"),
+        ("dotfiles@main-3", "alpha module", "first"),
+        ("dotfiles@main-7", "beta index", "second"),
     ]
     assert rows[0]["created_at"] == "2026-01-01T00:00:00Z"
     links = conn.execute(
         "SELECT commit_id, feature_id, role FROM commits_features ORDER BY commit_id"
     ).fetchall()
     assert [(r["commit_id"], r["feature_id"], r["role"]) for r in links] == [
-        (1, "dotfiles-3", "defines"),
-        (2, "dotfiles-7", "defines"),
+        (1, "dotfiles@main-3", "defines"),
+        (2, "dotfiles@main-7", "defines"),
     ]
     ff = conn.execute(
         "SELECT fix_commit_id, feature_id, via_fix_commit_id FROM fixes_features"
     ).fetchall()
     # (2, dotfiles-9) died with its orphaned feature
     assert [(r["fix_commit_id"], r["feature_id"], r["via_fix_commit_id"]) for r in ff] == [
-        (2, "dotfiles-3", None)
+        (2, "dotfiles@main-3", None)
     ]
     conn.close()
 
@@ -211,7 +211,7 @@ def test_migration_purges_store_only_dependents_and_orphans(tmp_path):
     vt = conn.execute("SELECT commit_id, verdict FROM commit_verdicts").fetchall()
     assert [(r["commit_id"], r["verdict"]) for r in vt] == [(2, "fix")]  # cleanup verdict gone
     feats = [r[0] for r in conn.execute("SELECT id FROM features")]
-    assert "dotfiles-9" not in feats
+    assert "dotfiles@main-9" not in feats
     assert conn.execute("SELECT COUNT(*) c FROM commits_features").fetchone()["c"] == 2
     assert conn.execute("SELECT COUNT(*) c FROM fixes_features").fetchone()["c"] == 1
     # FK integrity across the whole rebuilt schema
@@ -316,7 +316,7 @@ def test_migration_failure_rolls_back_and_reopens(tmp_path, monkeypatch):
     assert conn2.execute("SELECT COUNT(*) c FROM repositories").fetchone()["c"] == 1
     assert conn2.execute("SELECT COUNT(*) c FROM commits").fetchone()["c"] == 2
     ids = [r[0] for r in conn2.execute("SELECT id FROM features ORDER BY id")]
-    assert ids == ["dotfiles-3", "dotfiles-7"]
+    assert ids == ["dotfiles@main-3", "dotfiles@main-7"]
     conn2.close()
 
 
@@ -401,22 +401,29 @@ def test_migration_matches_fresh_walk(repo, tmp_path):
             " '', '', 'm', '2026-01-01T00:00:00Z')",
             (idx, verdict),
         )
-    add_feature(fresh, "alpha module", "", CREATED1)
-    add_feature(fresh, "beta index", "", CREATED4)
+    fid1 = add_feature(fresh, "alpha module", "", CREATED1)
+    fid2 = add_feature(fresh, "beta index", "", CREATED4)
     fresh.execute(
         "INSERT INTO commits_features (commit_id, feature_id, role)"
-        " VALUES ((SELECT id FROM commits WHERE walk_index = 1), 'repo-1', 'defines')"
+        " VALUES ((SELECT id FROM commits WHERE walk_index = 1), ?, 'defines')",
+        (fid1,),
     )
     fresh.execute(
         "INSERT INTO commits_features (commit_id, feature_id, role)"
-        " VALUES ((SELECT id FROM commits WHERE walk_index = 4), 'repo-2', 'defines')"
+        " VALUES ((SELECT id FROM commits WHERE walk_index = 4), ?, 'defines')",
+        (fid2,),
     )
     fresh.commit()
     annotate_all(repo, fresh)
     close_lineage(fresh)
 
     # --- equivalence: same metrics, same per-commit derived columns
-    assert snapshot_to_json(snapshot(moved)) == snapshot_to_json(snapshot(fresh))
+    a = snapshot_to_json(snapshot(moved))
+    b = snapshot_to_json(snapshot(fresh))
+    if a != b:
+        print("SNAP-A:", a)
+        print("SNAP-B:", b)
+    assert a == b
 
     def commit_facts(conn):
         return {

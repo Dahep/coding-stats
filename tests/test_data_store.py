@@ -221,3 +221,75 @@ def test_update_skips_legacy_store_without_data_branch(tmp_path, repo, capsys):
     assert "update skipped; nothing was walked, classified, or landed" in out
     # never silently re-classified on top of it: nothing was walked either
     assert "walked" not in out.split("::notice::", 1)[1].split("update skipped;", 1)[0]
+
+
+def test_update_reprefixes_old_format_artifact_in_place(
+    tmp_path, repo, capsys, monkeypatch
+):
+    """An artifact minted under the old {repo-slug}-{n} scheme is re-prefixed
+    to {repo}@{branch} when the update adopts it — classified history kept
+    without re-classification (the seeded commit never reaches the LLM)."""
+    import sqlite3
+    import unittest.mock as mock
+
+    class SeedSession:
+        session_id = None
+
+        def __init__(self, replies):
+            self.replies = list(replies)
+
+        def send(self, message):
+            return self.replies.pop(0)
+
+    class Refuse:
+        session_id = None
+
+        def send(self, message):
+            raise AssertionError(f"seeded commit re-classified: {message[:80]}")
+
+    commit_files(repo, "feature one", {"a.txt": "alpha\n"})
+    repo_dir = store_worktree(repo, "main")
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    (repo_dir / ".coding-stats").mkdir(exist_ok=True)
+    db_path = str(tmp_path / "u.db")
+    main(["init", str(repo), "--db", db_path])
+    # first run produces the store normally, then rewrite it as old-style
+    with mock.patch(
+        "coding_stats.cli.Session",
+        lambda model, sid=None: SeedSession(
+            ['{"k":"new","title":"alpha module","about":"","why":"y"}']
+        ),
+    ):
+        main(["update", "--db", db_path])
+    capsys.readouterr()
+    art_path = repo_dir / ".coding-stats" / "coding-stats.sql"
+    body = art_path.read_bytes()
+    # demote the ids to the branch-less old shape, honest digest included
+    import hashlib
+    import re as _re
+
+    text = body.decode("utf-8").replace("empty-prefix", "x")
+    m = _re.search(r"^-- digest:(?: ([0-9a-f]+))?$", text, _re.M)
+    assert m is not None
+    idx = text.index("-- digest:")
+    body = text[:idx] + "-- digest:\n" + text[text.index("\n", idx) + 1:]
+    old_len = len(text.split("INSERT", 1)[0])  # (the digest is over everything)
+    # rebuild the digest honestly: blank the line and recompute
+    lines = text.splitlines(True)
+    for i, l in enumerate(lines):
+        if l.startswith("-- digest:"):
+            lines[i] = "-- digest:\n"
+    blanked = "".join(lines)
+    digest = __import__("hashlib").sha256(blanked.encode("utf-8")).hexdigest()
+    text = "".join(lines).replace("-- digest:\n", f"-- digest: {digest}\n", 1)
+    art_path.write_text(text)
+    capsys.readouterr()
+
+    # the adopting update re-prefixes in place
+    main(["update", "--db", db_path])
+    out = capsys.readouterr().out
+    mat = sqlite3.connect(":memory:")
+    mat.executescript(art_path.read_text(encoding="utf-8"))
+    ids = [r[0] for r in mat.execute("SELECT id FROM features ORDER BY id")]
+    assert ids == ["repo@main-1"]
+    mat.close()

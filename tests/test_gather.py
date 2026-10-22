@@ -105,13 +105,13 @@ def test_gather_unions_two_repos_deterministically(tmp_path, monkeypatch):
 
     repos = _rows(union, "SELECT * FROM repositories ORDER BY repo_key")
     assert [r["repo_key"] for r in repos] == ["local:alpha-repo@main", "local:beta-repo@main"]
-    assert [r["slug"] for r in repos] == ["alpha-repo", "beta-repo"]
+    assert [r["slug"] for r in repos] == ["alpha-repo@main", "beta-repo@main"]
     commits = _rows(union, "SELECT repo_id, sha, added_lines, deleted_lines FROM commits")
     assert len(commits) == 2
     feats = _rows(union, "SELECT id, repo_id, live_lines FROM features ORDER BY id")
-    assert [f["id"] for f in feats] == ["alpha-repo-1", "beta-repo-1"]  # no remapping
+    assert [f["id"] for f in feats] == ["alpha-repo@main-1", "beta-repo@main-1"]  # no remapping
     churn = {fid: n for fid, _title, n in churn_per_feature(_connect(union))}
-    assert churn["alpha-repo-1"] == 2 and churn["beta-repo-1"] == 1  # no contamination
+    assert churn["alpha-repo@main-1"] == 2 and churn["beta-repo@main-1"] == 1  # no contamination
     snap = snapshot(_connect(union))
     assert snap.total_features == 2 and snap.total_commits == 2
     meta = _rows(union, "SELECT * FROM union_artifacts ORDER BY repo_key")
@@ -186,25 +186,31 @@ def test_gather_upserts_newer_artifact_of_same_key(tmp_path):
 
 
 def test_gather_refuses_slug_collision(tmp_path):
+    """The slug-collision refusal lives at the {repo}@{branch} slug: two
+    different hosts publishing the same owner/repo and branch mint colliding
+    feature-id prefixes and still fail loudly. (A same-repo/two-branch pair
+    is legal now — see test_gather_two_data_branches_union_deterministically.)"""
     a = _repo_with_artifact(
         tmp_path / "x",
         "dotfiles",
         [("feature one", {"a.txt": "a1\n"})],
         ['{"k":"new","title":"one","about":"x","why":"y"}'],
+        origin="https://github.com/dahep/dotfiles.git",
     )
     b = _repo_with_artifact(
         tmp_path / "y",
         "dotfiles",
         [("feature two", {"b.txt": "b1\n"})],
         ['{"k":"new","title":"two","about":"x","why":"y"}'],
-        branch="dev",
+        origin="https://gitlab.com/dahep/dotfiles.git",
     )
     union = tmp_path / "union.db"
     with pytest.raises(SystemExit) as excinfo:
         main(["gather", "--db", str(union), str(a), str(b)])
     msg = str(excinfo.value)
-    assert "local:dotfiles@main" in msg and "local:dotfiles@dev" in msg  # offending keys named
-    assert "dotfiles" in msg  # the colliding slug named
+    assert "https://github.com/dahep/dotfiles@main" in msg
+    assert "https://gitlab.com/dahep/dotfiles@main" in msg  # offending keys named
+    assert "dahep-dotfiles@main" in msg  # the colliding slug named
     assert not union.exists()  # refused before anything was written
 
 
@@ -237,7 +243,7 @@ def test_gather_decodes_hdr_non_ascii_key(tmp_path):
     repos = _rows(union, "SELECT repo_key, slug FROM repositories")
     # the non-ASCII key survives the \xNN header round-trip; the slug is
     # ASCII-sanitized by identity._slug (é -> '-')
-    assert repos == [{"repo_key": "local:café-repo@main", "slug": "caf--repo"}]
+    assert repos == [{"repo_key": "local:café-repo@main", "slug": "caf--repo@main"}]
 
 
 def _connect(path):
@@ -273,7 +279,7 @@ def test_union_report_repo_column_and_org_branding(tmp_path):
     assert "<th>Repo</th>" in page  # REPO column in the ranking table
     assert "alpha-repo" in page and "beta-repo" in page
     text = text_report(conn)
-    assert "#alpha-repo-1" in text and "#beta-repo-1" in text
+    assert "#alpha-repo@main-1" in text and "#beta-repo@main-1" in text
     assert "alpha-module" not in text  # sanity: no stray remap
     conn.close()
 
@@ -461,11 +467,11 @@ def _crafted_union(path):
                  (4, 2, 'z40', 't', '2026-01-03T00:00:00Z', 't', 'three', 'm', 2,
                   'normal', '', 1, 0, 1);
         INSERT INTO features (id, title, about, title_history_json, created_at, repo_id, live_lines)
-          VALUES ('a-1', 'alpha', '', '[]', '2026-01-01T00:00:00Z', 1, 8),
-                 ('b-1', 'beta', '', '[]', '2026-01-01T00:00:00Z', 2, 4);
+          VALUES ('a@main-1', 'alpha', '', '[]', '2026-01-01T00:00:00Z', 1, 8),
+                 ('b@main-1', 'beta', '', '[]', '2026-01-01T00:00:00Z', 2, 4);
         INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines)
-          VALUES ('a-1', 'x40', 5), ('b-1', 'x40', 7),
-                 ('a-1', 'y40', 8), ('b-1', 'z40', 4);
+          VALUES ('a@main-1', 'x40', 5), ('b@main-1', 'x40', 7),
+                 ('a@main-1', 'y40', 8), ('b@main-1', 'z40', 4);
         """
     )
     conn.commit()
@@ -478,8 +484,8 @@ def test_union_chart_repo_scoped_totals_and_staggered_lines(tmp_path):
     conn = _crafted_union(tmp_path / "union.db")
     labels, series, total = _size_series(conn)
     assert total[1] == [12.0, 8.0, 4.0]  # fork-shared SHA counted once per row, not doubled
-    assert dict((name, vals) for name, vals, _c in series)["#a-1 alpha"] == [5.0, 8.0, None]
-    assert dict((name, vals) for name, vals, _c in series)["#b-1 beta"] == [7.0, None, 4.0]
+    assert dict((name, vals) for name, vals, _c in series)["#a@main-1 alpha"] == [5.0, 8.0, None]
+    assert dict((name, vals) for name, vals, _c in series)["#b@main-1 beta"] == [7.0, None, 4.0]
     # each line spans only its OWN sample dates (staggered sampling invents
     # no zeros); the axis is chronological (committed_at)
     assert labels == ["2026-01-01", "2026-01-02", "2026-01-03"]
@@ -490,8 +496,8 @@ def test_union_chart_single_feature_regression(tmp_path):
     from coding_stats.htmlreport import _size_series
 
     conn = _crafted_union(tmp_path / "union.db")
-    conn.execute("DELETE FROM feature_line_samples WHERE feature_id = 'b-1'")
-    conn.execute("DELETE FROM features WHERE id = 'b-1'")
+    conn.execute("DELETE FROM feature_line_samples WHERE feature_id = 'b@main-1'")
+    conn.execute("DELETE FROM features WHERE id = 'b@main-1'")
     conn.commit()
     labels, series, total = _size_series(conn)
     assert [vals for _n, vals, _c in series] == [[5.0, 8.0]]
@@ -598,17 +604,17 @@ def test_gather_adopts_canonical_key_for_shim_artifact(tmp_path):
     assert repos == [
         {
             "repo_key": "https://github.com/dahep/dotfiles@main",
-            "slug": "dahep-dotfiles",
+            "slug": "dahep-dotfiles@main",
             "clone_url": "https://github.com/dahep/dotfiles",
         }
     ]
     assert [f["id"] for f in _rows(union, "SELECT id FROM features ORDER BY id")] == [
-        "dahep-dotfiles-1"
+        "dahep-dotfiles@main-1"
     ]
     assert art.read_bytes() == before  # union-only normalization: store untouched
     from coding_stats import htmlreport
 
-    assert "dahep-dotfiles-1" in htmlreport.build(_connect(union))
+    assert "dahep-dotfiles@main-1" in htmlreport.build(_connect(union))
 
 
 def test_gather_keeps_shim_when_no_origin_resolves(tmp_path):
@@ -621,13 +627,13 @@ def test_gather_keeps_shim_when_no_origin_resolves(tmp_path):
     union = tmp_path / "union.db"
     main(["gather", "--db", str(union), str(repo)])
     assert _rows(union, "SELECT repo_key, slug FROM repositories") == [
-        {"repo_key": "local:dotfiles@main", "slug": "dotfiles"}
+        {"repo_key": "local:dotfiles@main", "slug": "dotfiles@main"}
     ]
     # an explicit artifact file has no checkout context: stays shim-keyed too
     union2 = tmp_path / "union2.db"
     main(["gather", "--db", str(union2), str(repo / ".coding-stats" / "coding-stats.sql")])
     assert _rows(union2, "SELECT repo_key, slug FROM repositories") == [
-        {"repo_key": "local:dotfiles@main", "slug": "dotfiles"}
+        {"repo_key": "local:dotfiles@main", "slug": "dotfiles@main"}
     ]
 
 
@@ -679,8 +685,8 @@ def test_gather_aliases_shim_and_canonical_artifacts_of_one_repo(tmp_path):
     # overlapping rows resolved by last-ingest-wins: three commits, three ids
     assert _rows(union, "SELECT COUNT(*) c FROM commits")[0]["c"] == 3
     assert [f["id"] for f in _rows(union, "SELECT id FROM features ORDER BY id")] == [
-        "dahep-dotfiles-1",
-        "dahep-dotfiles-2",
-        "dahep-dotfiles-3",
+        "dahep-dotfiles@main-1",
+        "dahep-dotfiles@main-2",
+        "dahep-dotfiles@main-3",
     ]
     assert len(_rows(union, "SELECT * FROM union_artifacts")) == 1

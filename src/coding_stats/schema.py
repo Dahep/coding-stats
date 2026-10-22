@@ -157,8 +157,10 @@ def _step_1(conn: sqlite3.Connection) -> None:
         )
     key = slug = None
     if isinstance(repo_value, str):
-        base, slug = identity.local_identity(repo_value)
-        key = identity.repo_key(base, branch_value if isinstance(branch_value, str) else None)
+        base, plain_slug = identity.local_identity(repo_value)
+        branch_v = branch_value if isinstance(branch_value, str) else None
+        slug = identity.repo_slug(plain_slug, branch_v) if branch_v else plain_slug
+        key = identity.repo_key(base, branch_v)
 
     stats: dict[int, gitwalk.DiffStat] = {}
     stale: set[int] = set()

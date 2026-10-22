@@ -124,6 +124,10 @@ def rebuild(
         identity.register_repository(fresh, repo_dir, branch)
         if data is not None:
             rehydrate_diffs(fresh, repo_dir)
+            # safe-side upgrade: artifacts minted before the scheme carries
+            # branch ids ({repo-slug}-{n}) re-prefix in place, suffixes kept
+            row = fresh.execute("SELECT slug FROM repositories ORDER BY id LIMIT 1").fetchone()
+            identity.reprefix_features(fresh, str(row["slug"]))
         fresh.commit()
     finally:
         fresh.close()
