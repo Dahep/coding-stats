@@ -1,6 +1,6 @@
 # ADR 0003: In-repo committed artifact, integrity policy, and per-push landing
 
-## Status: accepted
+## Status: accepted — partially superseded by ADR-0006 (its Status line lists the affected parts)
 
 ## Context & decision
 
