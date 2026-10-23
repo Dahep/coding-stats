@@ -99,6 +99,9 @@ def _sibling_artifact(repo_dir: Path, tip_sha: str) -> bytes | None:
     return proc.stdout if proc.returncode == 0 else None
 
 
+sibling_artifact = _sibling_artifact
+
+
 def _winning_sources(
     repo_dir: Path,
     our_base: str,

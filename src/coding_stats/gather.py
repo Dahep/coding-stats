@@ -84,10 +84,9 @@ def gather(union_path: Path, sources: list[Path]) -> GatherResult:
         raise GatherError("no artifact sources given")
     ingests: list[_Ingest] = []
     for source in sources:
-        for art_path in _artifact_paths(source):
-            ingests.append(_load(source, art_path))
+        for label, data in _artifact_blobs(source):
+            ingests.append(_load(source, label, data))
     ingests.sort(key=lambda i: (i.key,))  # deterministic ingest order
-
     existing = _existing_keys(union_path)
     _refuse_slug_collisions(ingests, existing)
 
@@ -108,32 +107,49 @@ def gather(union_path: Path, sources: list[Path]) -> GatherResult:
                 _upsert(conn, item)
                 ingested += 1
             _write_union_settings(conn)
+            _refuse_drifted_feature_ids(conn)
         return GatherResult(ingested=ingested, skipped=skipped)
     finally:
         conn.close()
 
 
-def _artifact_paths(source: Path) -> list[Path]:
-    """The artifact files a source names: an explicit file, a checkout's
-    committed store, or — for Data-branch-layout repos (ADR-0006) — every
-    mounted Data-branch store found in the checkout."""
+def _artifact_blobs(source: Path) -> list[tuple[str, bytes]]:
+    """(label, artifact bytes) a source expands to: an explicit file, a
+    checkout's committed store, every mounted Data-branch store of a
+    Data-branch-layout repo (ADR-0006), or — when nothing is mounted — the
+    Data branches the checkout has fetched, read straight out of their refs."""
     if not source.is_dir():
-        return [source]
+        return [(str(source), source.read_bytes())]
     p = source / STORE_REL
     if p.exists():
-        return [p]
+        return [(str(p), p.read_bytes())]
+    out: list[tuple[str, bytes]] = []
     roots = source / ".git" / datastore.STORE_DIR
-    if not roots.is_dir():
-        return [p]  # missing on purpose: the reader names the error
-    return sorted(roots.glob(f"*/{_STORE_TREE_PATH}"))
+    if roots.is_dir():
+        for art in sorted(roots.glob(f"*/{_STORE_TREE_PATH}")):
+            out.append((str(art), art.read_bytes()))
+    if not out:
+        # Data branches not mounted as worktrees (e.g. a runner whose fetch
+        # step created refs only): read the artifact out of each known tip
+        from .seeding import sibling_artifact
+
+        refs = datastore.remote_data_refs(source)
+        for name in sorted(refs):
+            data = sibling_artifact(source, refs[name])
+            if data is not None:
+                out.append((f"{source} [{name}]", data))
+    if not out:
+        raise GatherError(f"{source}: cannot read artifact ({p})")
+    return out
 
 
-def _load(source: Path, path: Path) -> _Ingest:
-    try:
-        data = path.read_bytes()
-    except OSError as exc:
-        raise GatherError(f"{source}: cannot read artifact ({exc})") from exc
+def _load(source: Path, label: str, data: bytes) -> _Ingest:
     header = artifact.parse_header(data)
+    if header is None:
+        raise GatherError(f"{label}: not a coding-stats artifact (no valid header)")
+    err = artifact.verify_bytes(data)
+    if err is not None:
+        raise GatherError(f"{label}: refusing artifact ({err})")
     if header is None:
         raise GatherError(f"{source}: not a coding-stats artifact (no valid header)")
     err = artifact.verify_bytes(data)
@@ -247,6 +263,30 @@ def _refuse_slug_collisions(ingests: list[_Ingest], existing: dict[str, str]) ->
             )
 
 
+def _refuse_drifted_feature_ids(conn: sqlite3.Connection) -> None:
+    """A feature id whose DEFINING commit sha differs between artifacts of
+    one repo (ids drifted after a manual full recompute) is a gather error
+    naming both offending Repository keys — never a silent merge."""
+    rows = conn.execute(
+        """SELECT cf.feature_id fid, c.sha sha, rp.repo_key k FROM commits_features cf
+           JOIN commits c ON c.id = cf.commit_id
+           JOIN repositories rp ON rp.id = c.repo_id
+           WHERE cf.role = 'defines'"""
+    ).fetchall()
+    by_fid: dict[str, dict[str, set[str]]] = {}
+    for r in rows:
+        fid, sha, k = str(r["fid"]), str(r["sha"]), str(r["k"])
+        by_fid.setdefault(fid, {}).setdefault(sha, set()).add(k)
+    for fid, by_sha in sorted(by_fid.items()):
+        if len(by_sha) > 1:
+            keys = sorted({k for ks in by_sha.values() for k in ks})
+            raise GatherError(
+                f"feature id {fid!r} drifted: its defining commit sha differs"
+                f" across repository keys {keys}; ids minted before a full"
+                " recompute must be re-prefixed, not silently merged"
+            )
+
+
 def _upsert(conn: sqlite3.Connection, item: _Ingest) -> None:
     """Replace (or add) one repository's rows in the union, remapping
     artifact-local commit ids into union-space ints (deterministic: assigned
@@ -353,8 +393,11 @@ def _upsert(conn: sqlite3.Connection, item: _Ingest) -> None:
             ),
         )
     for r in src.execute("SELECT * FROM feature_line_samples ORDER BY feature_id, at_commit_sha"):
+        # a duplicated (seeded) feature id's sample rows exist per key too;
+        # the union keeps one per (id, sample commit): the first requester
+        # in deterministic ingest order (sorted by Repository key) wins
         conn.execute(
-            "INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines)"
+            "INSERT OR IGNORE INTO feature_line_samples (feature_id, at_commit_sha, live_lines)"
             " VALUES (?, ?, ?)",
             (r["feature_id"], r["at_commit_sha"], r["live_lines"]),
         )

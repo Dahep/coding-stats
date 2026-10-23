@@ -144,14 +144,15 @@ _TABLES: tuple[_Table, ...] = (
     _Table(
         "features",
         """CREATE TABLE features (
-               id TEXT PRIMARY KEY,
+               id TEXT NOT NULL,
                title TEXT NOT NULL,
                about TEXT NOT NULL DEFAULT '',
                title_history_json TEXT NOT NULL DEFAULT '[]',
                created_at TEXT NOT NULL,
                created_run_id INTEGER,
                repo_id INTEGER NOT NULL,
-               live_lines INTEGER NOT NULL DEFAULT 0
+               live_lines INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY (repo_id, id)
            );""",
         (
             "id",
@@ -165,7 +166,7 @@ _TABLES: tuple[_Table, ...] = (
         ),
         """SELECT id, title, about, title_history_json, created_at, created_run_id,
                   repo_id, live_lines
-           FROM features ORDER BY id""",
+           FROM features ORDER BY repo_id, id""",
         {"created_run_id": None},
     ),
     _Table(

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import NamedTuple
 
+from .orgview import org
+
 
 @dataclass
 class FeatureTimePoint:
@@ -42,7 +44,9 @@ def _month_fill(first: str, last: str) -> list[str]:
 
 def features_timeline(conn: sqlite3.Connection) -> list[FeatureTimePoint]:
     """Monthly buckets from first to last walk commit: new/cumulative features,
-    commits, and fix commits per bucket."""
+    commits, and fix commits per bucket. Org-level: a Shared commit (a sha
+    held by several keys of one repo) counts once (the earliest verdict)."""
+    conn = org(conn)
     features_by_month = {
         r["m"]: r["n"]
         for r in conn.execute(
@@ -159,6 +163,7 @@ def churn_per_feature(conn: sqlite3.Connection) -> list[tuple[str, str, int]]:
     """(feature id, title, churn lines) per feature over its linked commits.
     Churn is read from the walk-stored churn_lines columns (derived at walk
     time by gitwalk.prepare_diff — the single source of the counting rules)."""
+    conn = org(conn)
     rows = conn.execute(
         """SELECT f.id, f.title, COALESCE(SUM(c.churn_lines), 0) n FROM features f
            JOIN commits_features cf ON cf.feature_id = f.id
@@ -185,7 +190,9 @@ class FeatureRank(NamedTuple):
 
 def feature_ranking(conn: sqlite3.Connection) -> list[FeatureRank]:
     """All features ranked by attributed fixes (lineage closure, ties broken
-    by feature id), with churn and the earliest defining-commit sha."""
+    by feature id), with churn and the earliest defining-commit sha. Org
+    level: one feature row per duplicated (seeded) feature id."""
+    conn = org(conn)
     churn = {fid: n for fid, _t, n in churn_per_feature(conn)}
     sha = {
         r["fid"]: r["sha"]
@@ -223,7 +230,9 @@ def repo_count(conn: sqlite3.Connection) -> int:
 
 
 def feature_repos(conn: sqlite3.Connection) -> dict[str, str]:
-    """feature id -> repository slug (the REPO column for multi-repo views)."""
+    """feature id -> repository slug (the REPO column for multi-repo views;
+    org level reads the projection — one row per duplicated id)."""
+    conn = org(conn)
     return {
         str(r["fid"]): str(r["slug"])
         for r in conn.execute(
@@ -268,6 +277,7 @@ def _state_done(raw: str) -> bool:
 
 
 def snapshot(conn: sqlite3.Connection, top: int = 15) -> MetricSnapshot:
+    conn = org(conn)
     total_commits = conn.execute("SELECT COUNT(*) c FROM commits").fetchone()["c"]
     verdict_counts = {
         r["verdict"]: r["n"]
