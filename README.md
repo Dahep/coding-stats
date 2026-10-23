@@ -70,7 +70,9 @@ See `DESIGN.md` (decisions) and `CONTEXT.md` (domain language).
 
 ## Live report (dogfooding)
 
-This repository runs both actions on itself (`uses: ./` and `./report`): every
+This repository adopts coding-stats like any other repo — the same caller
+workflow `ci init` writes (`Dahep/coding-stats@v1` + the report action), with
+this repo's one per-repo opt-in (`deploy-pages: "true"`) flipped on: every
 push to `main` walks, classifies, and lands the artifact on the Data branch
 `coding-stats/main` — `main`'s own history stays human-only — and the report
 gathers every Data branch and publishes to
@@ -143,8 +145,9 @@ fires: pushes made with `GITHUB_TOKEN` do not start workflows.
 
 Immutable `v1.x.y` tags plus a moving `v1` major tag, cut from `main` via
 PR-merged release commits — tags are never pushed to `main` as branch
-updates. This repo's own workflows use `uses: ./` and `./report`, so every
-release is proven by a real dogfood run.
+updates. This repo runs the released actions (`@v1`) like any other repo, so
+every release is proven by this repo's next real run; changes not yet in a
+tag are proven by the test suite until the next release carries them.
 
 To run the update in CI, adopt the composite action `Dahep/coding-stats@v1`
 (see `action.yml`): one `uses:` step after `actions/checkout` with
