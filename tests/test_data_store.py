@@ -293,3 +293,23 @@ def test_update_reprefixes_old_format_artifact_in_place(
     ids = [r[0] for r in mat.execute("SELECT id FROM features ORDER BY id")]
     assert ids == ["repo@main-1"]
     mat.close()
+
+
+def test_two_target_branches_stay_separate(repo, tmp_path):
+    """Two Target branches keep separate data branches; landing one side
+    moves nothing else."""
+    commit_files(repo, "base", {"a.txt": "a\n"})
+    bare = _bare(tmp_path)
+    _with_remote(repo, bare)
+    store_a = datastore.prepare(repo, "main")
+    store_b = datastore.prepare(repo, "rel-1")
+    assert store_a.data_branch == "coding-stats/main"
+    assert store_b.data_branch == "coding-stats/rel-1"
+    assert store_a.worktree != store_b.worktree
+    (store_a.worktree / ".coding-stats").mkdir(exist_ok=True)
+    (store_a.worktree / ".coding-stats" / "main.sql").write_text("a\n")
+    assert ci.land(store_a, repo, "origin").status == "landed"
+    assert _git(bare, "rev-parse", "refs/heads/coding-stats/main")  # landed by sha
+    with pytest.raises(subprocess.CalledProcessError):
+        _git(bare, "rev-parse", "refs/heads/coding-stats/rel-1")  # sibling untouched
+    assert _git(bare, "rev-parse", "refs/heads/main")  # Target branch untouched
