@@ -141,4 +141,4 @@ def test_html_report(tmp_path, classified, repo):
     assert "<svg" in text and "coding-stats report" in text
     assert "alpha" in text  # fixture feature named in ranking table
     ranking = feature_ranking(classified)[:5]
-    assert ranking and ranking[0].fid == "repo-1" and ranking[0].fixes == 2
+    assert ranking and ranking[0].fid == "repo@main-1" and ranking[0].fixes == 2

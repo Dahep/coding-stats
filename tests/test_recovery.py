@@ -4,13 +4,14 @@ and the stateless-DB store seed behind it."""
 
 import hashlib
 import sqlite3
+import subprocess
 
 import pytest
 
-from coding_stats import artifact
+from coding_stats import artifact, ci, datastore
 from coding_stats.cli import main
 from coding_stats.gitwalk import walk
-from conftest import commit_files, make_db, run
+from conftest import commit_files, make_db, run, store_dir
 
 
 def _good_artifact(extra: bytes = b"") -> bytes:
@@ -43,13 +44,24 @@ def _init(tmp_path, repo) -> str:
 
 
 def _land_artifact(repo) -> str:
-    """Commit the current .coding-stats/ store the way ci land does."""
-    run(repo, "add", "-A", "--", ".coding-stats")
-    run(repo, "commit", "-m", "coding-stats artifact update (auto)")
+    """The run's resulting Data-branch tip: land (commit) via the CLI in the
+    repo (like the CI step does) and return the orphan Data branch's tip."""
+    import os
+
+    os.chdir(repo)
+    main(["ci", "land", "--branch", "main"])
+    return _data_tip(repo)
+
+
+def _data_tip(repo, branch: str = "coding-stats/main") -> str:
+    """The local Data branch's tip (landed or not yet)."""
     import subprocess
 
     return subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+        ["git", "-C", str(repo), "rev-parse", f"refs/heads/{branch}"],
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
 
@@ -86,7 +98,7 @@ def test_partial_recompute_anchors_prior_committed_version(tmp_path, repo, capsy
     )
     main(["update", "--db", db_path])
     capsys.readouterr()
-    art = repo / ".coding-stats" / "coding-stats.sql"
+    art = store_dir(repo) / "coding-stats.sql"
     art.write_text(
         art.read_text(encoding="utf-8")
         + "\nINSERT INTO features (id, title, about, created_at, repo_id, live_lines)"
@@ -132,7 +144,7 @@ def test_full_recompute_when_no_committed_version_verifies(tmp_path, repo, capsy
     main(["update", "--db", db_path])
     capsys.readouterr()
     # history-rewrite case: the ONLY committed version is tampered
-    art = repo / ".coding-stats" / "coding-stats.sql"
+    art = store_dir(repo) / "coding-stats.sql"
     art.write_text(
         art.read_text(encoding="utf-8")
         + "\nINSERT INTO features (id, title, about, created_at, repo_id, live_lines)"
@@ -184,7 +196,7 @@ def test_reclassify_only_commits_newer_than_coverage_horizon(tmp_path, repo, cap
 
     # tampered CURRENT FILE (uncommitted hand-edit) resolves through the same
     # MISMATCH path: the newest self-verifying committed version anchors
-    art = repo / ".coding-stats" / "coding-stats.sql"
+    art = store_dir(repo) / "coding-stats.sql"
     art.write_bytes(art.read_bytes() + b"\n-- hand tamper\n")
     log = []
     monkeypatch.setattr(
@@ -210,7 +222,8 @@ def test_mismatch_without_history_falls_back_to_fresh_walk(tmp_path, repo, capsy
     commit_files(repo, "feature one", {"a.txt": "a1\n"})
     commit_files(repo, "feature two", {"b.txt": "b1\n"})
     db_path = _init(tmp_path, repo)  # no update yet: nothing committed, nothing trusted
-    art = repo / ".coding-stats" / "coding-stats.sql"
+    datastore.prepare(repo, "main")  # mount the store worktree first
+    art = store_dir(repo) / "coding-stats.sql"
     art.parent.mkdir(parents=True, exist_ok=True)
     art.write_text("garbage without a digest line\n", encoding="utf-8")
     monkeypatch.setattr(
@@ -337,42 +350,54 @@ def test_rebuild_swap_failure_keeps_original_db(tmp_path, repo, monkeypatch):
     again.close()
 
 
-def test_find_anchor_scoped_to_target_branch(tmp_path, repo):
-    from coding_stats import recovery
+def test_find_anchor_scopes_to_one_target_data_branch(tmp_path, repo):
+    from coding_stats import datastore, recovery
 
     commit_files(repo, "base", {"a.txt": "a1\n"})
-    # artifact history that exists ONLY on a side branch
-    from conftest import run as _run
+    # artifact history exists only on side's Data branch (its own orphan)
+    side = datastore.prepare(repo, "side")
+    store = side.worktree / ".coding-stats" / "coding-stats.sql"
+    store.parent.mkdir(exist_ok=True)
+    store.write_bytes(_good_artifact())
+    run(side.worktree, "add", "-A", "--", ".coding-stats")
+    run(side.worktree, "commit", "-m", "coding-stats artifact update (auto)")
+    side_tip = _data_tip(repo, "coding-stats/side")
 
-    _run(repo, "checkout", "-q", "-b", "side")
-    _store = repo / ".coding-stats"
-    _store.mkdir()
-    (_store / "coding-stats.sql").write_bytes(_good_artifact())
-    _land_artifact(repo)
-    side_commit = _git_head(repo)
-    _run(repo, "checkout", "-q", "main")
-
-    assert recovery.find_anchor(repo, "main") is None  # no cross-branch restore
-    found = recovery.find_anchor(repo, "side")
-    assert found is not None and found[0] == side_commit
+    assert datastore.anchor_ref(repo, "coding-stats/main") is None  # no main data branch
+    assert recovery.find_anchor(repo, None) is None
+    ref = datastore.anchor_ref(repo, "coding-stats/side")
+    found = recovery.find_anchor(repo, ref)
+    assert found is not None and found[0] == side_tip  # scoped: side's own history
 
 
-def test_find_anchor_prefers_target_branch_version(tmp_path, repo):
-    from coding_stats import recovery
-    from conftest import run as _run
+def test_anchor_ref_resolves_local_then_fetched_remote(repo, tmp_path):
+    from coding_stats import datastore
 
-    commit_files(repo, "base", {"a.txt": "a1\n"})
-    (repo / ".coding-stats").mkdir()
-    (repo / ".coding-stats" / "coding-stats.sql").write_bytes(_good_artifact())
-    main_commit = _land_artifact(repo)
-    _run(repo, "checkout", "-q", "-b", "side")
-    commit_files(repo, "side work", {"s.txt": "s\n"})
-    (repo / ".coding-stats" / "coding-stats.sql").write_bytes(_good_artifact(b"# side\n"))
-    _land_artifact(repo)
-    _run(repo, "checkout", "-q", "main")
+    commit_files(repo, "base", {"a.txt": "a\n"})
+    assert datastore.anchor_ref(repo, "coding-stats/main") is None  # no Data branch
 
-    found = recovery.find_anchor(repo, "main")
-    assert found is not None and found[0] == main_commit  # the target's own version
+    # land once locally: the branch is born and anchors locally
+    store = datastore.prepare(repo, "main")
+    art = store.worktree / ".coding-stats" / "coding-stats.sql"
+    art.parent.mkdir(exist_ok=True)
+    art.write_bytes(_good_artifact())
+    assert ci.land(store, repo).status == "landed"
+    assert datastore.anchor_ref(repo, "coding-stats/main") == "refs/heads/coding-stats/main"
+
+    # publish to a bare remote, then drop the local branch+worktree: the
+    # fetched remote ref still gives an anchor (recovery survives a checkout
+    # where only the remote's Data branch was fetched)
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+    run(repo, "remote", "add", "origin", bare)
+    run(repo, "push", "-q", "origin", "refs/heads/coding-stats/main:refs/heads/coding-stats/main")
+    run(repo, "worktree", "remove", "--force", str(store.worktree))
+    run(repo, "update-ref", "-d", "refs/heads/coding-stats/main")
+    refspec = "refs/heads/coding-stats/main:refs/remotes/origin/coding-stats/main"
+    run(repo, "fetch", "origin", refspec)
+    assert datastore.anchor_ref(repo, "coding-stats/main") == (
+        "refs/remotes/origin/coding-stats/main"
+    )
 
 
 def test_no_cross_branch_restore_on_mismatch(tmp_path, repo, capsys, monkeypatch):
@@ -391,13 +416,17 @@ def test_no_cross_branch_restore_on_mismatch(tmp_path, repo, capsys, monkeypatch
     )
     main(["update", "--db", db_path])
     capsys.readouterr()
-    # a self-verifying artifact version lives only on a side branch
-    from conftest import run as _run
-
-    _run(repo, "checkout", "-q", "-b", "side")
-    _land_artifact(repo)
-    _run(repo, "checkout", "-q", "main")
-    art = repo / ".coding-stats" / "coding-stats.sql"
+    # a self-verifying artifact version lives only on side's Data branch
+    side = datastore.prepare(repo, "side")
+    (side.worktree / ".coding-stats").mkdir(exist_ok=True)
+    (side.worktree / ".coding-stats" / "coding-stats.sql").write_bytes(_good_artifact())
+    run(side.worktree, "add", "-A", "--", ".coding-stats")
+    run(side.worktree, "commit", "-m", "coding-stats artifact update (auto)")
+    # tamper main's CURRENT store (uncommitted hand-edit); main's own Data
+    # branch was never landed, so its anchor ref does not exist — and the
+    # side Data branch's version is never restored
+    main_store = datastore.prepare(repo, "main")
+    art = main_store.worktree / ".coding-stats" / "coding-stats.sql"
     art.parent.mkdir(parents=True, exist_ok=True)
     art.write_bytes(
         _good_artifact()

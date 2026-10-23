@@ -7,8 +7,8 @@ from new-format ones in exactly the header tag.
 """
 
 import hashlib
-import shutil
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -61,7 +61,7 @@ def _legacy_repo(tmp_path, repo, monkeypatch=None, old_origin=True):
             "coding_stats.cli.Session", lambda model, sid=None: FakeSession(replies)
         )
         extra = []
-    main(["update", "--db", str(legacy_db), "--no-serialize", "--no-report", *extra])
+    main(["update", "--db", str(legacy_db), "--no-serialize", *extra])
     conn = sqlite3.connect(legacy_db)
     conn.row_factory = sqlite3.Row
     store = repo / ".skill-stats"
@@ -97,6 +97,23 @@ def _counts(db_path):
     return commits, verdicts
 
 
+def _snapshot_db(source: Path, dest: Path) -> None:
+    """A consistent copy of a (possibly WAL-mode) SQLite DB: the backup API
+    materializes main-file + WAL content into `dest` — a raw file copy of a
+    live WAL DB would trail whatever is not checkpointed yet."""
+    import sqlite3 as _sq
+
+    src = _sq.connect(source)
+    try:
+        dst = _sq.connect(dest)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+
 def test_migrate_renamed_repo_reuses_db_and_relabels(tmp_path, repo, monkeypatch, capsys):
     # Pin canonical identity resolution BEFORE the fixture init: on machines
     # where the origin URL rewrites to an ssh alias, identity falls back to
@@ -125,7 +142,7 @@ def test_migrate_renamed_repo_reuses_db_and_relabels(tmp_path, repo, monkeypatch
     assert _db_key(dest) == "https://github.com/Dahep/coding-stats@main"
     assert _counts(dest) == (2, 2)  # verdicts survived the migration
     assert artifact.verify(repo / ".coding-stats" / "coding-stats.sql") is None
-    assert (repo / ".coding-stats" / "report.html").exists()
+    # the store holds only the SQL artifact (ADR-0006 clause 5)
     assert not (repo / ".skill-stats").exists()
     assert not (repo / ".github" / "workflows" / "skill-stats.yml").exists()
 
@@ -247,7 +264,7 @@ def test_migrate_ci_writes_new_workflow(tmp_path, repo, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert ".github/workflows/coding-stats.yml: written" in out
     text = (repo / ".github" / "workflows" / "coding-stats.yml").read_text("utf-8")
-    assert "CODING_STATS_BRANCH: 'main'" in text
+    assert "Dahep/coding-stats@v1" in text  # the caller workflow adopts the actions
     assert not (repo / ".github" / "workflows" / "skill-stats.yml").exists()
 
 
@@ -293,7 +310,7 @@ def test_migrate_db_behind_artifact_seeds_from_artifact(tmp_path, repo, monkeypa
     )
     _legacy_repo(tmp_path, repo, monkeypatch)
     stale = tmp_path / "stale.db"
-    shutil.copy(tmp_path / "legacy.db", stale)
+    _snapshot_db(tmp_path / "legacy.db", stale)  # consistent WAL-safe copy
     commit_files(repo, "feature c", {"h.txt": "c1\n"})
     commit_files(repo, "feature d", {"i.txt": "d1\n"})
     replies = [
@@ -301,7 +318,7 @@ def test_migrate_db_behind_artifact_seeds_from_artifact(tmp_path, repo, monkeypa
         '{"k":"new","title":"feature d","about":"x","why":"y"}',
     ]
     monkeypatch.setattr("coding_stats.cli.Session", lambda model, sid=None: FakeSession(replies))
-    main(["update", "--db", str(tmp_path / "legacy.db"), "--no-serialize", "--no-report"])
+    main(["update", "--db", str(tmp_path / "legacy.db"), "--no-serialize"])
     monkeypatch.setattr("coding_stats.cli.Session", lambda model, sid=None: FakeSession([]))
     store = repo / ".skill-stats"
     conn = sqlite3.connect(tmp_path / "legacy.db")
@@ -392,7 +409,7 @@ def test_migrate_default_destination_mirror_respects_home(tmp_path, repo, monkey
     )
     legacy_db.parent.mkdir()
     main(["init", str(repo), "--db", str(legacy_db), "--branch", "main"])
-    main(["update", "--db", str(legacy_db), "--no-serialize", "--no-report"])
+    main(["update", "--db", str(legacy_db), "--no-serialize"])
     conn = sqlite3.connect(legacy_db)
     conn.row_factory = sqlite3.Row
     store = repo / ".skill-stats"

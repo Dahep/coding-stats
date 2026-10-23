@@ -112,7 +112,7 @@ def test_register_repository_prefers_origin_url(repo, tmp_path):
     rid = register_repository(conn, repo, "main")
     row = conn.execute("SELECT * FROM repositories WHERE id = ?", (rid,)).fetchone()
     assert row["repo_key"] == "https://github.com/dahep/dotfiles@main"
-    assert row["slug"] == "dahep-dotfiles"
+    assert row["slug"] == "dahep-dotfiles@main"
     assert row["clone_url"] == "https://github.com/dahep/dotfiles"
     assert (
         json.loads(
@@ -133,7 +133,7 @@ def test_register_repository_shim_without_origin(repo, tmp_path):
     rid = register_repository(conn, repo, "main")
     row = conn.execute("SELECT * FROM repositories WHERE id = ?", (rid,)).fetchone()
     assert row["repo_key"] == "local:repo@main"
-    assert row["slug"] == "repo"
+    assert row["slug"] == "repo@main"
     assert row["clone_url"] is None
 
 
@@ -203,7 +203,7 @@ def test_reregister_replaces_when_no_data(repo, tmp_path):
     assert rid2 == rid
     row = conn.execute("SELECT repo_key, slug FROM repositories").fetchone()
     assert row["repo_key"] == "https://github.com/dahep/other@main"
-    assert row["slug"] == "dahep-other"
+    assert row["slug"] == "dahep-other@main"
 
 
 def test_reregister_refuses_relabel_with_data(repo, tmp_path):

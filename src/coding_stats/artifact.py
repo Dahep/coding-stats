@@ -37,8 +37,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import htmlreport
-
 FORMAT = 1
 
 DIGEST_BLANK = "-- digest:"
@@ -144,14 +142,15 @@ _TABLES: tuple[_Table, ...] = (
     _Table(
         "features",
         """CREATE TABLE features (
-               id TEXT PRIMARY KEY,
+               id TEXT NOT NULL,
                title TEXT NOT NULL,
                about TEXT NOT NULL DEFAULT '',
                title_history_json TEXT NOT NULL DEFAULT '[]',
                created_at TEXT NOT NULL,
                created_run_id INTEGER,
                repo_id INTEGER NOT NULL,
-               live_lines INTEGER NOT NULL DEFAULT 0
+               live_lines INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY (repo_id, id)
            );""",
         (
             "id",
@@ -165,7 +164,7 @@ _TABLES: tuple[_Table, ...] = (
         ),
         """SELECT id, title, about, title_history_json, created_at, created_run_id,
                   repo_id, live_lines
-           FROM features ORDER BY id""",
+           FROM features ORDER BY repo_id, id""",
         {"created_run_id": None},
     ),
     _Table(
@@ -300,14 +299,13 @@ def serialize(conn: sqlite3.Connection) -> bytes:
     return content.encode("utf-8")
 
 
-def write(conn: sqlite3.Connection, repo_dir: Path, with_report: bool = True) -> Path:
-    """Land the artifact: ``.coding-stats/coding-stats.sql`` plus, by default, the
-    regenerated ``report.html`` (both read the WORKING db — settings.repo is a
-    machine path and absent from the artifact)."""
-    store = Path(repo_dir) / ".coding-stats"
+def write(conn: sqlite3.Connection, store_root: Path) -> Path:
+    """Land the artifact: ``<store_root>/.coding-stats/coding-stats.sql``
+    (reads the WORKING db — settings.repo is a machine path and absent from
+    the artifact). The store holds ONLY the SQL artifact (ADR-0006 clause
+    5): reports render through the report verb/action, never here."""
+    store = Path(store_root) / ".coding-stats"
     store.mkdir(parents=True, exist_ok=True)
-    if with_report:
-        htmlreport.write_report(conn, store / "report.html")
     path = store / "coding-stats.sql"
     path.write_bytes(serialize(conn))
     return path

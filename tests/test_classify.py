@@ -63,7 +63,7 @@ def test_apply_new_feature(walked):
     feat = walked.execute("SELECT * FROM features").fetchone()
     assert feat["title"] == "alpha module"
     # repo-prefixed feature id: {slug}-{local number} (ADR-0003 clause 5)
-    assert feat["id"] == "repo-1"
+    assert feat["id"] == "repo@main-1"
     link = walked.execute(
         "SELECT role FROM commits_features WHERE feature_id = ?", (feat["id"],)
     ).fetchone()
@@ -75,7 +75,7 @@ def test_apply_new_feature(walked):
 def test_apply_existing_feature(walked, shas, repo):
     ids = _ids_by_sha(walked)
     fid = add_feature(walked, "alpha")
-    assert fid == "repo-1"
+    assert fid == "repo@main-1"
     reply = Reply("existing", {"k": "existing", "f": fid, "why": "continues scope"})
     verdict = apply_reply(walked, ids[shas["c2"]], "2026", reply, "{}", "m")
     assert verdict == "feature"
@@ -109,7 +109,7 @@ def test_feature_ids_are_prefixed_and_increment(walked, shas):
         "m",
     )
     fids = [r[0] for r in walked.execute("SELECT id FROM features ORDER BY rowid")]
-    assert fids == ["repo-1", "repo-2"]
+    assert fids == ["repo@main-1", "repo@main-2"]
 
 
 def test_prefixed_citation_through_prompt_and_parse(walked, shas):
@@ -123,14 +123,14 @@ def test_prefixed_citation_through_prompt_and_parse(walked, shas):
         "m",
     )
     reg = feature_registry(walked)
-    assert "repo-1:" in reg and "alpha module" in reg
+    assert "repo@main-1:" in reg and "alpha module" in reg
     prompt = commit_prompt(walked, 2)
-    assert "FEATURES" in prompt and "repo-1" in prompt
-    reply = parse_reply('{"k":"existing","f":"repo-1","why":"continues scope"}')
-    assert reply.kind == "existing" and reply.payload["f"] == "repo-1"
+    assert "FEATURES" in prompt and "repo@main-1" in prompt
+    reply = parse_reply('{"k":"existing","f":"repo@main-1","why":"continues scope"}')
+    assert reply.kind == "existing" and reply.payload["f"] == "repo@main-1"
     apply_reply(walked, ids[shas["c2"]], "2026", reply, "{}", "m")
     row = walked.execute(
-        "SELECT role FROM commits_features WHERE feature_id = 'repo-1' AND commit_id = ?",
+        "SELECT role FROM commits_features WHERE feature_id = 'repo@main-1' AND commit_id = ?",
         (ids[shas["c2"]],),
     ).fetchone()
     assert row["role"] == "touches"

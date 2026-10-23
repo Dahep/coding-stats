@@ -35,51 +35,132 @@ See `DESIGN.md` (decisions) and `CONTEXT.md` (domain language).
    the checkout's git repo and seeds itself from the artifact. Classification
    is best-effort: a backlog stays visible in the final line and reprocesses
    on a later run.
-7. `migrate` — one-time migration from the legacy `skill-stats` layout
+7. `migrate` — two one-time moves. From the legacy `skill-stats` layout
    (ADR-0005): verifies the legacy artifact, reuses the machine-local DB
    when it corresponds (verdicts survive), relabels the repository key when
    the GitHub rename changed it, regenerates the store under
    `.coding-stats/`, removes the legacy `skill-stats.yml` workflow (`--ci`
    writes the new scaffold), and only then deletes `.skill-stats/`.
-   Idempotent; `--dry-run` prints the plan first.
-8. `ci` — `coding-stats ci init` writes `.github/workflows/coding-stats.yml`
-   (plus `.coding-stats/.gitignore` for the throwaway DB) idempotently,
-   refusing drifted files unless `--upgrade`; `ci init --pages` adds a
-   deploy-pages job that publishes the run's report.html as the site root
-   (opt-in: Pages only works on public or paid repos); `coding-stats ci land`
-   (called by the workflow, usable locally) lands the artifact-update
-   commit: no-op updates push nothing, superseded runs abandon neutrally,
-   everything else commits as `coding-stats[bot]` and pushes with
-   `GITHUB_TOKEN`.
+   Idempotent; `--dry-run` prints the plan first. From the ADR-0003
+   in-branch layout onto the Data branch (ADR-0006): `migrate . --data-branch`
+   verifies the committed `.coding-stats/` store, re-prefixes its feature
+   ids to `{repo}@{branch}`, and lands it as the first commit of the orphan
+   Data branch — the Target branch is never pushed to; the printed steps
+   remove the old store via a normal PR.
+8. `ci` — `coding-stats ci init` writes the short caller workflow that
+   adopts `Dahep/coding-stats@v1` (and a report job using
+   `Dahep/coding-stats/report@v1`; `--no-report` drops it), idempotently and
+   drift-refusing like everything else; upgrades happen by moving the
+   action ref, never by re-rendering. `coding-stats ci land` is the landing
+   verb the update action calls (usable locally): no-op updates push
+   nothing, superseded runs abandon neutrally, everything else commits as
+   `coding-stats[bot]` and pushes with `GITHUB_TOKEN` — to the Data branch
+   `coding-stats/<target>` only.
 9. `gather` — `coding-stats gather --db union.db <repo|artifact>...` ingests
    N artifacts into a union DB keyed by Repository key. Ingest verifies each
    artifact first, is idempotent per key (identical artifact = no-op, a newer
-   one last-wins), and refuses when distinct keys share a URL-derived slug
-   (one repo on two Target branches — never renames ids). The union is
-   structurally single-repo: `report --db union.db` reads it unchanged, with
-   REPO columns appearing only when it covers more than one repository.
+   one last-wins), reads a checkout's mounted Data-branch stores (or its
+   fetched `coding-stats/*` refs) so one source covers all tracked branches,
+   and refuses when distinct keys share a `{repo}@{branch}` slug. A sha
+   present under several keys of one repo is one Shared commit in org
+   totals (earliest classification wins, ties by Repository key); per-branch
+   views stay per-branch. The union is structurally single-repo:
+   `report --db union.db` reads it unchanged, with REPO columns appearing
+   only when it covers more than one repository.
 
 ## Live report (dogfooding)
 
-The tool analyzes this repository on every push to `main`; the report publishes
-to <https://dahep.github.io/coding-stats/> and the analysis artifact
-(`.coding-stats/`) commits back to `main` as `coding-stats[bot]`.
+This repository runs both actions on itself (`uses: ./` and `./report`): every
+push to `main` walks, classifies, and lands the artifact on the Data branch
+`coding-stats/main` — `main`'s own history stays human-only — and the report
+gathers every Data branch and publishes to
+<https://dahep.github.io/coding-stats/>.
 
 ## Usage
 
 ```sh
 uv sync
 uv run coding-stats init ~/dotfiles --db ~/.coding-stats/coding-stats.db
-uv run coding-stats walk    --db ~/.coding-stats/coding-stats.db
-uv run coding-stats classify --db ~/.coding-stats/coding-stats.db [--limit N] [--fresh]
-uv run coding-stats detect  --db ~/.coding-stats/coding-stats.db
-uv run coding-stats lineage --db ~/.coding-stats/coding-stats.db
-uv run coding-stats report  --db ~/.coding-stats/coding-stats.db --json --charts
-uv run coding-stats update  --db ~/.coding-stats/coding-stats.db   # verify->walk->...->serialize
-uv run coding-stats ci init [--branch main] [--no-push] [--upgrade]   # in the target repo
-uv run coding-stats ci land --branch main                             # landing verb
+uv run coding-stats update  --db ~/.coding-stats/coding-stats.db   # verify->walk->seed->classify->...->serialize
+uv run coding-stats report  --db ~/.coding-stats/coding-stats.db --json --charts [--html out.html]
+uv run coding-stats ci init [--branch main] [--no-report] [--upgrade]  # in the target repo
+uv run coding-stats ci land --branch main                              # landing verb
+uv run coding-stats migrate . --data-branch     # ADR-0003 store -> the Data branch
 uv run coding-stats gather --db union.db ~/dotfiles ~/.config-repo     # union of artifacts
 ```
+
+The plumbing verbs (`walk`, `classify`, `detect`, `lineage`) remain available
+as stage subcommands of `update` for development and debugging.
+
+## Adopting in CI
+
+One `uses:` step after checkout adopts the update:
+
+```yaml
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: coding-${{ github.workflow }}-${{ github.ref_name }}
+      cancel-in-progress: false   # never kill a classifying run
+    permissions:
+      contents: write             # the Data-branch landing is the only write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # walk, blame and partial recompute need full history
+      - uses: Dahep/coding-stats@v1
+        with:
+          opencode-api-key: ${{ secrets.OPENCODE_API_KEY }}
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+```
+
+- **Tracked branches** are the workflow's own `on.push.branches` filter —
+  list `main` and `release/2.x` there to track both; each gets its own Data
+  branch `coding-stats/<branch>` and its own numbers. The `target-branch`
+  input defaults to the pushed branch.
+- **The per-branch, non-cancelling concurrency group** keeps at most one
+  pending run per branch; a superseded run abandons at landing (a
+  `::notice::`, never a red run) and paid classification is never discarded.
+- **Work repos should pin the commit sha** (`uses: Dahep/coding-stats/<sha>`)
+  rather than the moving `v1` tag: the update job holds `contents: write`
+  and the LLM keys. Upgrades are then a one-line PR, Dependabot-manageable.
+- **Orgs restricting third-party actions**: allowlist `Dahep/coding-stats@*`.
+- **Rulesets covering every branch** must exclude `coding-stats/**` (or let
+  the Actions bot bypass) — a one-time admin step; the update pushes only
+  Data-branch refs but a blanket ruleset still sees them.
+
+Reports run on their own cadence (`workflow_run` after the update workflow,
+a schedule, or manual dispatch) through `Dahep/coding-stats/report@v1`:
+it gathers every `coding-stats/*` Data branch with Shared-commit dedup,
+renders one HTML report, uploads it as an Actions artifact (plus the union
+DB with `include-db: true`), and deploys to Pages only with `deploy-pages:
+true` — then the report job carries `pages: write` / `id-token: write`, and
+the update job never does. A `push` trigger on `coding-stats/**` never
+fires: pushes made with `GITHUB_TOKEN` do not start workflows.
+
+## Releases
+
+Immutable `v1.x.y` tags plus a moving `v1` major tag, cut from `main` via
+PR-merged release commits — tags are never pushed to `main` as branch
+updates. This repo's own workflows use `uses: ./` and `./report`, so every
+release is proven by a real dogfood run.
+
+To run the update in CI, adopt the composite action `Dahep/coding-stats@v1`
+(see `action.yml`): one `uses:` step after `actions/checkout` with
+`fetch-depth: 0`. It installs the engine exactly at the action ref you pin and
+lands every update on the Data branch `coding-stats/<branch>` — the analyzed
+branch itself never receives bot commits.
+
+For reports there is a second composite action, `Dahep/coding-stats/report@v1`
+(see `report/action.yml`): it gathers every `coding-stats/*` Data branch of
+the repo with Shared-commit dedup, renders one HTML report, uploads it as an
+Actions artifact (and optionally the union DB, `include-db: true`) and deploys
+to Pages only when `deploy-pages: true` (with `pages: write` / `id-token:
+write` permissions in the report job). Trigger it by `workflow_run` after the
+update workflow, a schedule, or manual dispatch — a `push` trigger on
+`coding-stats/**` never fires, because pushes made with `GITHUB_TOKEN` do not
+start workflows.
 
 `classify` shells out to the `opencode` CLI (`opencode run --format json`,
 model configurable at `init` with `--model`, default `opencode/glm-5.3-flash`)

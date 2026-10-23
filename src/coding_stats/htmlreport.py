@@ -488,6 +488,9 @@ def _kpi(label: str, value: str, sub: str = "") -> str:
 
 
 def build(conn: sqlite3.Connection, top: int = 15) -> str:
+    from .orgview import org  # late import: htmlreport→metrics→orgview cycle
+
+    conn = org(conn)  # every read below aggregates across keys: dedup first
     snap = snapshot(conn, top=top)
     rows = conn.execute("SELECT key, value FROM settings").fetchall()
     settings: dict[str, str] = {}
@@ -518,12 +521,18 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
         repo_name = repo.rstrip("/").split("/")[-1] or repo
         branch_tag = f" <span class='muted'>({_esc(branch)})</span>"
     else:
-        # union of one: brand by Repository key slug and its Target branch
+        # union of one: brand by Repository key slug and its Target branch.
+        # The slug is the {repo}@{branch} form (ADR-0006 clause 2) — the
+        # branch is already in it, so the tag never repeats it.
         slugs = [str(r["slug"]) for r in conn.execute("SELECT slug FROM repositories ORDER BY id")]
         repo_name = slugs[0] if slugs else ""
         row = conn.execute("SELECT branch FROM repositories ORDER BY id LIMIT 1").fetchone()
         branch = str(row["branch"] or "") if row else ""
-        branch_tag = f" <span class='muted'>({_esc(branch)})</span>" if branch else ""
+        branch_tag = (
+            f" <span class='muted'>({_esc(branch)})</span>"
+            if branch and f"@{branch}" not in repo_name
+            else ""
+        )
     repos = feature_repos(conn) if multi else {}
 
     tl = features_timeline(conn)

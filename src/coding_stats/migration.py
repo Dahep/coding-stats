@@ -126,8 +126,16 @@ def detect(
     if legacy_db is not None:
         db_key = _stored_db_key(legacy_db)
         if db_key is None:
-            raise MigrationError(f"legacy DB {legacy_db} has no repositories row")
-        if db_key != stored:
+            # no repositories row: an empty DB or a pre-step-1 legacy schema.
+            # The committed artifact is the authority either way — rebuild
+            # from it instead of aborting (a raw file copy of a live WAL DB
+            # can legitimately trail its rows).
+            notices.append(
+                f"ignoring {legacy_db}: no repositories row (empty or pre-step-1"
+                " legacy DB); rebuilding from the artifact"
+            )
+            legacy_db = None
+        elif db_key != stored:
             if explicit:
                 raise MigrationError(
                     f"legacy DB {legacy_db} is keyed {db_key!r} but the legacy artifact is"
@@ -171,7 +179,22 @@ def detect(
 
     if legacy_db is not None:
         relation = _horizon_relation(repo, legacy_db, header.covered_through)
-        if relation in ("equal", "db-ahead"):
+        if db_key is None:
+            # no repositories row: an empty DB or a pre-step-1 legacy schema.
+            # The key cannot be verified, so the DB is never REUSED — but the
+            # artifact stays authoritative and the horizon relation still
+            # tells the user where their DB stood.
+            notices.append(
+                f"ignoring {legacy_db} for reuse: no repositories row (empty or"
+                " pre-step-1 legacy DB)"
+            )
+            seed = "rebuild-artifact"
+            if relation == "artifact-ahead":
+                notices.append(
+                    f"the legacy artifact classifies ahead of {legacy_db}; seeding"
+                    " from the artifact so no verdicts are lost"
+                )
+        elif relation in ("equal", "db-ahead"):
             seed = "reuse-db"
         elif relation == "artifact-ahead":
             notices.append(
@@ -261,8 +284,7 @@ def _horizon_relation(repo: Path, legacy_db: Path, artifact_horizon: str) -> str
     horizon: 'equal' | 'db-ahead' | 'artifact-ahead' | 'diverged'. Both are
     target-branch commit shas; a git ancestry check decides which side holds
     the newer analysis."""
-    conn = sqlite3.connect(f"file:{legacy_db}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = _open_read_snapshot(legacy_db)
     try:
         db_horizon = artifact.covered_through(conn)
     finally:
@@ -312,11 +334,38 @@ def _default_dest() -> Path:
     return Path("coding-stats.db")
 
 
+def _open_read_snapshot(path: Path) -> sqlite3.Connection:
+    """A consistent in-memory read snapshot of a (legacy) SQLite DB.
+
+    A plain ``mode=ro`` open is NOT enough here: legacy DBs run in WAL
+    mode (persistent in the file header), and a read-only connection
+    cannot create the ``-shm``/``-wal`` sidecars when they are absent —
+    the open (or the first read) fails with an OperationalError that
+    looks like a missing table. A normal connection may create sidecars
+    (harmless: this file is machine-local state the migration owns), and
+    the backup API yields one consistent snapshot including WAL content."""
+    src = sqlite3.connect(path)
+    try:
+        snap = sqlite3.connect(":memory:")
+        try:
+            src.backup(snap)
+        except Exception:
+            snap.close()
+            raise
+    finally:
+        src.close()
+    snap.row_factory = sqlite3.Row
+    return snap
+
+
 def _stored_db_key(path: Path) -> str | None:
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = _open_read_snapshot(path)
     try:
         rows = conn.execute("SELECT repo_key FROM repositories").fetchall()
+    except sqlite3.OperationalError:
+        # a pre-step-1 legacy DB (the old tool's own schema) has no
+        # repositories table: no usable key — rebuild-from-artifact territory
+        return None
     finally:
         conn.close()
     if not rows:
@@ -383,6 +432,7 @@ def run(plan: Plan, repo: Path, no_classify: bool = False) -> list[str]:
                 no_report=False,
                 no_serialize=False,
             ),
+            legacy_store=True,
         )
     finally:
         conn.close()
@@ -428,7 +478,7 @@ def _atomic_copy(source: Path, db_path: Path) -> None:
     tmp_path = db_path.parent / (db_path.name + ".migrate-tmp")
     for suffix in ("", *_SIDECARS):
         Path(str(tmp_path) + suffix).unlink(missing_ok=True)
-    src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    src = _open_read_snapshot(source)
     try:
         dst = sqlite3.connect(tmp_path)
         try:
@@ -476,3 +526,70 @@ def init_ci(repo: Path, branch: str, upgrade: bool = False) -> list[str]:
     from . import ci  # late import keeps module-level deps flat
 
     return ci.init(repo, branch, upgrade=upgrade)
+
+
+def migrate_to_data_branch(
+    repo: Path, target: str | None = None, remote: str = "origin"
+) -> list[str]:
+    """ADR-0006 clause 6 (ticket #26): move a repo from the ADR-0003 layout
+    (a committed .coding-stats/ store on the Target branch) onto its orphan
+    Data branch. Verifies first (refusing damage), re-prefixes the ids, and
+    pushes ONLY refs/heads/coding-stats/<target>; the Target branch itself
+    never receives a commit. Idempotent: a Data branch already holding a
+    verifying, branch-carrying artifact reports 'already migrated'."""
+    from . import ci, datastore, gitwalk, identity  # late imports (module cycle)
+
+    branch = target or gitwalk.current_branch(repo)
+    legacy = repo / ".coding-stats" / "coding-stats.sql"
+    out: list[str] = []
+    # idempotent only against a VERIFYING artifact: a Data branch whose tip
+    # carries no (or a damaged) artifact does not count as migrated — the
+    # migration below overwrites it with the Target's verified store
+    data_tip = datastore.remote_data_refs(repo, remote).get(datastore.data_branch(branch))
+    if data_tip is not None:
+        data = datastore.read_artifact_at(repo, data_tip)
+        if data is not None and artifact.verify_bytes(data) is None:
+            return ["already migrated"]
+
+    if not legacy.exists():
+        return ["nothing to migrate (no committed .coding-stats/ on this Target)"]
+    err = artifact.verify(legacy)
+    if err is not None:
+        raise MigrationError(
+            f"the committed .coding-stats/ artifact does not verify ({err}); nothing migrated"
+        )
+    out.append("committed artifact: digest ok")
+    # re-prefix in memory: the ids upgrade to the {repo}@{branch} form
+    rows = sqlite3.connect(":memory:")
+    rows.row_factory = sqlite3.Row
+    try:
+        artifact.materialize(rows, legacy.read_bytes())
+        plain = identity.resolved_identity(repo)[1]
+        identity.reprefix_features(rows, identity.repo_slug(plain, branch))
+        data = artifact.serialize(rows)
+    finally:
+        rows.close()
+    out.append("ids re-prefixed to {repo}@{branch}")
+
+    store = datastore.prepare(repo, branch)
+    art = store.worktree / ".coding-stats" / "coding-stats.sql"
+    art.parent.mkdir(parents=True, exist_ok=True)
+    art.write_bytes(data)
+    landing = ci.land(store, repo, remote)
+    out.append(f"coding-stats landing: {landing.status} — {landing.detail}")
+    if landing.status != "landed":
+        out.append(
+            "NOT removed from the Target branch: the landing did not push"
+            " (keep .coding-stats/ until a run lands the Data branch, then"
+            " re-run migrate)"
+        )
+        return out
+    out.append(
+        "removal is a normal PR (migration never pushes to the Target branch): next steps\n"
+        "  git checkout <target>\n"
+        "  git rm -r .coding-stats\n"
+        "  rm .github/workflows/coding-stats.yml   # regenerate via ci init's slim call\n"
+        "  git commit -m 'drop the in-branch stats store (moved to the Data branch)'\n"
+        "  git push origin <target>"
+    )
+    return out

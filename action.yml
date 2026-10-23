@@ -1,0 +1,140 @@
+# coding-stats update — the composite action `Dahep/coding-stats@v1`
+# (ADR-0006 clause 5, ticket #24). Adopt with one step after checkout:
+#
+#     - uses: actions/checkout@v4
+#       with:
+#         fetch-depth: 0   # required: walk, blame and recovery need full history
+#     - uses: Dahep/coding-stats@v1
+#       with:
+#         opencode-api-key: ${{ secrets.OPENCODE_API_KEY }}  # or openrouter-api-key
+#
+# The engine runs from THIS checkout ($GITHUB_ACTION_PATH), so the tool
+# version is exactly the action ref the caller pinned; upgrades move the ref
+# (manually or via Dependabot), never a re-rendered workflow.
+#
+# Parameter hygiene (the ci.render_workflow rule): inputs reach the shell
+# only through env: — never `${{ }}` inside a run: line. Requires only
+# `contents: write` in the caller's workflow: the landing push authenticates
+# with the GITHUB_TOKEN actions/checkout persisted, and no step reads a
+# secret. No LLM key -> the deterministic stages run and the backlog is
+# recorded (Q13): a missing key never fails the run.
+
+name: "coding-stats update"
+description: >-
+  Walk, classify and land one Target branch's coding-stats Artifact on its
+  Data branch (coding-stats/<target-branch>), running the engine exactly at
+  the action ref you pinned. The Target branch itself is never written to.
+
+inputs:
+  target-branch:
+    description: >-
+      Target branch to analyze; its Artifact lands on the Data branch
+      coding-stats/<target-branch>. Defaults to the pushed branch.
+    required: false
+    default: "${{ github.ref_name }}"
+  opencode-api-key:
+    description: >-
+      LLM key for classification (opencode Go/Zen subscription). Optional:
+      without any key the run still does the deterministic stages and records
+      a visible backlog.
+    required: false
+    default: ""
+  openrouter-api-key:
+    description: >-
+      LLM key for classification via OpenRouter (work repos bill the work
+      key). Optional, same best-effort behaviour as opencode-api-key.
+    required: false
+    default: ""
+  no-classify:
+    description: "Debug pass-through to update --no-classify: skip LLM classification."
+    required: false
+    default: "false"
+  no-detect:
+    description: "Debug pass-through to update --no-detect: skip blame-based fix detection."
+    required: false
+    default: "false"
+  no-lineage:
+    description: "Debug pass-through to update --no-lineage: skip the lineage closure."
+    required: false
+    default: "false"
+    required: false
+    default: "false"
+
+outputs:
+  data-branch:
+    description: The Data branch the Artifact lands on (coding-stats/<target-branch>).
+    value: "${{ steps.land.outputs.data-branch }}"
+
+runs:
+  using: composite
+  steps:
+    - name: verify the checkout has full history
+      shell: bash
+      run: |
+        if [ "$(git rev-parse --is-shallow-repository)" != "false" ]; then
+          echo "::error::coding-stats needs the full git history (walk, blame, partial recompute) but this checkout is shallow. Set fetch-depth: 0 on your actions/checkout step:"
+          echo "::error::  - uses: actions/checkout@v4"
+          echo "::error::    with:"
+          echo "::error::      fetch-depth: 0"
+          exit 1
+        fi
+
+    - uses: astral-sh/setup-uv@v6
+
+    # Best-effort (Q13): a failed download degrades to a classification
+    # backlog, never a red run.
+    - name: install opencode CLI
+      continue-on-error: true
+      shell: bash
+      run: curl -fsSL https://opencode.ai/install | bash
+
+    # Target branch full history (belt: the fetch-depth: 0 checkout should
+    # already have it) plus every Data branch, pruned. Seeding and the
+    # recovery anchor read refs/remotes/origin/coding-stats/* — the update
+    # action never fetches or writes any non-Data-branch ref beyond the
+    # Target it analyzes.
+    - name: fetch Target branch and Data branches
+      shell: bash
+      env:
+        CODING_STATS_TARGET: "${{ inputs.target-branch }}"
+      run: |
+        git fetch --prune origin \
+          "+refs/heads/coding-stats/*:refs/remotes/origin/coding-stats/*" \
+          "+refs/heads/$CODING_STATS_TARGET:refs/remotes/origin/$CODING_STATS_TARGET"
+
+    # update auto-mounts the Data-branch worktree (datastore.prepare) and
+    # writes the Artifact there; the working DB is throwaway machine state
+    # under $RUNNER_TEMP (the Artifact is the store). `init` pins the Target
+    # branch into the working DB's settings — the GITHUB_REF_NAME fallback
+    # would ignore a target-branch override.
+    - name: update
+      shell: bash
+      env:
+        CODING_STATS_TARGET: "${{ inputs.target-branch }}"
+        CODING_STATS_SKIP_CLASSIFY: "${{ inputs.no-classify }}"
+        CODING_STATS_SKIP_DETECT: "${{ inputs.no-detect }}"
+        CODING_STATS_SKIP_LINEAGE: "${{ inputs.no-lineage }}"
+        OPENCODE_API_KEY: "${{ inputs.opencode-api-key }}"
+        OPENROUTER_API_KEY: "${{ inputs.openrouter-api-key }}"
+      run: |
+        db="$RUNNER_TEMP/coding-stats/working.db"
+        mkdir -p "$RUNNER_TEMP/coding-stats"
+        uv run --project "$GITHUB_ACTION_PATH" coding-stats init . --branch "$CODING_STATS_TARGET" --db "$db"
+        flags=()
+        if [ "$CODING_STATS_SKIP_CLASSIFY" = "true" ]; then flags+=(--no-classify); fi
+        if [ "$CODING_STATS_SKIP_DETECT" = "true" ]; then flags+=(--no-detect); fi
+        if [ "$CODING_STATS_SKIP_LINEAGE" = "true" ]; then flags+=(--no-lineage); fi
+        uv run --project "$GITHUB_ACTION_PATH" coding-stats update --db "$db" "${flags[@]}"
+
+    # Landing rules live in `ci land` (engine-tested): no-op pushes nothing,
+    # a superseded run abandons with a ::notice::, never force. The push goes
+    # to exactly refs/heads/coding-stats/<target> with the GITHUB_TOKEN that
+    # actions/checkout persisted — caller permissions: contents: write only.
+    - name: land artifact update
+      id: land
+      shell: bash
+      env:
+        CODING_STATS_TARGET: "${{ inputs.target-branch }}"
+      run: |
+        uv run --project "$GITHUB_ACTION_PATH" coding-stats ci land --branch "$CODING_STATS_TARGET"
+        echo "data-branch=coding-stats/$CODING_STATS_TARGET" >> "$GITHUB_OUTPUT"

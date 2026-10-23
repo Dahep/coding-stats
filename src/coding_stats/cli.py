@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import ci, db, gitwalk, identity
+from . import ci, datastore, db, gitwalk, identity
 from .classify import DEFAULT_MODEL, SESSION_DIR, Session, classify_pending
 from .lineage import close_lineage
 from .targets import annotate_all
@@ -73,33 +73,28 @@ def main(argv: list[str] | None = None) -> None:
 
     up = sub.add_parser(
         "update",
-        help="verify -> walk -> classify -> detect -> lineage -> live-lines ->"
-        " report -> serialize + digest",
+        help="verify -> walk -> seed -> classify -> detect -> lineage -> live-lines"
+        " -> serialize + digest (ADR-0006: the store holds only the SQL artifact;"
+        " reports render via the report verb/action)",
     )
     up.add_argument("--db", default="coding-stats.db")
     up.add_argument("--no-classify", action="store_true", help="skip LLM classification")
     up.add_argument("--no-detect", action="store_true", help="skip blame-based fix detection")
     up.add_argument("--no-lineage", action="store_true", help="skip lineage closure")
-    up.add_argument("--no-report", action="store_true", help="skip report.html regeneration")
     up.add_argument("--no-serialize", action="store_true", help="skip artifact write")
 
     ci_grp = sub.add_parser("ci", help="CI scaffold: workflow rendering + artifact landing")
     ci_sub = ci_grp.add_subparsers(dest="ci_cmd", required=True)
     ci_init = ci_sub.add_parser(
-        "init", help="write .github/workflows/coding-stats.yml (idempotent, refuses drift)"
+        "init",
+        help="write the short caller workflow that uses the coding-stats actions"
+        " (idempotent, refuses drift)",
     )
     ci_init.add_argument("--branch", default=None, help="Target branch (default: current)")
     ci_init.add_argument(
-        "--db", default=ci.DEFAULT_CI_DB, help="working DB the workflow runs update against"
+        "--no-report", action="store_true", help="write only the update workflow (no report job)"
     )
-    ci_init.add_argument("--no-push", action="store_true", help="render without the landing step")
     ci_init.add_argument("--upgrade", action="store_true", help="overwrite a drifted workflow")
-    ci_init.add_argument("--pages", action="store_true", help="publish report.html to GitHub Pages")
-    ci_init.add_argument(
-        "--tool-ref",
-        default=None,
-        help="git ref to install the tool from (default: this checkout's commit)",
-    )
     ci_land = ci_sub.add_parser(
         "land", help="land the artifact-update commit (Q15/Q17/Q18 rules; usable anywhere)"
     )
@@ -136,7 +131,12 @@ def main(argv: list[str] | None = None) -> None:
         "--ci", action="store_true", help="also write the coding-stats CI scaffold (ci init)"
     )
     mig.add_argument("--dry-run", action="store_true", help="print the plan, change nothing")
-
+    mig.add_argument(
+        "--data-branch",
+        action="store_true",
+        help="ADR-0006 clause 6: move the committed .coding-stats/ store onto the"
+        " orphan Data branch (instead of the legacy skill-stats migration)",
+    )
     args = parser.parse_args(argv)
 
     settings: dict[str, Any] = {}
@@ -147,6 +147,8 @@ def main(argv: list[str] | None = None) -> None:
         db_path = new_db(args.db, args)
         conn = db.connect(db_path)
         branch = args.branch or gitwalk.current_branch(repo)
+        if branch == "HEAD":
+            sys.exit("detached HEAD: pass --branch <target> explicitly")
         identity.register_repository(conn, repo, branch)  # writes repositories row + repo_id
         cfg = {
             "repo": str(repo),
@@ -167,22 +169,31 @@ def main(argv: list[str] | None = None) -> None:
         if top is None:
             sys.exit("not inside a git repository")
         branch = args.branch or gitwalk.current_branch(top)
+        if branch == "HEAD":
+            sys.exit(
+                "detached HEAD: pass --branch <target> explicitly"
+                " (a detached checkout names no Target branch)"
+            )
         if args.ci_cmd == "init":
             try:
                 for msg in ci.init(
                     top,
                     branch,
-                    db=args.db,
-                    push=not args.no_push,
+                    report=not args.no_report,
                     upgrade=args.upgrade,
-                    tool_ref=args.tool_ref,
-                    pages=args.pages,
                 ):
                     print(msg)
             except ci.DriftError as exc:
                 sys.exit(f"error: {exc}")
         else:
-            ci.report_landing(ci.commit_or_abandon(top, branch, args.remote))
+            try:
+                store = datastore.prepare(top, branch, remote=args.remote, sync=False)
+            except datastore.StoreSkip as exc:
+                ci.report_landing(ci.Landing("skipped", str(exc)))
+            else:
+                ci.report_landing(
+                    ci.land(store, top, args.remote),
+                )
         return
 
     if args.cmd == "gather":
@@ -205,6 +216,16 @@ def main(argv: list[str] | None = None) -> None:
         if identity.toplevel(repo) is None:
             sys.exit(f"not a git repo: {repo}")
         branch = args.branch or gitwalk.current_branch(repo) or "main"
+        if branch == "HEAD":
+            sys.exit("detached HEAD: pass --branch <target> explicitly")
+        if args.data_branch:
+            # ADR-0006 clause 6: committed ADR-0003 store → the Data branch
+            try:
+                for line in migration.migrate_to_data_branch(repo, branch):
+                    print(line)
+            except migration.MigrationError as exc:
+                sys.exit(f"error: {exc}")
+            return
         try:
             plan = migration.detect(repo, args.db, args.legacy_db, args.fresh, branch)
         except migration.MigrationError as exc:
@@ -223,6 +244,7 @@ def main(argv: list[str] | None = None) -> None:
                 print(msg)
         return
 
+    Path(args.db).parent.mkdir(parents=True, exist_ok=True)  # throwaway CI DBs nest deep
     conn = db.connect(Path(args.db))
     settings = _settings(conn)
     repo_dir: Path | None = Path(settings["repo"]) if "repo" in settings else None
@@ -291,7 +313,7 @@ def _pending_count(conn: sqlite3.Connection) -> int:
 
 
 def _run_update(
-    conn: sqlite3.Connection, db_path: Path, args: argparse.Namespace
+    conn: sqlite3.Connection, db_path: Path, args: argparse.Namespace, legacy_store: bool = False
 ) -> sqlite3.Connection:
     """One orchestrating run (ADR-0003 clause 7, Q11): verify the existing
     artifact first, then walk -> classify -> detect -> lineage -> live-lines ->
@@ -300,15 +322,23 @@ def _run_update(
     pending, is printed loudly, and reprocesses on a later successful update
     (Q13). The exit code stays 0 with a backlog.
 
+    ADR-0006 clause 1: the store is the Data branch `coding-stats/<target>` —
+    prepare mounts its worktree, and the artifact is verified / rebuilt /
+    written there; `ci land` pushes it while the Target branch never
+    receives artifact commits. Layout skips (a Target branch under
+    coding-stats/, a Data-branch ref-path clash, a legacy committed store
+    with no Data branch) end with a neutral notice instead of silently
+    re-classifying.
+
     On digest MISMATCH the run recovers per ADR-0003 clause 3 (partial
     recompute anchored at the newest self-verifying committed artifact
-    version; full recompute when none verifies). A fresh/throwaway working DB
-    (CI runs are stateless — the artifact is the store) adopts the git repo at
-    the current directory and seeds itself from a verified artifact."""
+    version — found in the Data branch's history now; full recompute when
+    none verifies). A fresh/throwaway working DB (CI runs are stateless — the
+    artifact is the store) adopts the git repo at the current directory and
+    seeds itself from a verified artifact."""
     import os as _os
 
     from . import artifact, livelines, recovery
-    from .htmlreport import write_report
 
     settings = _settings(conn)
     if "repo" in settings:
@@ -331,10 +361,41 @@ def _run_update(
         settings["branch"] = branch
     identity.register_repository(conn, repo_dir, branch)
 
-    store = repo_dir / ".coding-stats"
-    art_path = store / "coding-stats.sql"
+    if legacy_store:
+        # the ADR-0005 migration verb regenerates the store ON the Target
+        # checkout (legacy layout); the skips below apply only to the
+        # default Data-branch layout
+        store_dir = repo_dir
+        art_path = repo_dir / ".coding-stats" / "coding-stats.sql"
+    else:
+        try:
+            store = datastore.prepare(repo_dir, branch)
+        except datastore.StoreSkip as exc:
+            print(f"::notice::coding-stats update skipped: {exc}")
+            ci.step_summary(f"coding-stats update skipped: {exc}")
+            print("update skipped; nothing was walked, classified, or landed")
+            return conn
+        store_dir = store.worktree
+        art_path = store_dir / ".coding-stats" / "coding-stats.sql"
+    legacy_path = repo_dir / ".coding-stats" / "coding-stats.sql"
     recovered = False
-    if art_path.exists():
+    if not art_path.exists():
+        if not legacy_store and legacy_path.exists():
+            exposed = "coding-stats update skipped: the Target branch carries a committed"
+            msg = (
+                f"::notice::{exposed} .coding-stats/ store (ADR-0003 layout) but its Data"
+                f" branch {store.data_branch} has no artifact yet, so updates would"
+                " silently re-classify the whole history. Run `coding-stats migrate`"
+                " to move the committed artifact onto the Data branch with its"
+                " classified history, or delete the Target branch's .coding-stats/"
+                " to start coverage fresh."
+            )
+            print(msg)
+            ci.step_summary(f"### {exposed} artifact — migration needed")
+            print("update skipped; nothing was walked, classified, or landed")
+            return conn
+        print("artifact: none yet (first run)")
+    else:
         err = artifact.verify(art_path)
         if err is None:
             print("artifact digest: ok")
@@ -346,7 +407,12 @@ def _run_update(
                 print("seeded working db from the artifact")
         else:
             print(f"artifact digest: MISMATCH ({err})")
-            rec, conn = recovery.recover(conn, db_path, repo_dir, branch)
+            anchor = (
+                f"refs/heads/{branch}"
+                if legacy_store
+                else datastore.anchor_ref(repo_dir, store.data_branch)
+            )
+            rec, conn = recovery.recover(conn, db_path, repo_dir, branch, anchor)
             settings = _settings(conn)
             recovered = True
             if rec.mode == "restored":
@@ -357,13 +423,17 @@ def _run_update(
                     "FULL-RECOMPUTE: no committed artifact version verifies;"
                     " rebuilding from scratch"
                 )
-    else:
-        print("artifact: none yet (first run)")
 
     n = gitwalk.walk(repo_dir, conn, branch)
     print(f"walked {n} new commits")
 
     if not args.no_classify:
+        if not legacy_store:
+            from .seeding import seed_from_siblings
+
+            seed = seed_from_siblings(conn, repo_dir, store.data_branch)
+            if seed.seeded:
+                print(f"seeded {seed.seeded} commits from {', '.join(seed.sources)}")
         pending_before = _pending_count(conn)
         try:
             SESSION_DIR.mkdir(parents=True, exist_ok=True)
@@ -403,11 +473,8 @@ def _run_update(
         f" {live.unattributed_lines}, {live.samples_written} samples written"
     )
 
-    if not args.no_report:
-        report_path = write_report(conn, store / "report.html")
-        print(f"wrote {report_path}")
     if not args.no_serialize:
-        path = artifact.write(conn, repo_dir, with_report=False)
+        path = artifact.write(conn, store_dir)
         err = artifact.verify(path)
         print(f"wrote {path} (digest {'ok' if err is None else 'MISMATCH ' + str(err)})")
         if recovered:

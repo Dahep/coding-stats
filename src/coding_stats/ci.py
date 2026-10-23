@@ -1,37 +1,39 @@
-"""CI scaffold (ADR-0003 clauses 6-7): workflow rendering and artifact landing.
+"""CI scaffold (ADR-0006 clause 5): the caller workflow and Data-branch
+artifact landing.
 
-``ci init`` writes ``.github/workflows/coding-stats.yml`` (plus the store's
-``.gitignore`` for the throwaway CI working DB) idempotently: identical
-content is a no-op assertion, drifted content refuses with a diff summary
-unless ``--upgrade`` — the same replace-vs-refuse semantics as
-identity.register_repository.
+``ci init`` writes the short caller workflow (``.github/workflows/
+coding-stats.yml``) that adopts the composite actions ``Dahep/
+coding-stats@v1`` (update; lands on the Data branch) and ``Dahep/
+coding-stats/report@v1`` — idempotently: identical content is a no-op
+assertion, drifted content refuses with a diff summary unless
+``--upgrade``. The rendered-engine workflow, its git-pin rendering and
+the Pages job are gone: the engine version is the action ref the caller
+pins, and reports belong to the report action.
 
-``ci land`` is the push-side verb the workflow calls (``uv run coding-stats ci
-land``): it keeps the landing rules (Q15 -> a distinct artifact-update commit
-parented on the push, Q17 -> GITHUB_TOKEN so no PAT, Q18 -> no-op/stale/
-abandon) in Python where they are engine-testable instead of inline shell.
-It may be run anywhere (no CI-env restriction documented by choice); it acts
-on the repository passed in, pushing HEAD to exactly the given branch.
-"""
+``ci land`` is the push-side verb the update action calls: it keeps the
+landing rules — Q15 -> a distinct artifact-update commit, Q17 ->
+GITHUB_TOKEN so no PAT, Q18 -> no-op/stale/abandon — in Python where
+they are engine-testable instead of inline shell.  ADR-0006 retargeted
+it: the landing commits the `.coding-stats/` store of the Data-branch
+worktree (mounted by ``datastore.prepare``) and pushes HEAD to exactly the
+Data branch ``coding-stats/<target>`` — the Target branch never receives bot
+commits.  It may be run anywhere (no CI-env restriction documented by
+choice)."""
 
 import difflib
 import os
-import re
 import subprocess
 from dataclasses import dataclass
 from importlib import metadata
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
-DEFAULT_CI_DB = ".coding-stats/working.db"
+from . import datastore
+
 WORKFLOW_REL = ".github/workflows/coding-stats.yml"
-GITIGNORE_REL = ".coding-stats/.gitignore"
-# Fallback ref when the tool cannot see its own checkout (installed copy).
-DEFAULT_TOOL_REPO = "https://github.com/Dahep/coding-stats.git"
-DEFAULT_TOOL_REF = "main"
-
 SUBJECT = "coding-stats artifact update (auto)"
 BOT_NAME = "coding-stats[bot]"
 BOT_EMAIL = "coding-stats[bot]@users.noreply.github.com"
+_STORE_PATH = ".coding-stats"
 
 
 class DriftError(RuntimeError):
@@ -43,143 +45,76 @@ class Landing:
     """The landing outcome. The verb itself stays silent: reporting is the
     CLI's job, so the status is printed exactly once."""
 
-    status: str  # 'landed' | 'noop' | 'abandoned'
+    status: str  # 'landed' | 'noop' | 'abandoned' | 'skipped'
     detail: str
 
 
-def render_workflow(
-    branch: str,
-    db: str = DEFAULT_CI_DB,
-    push: bool = True,
-    tool_spec: str | None = None,
-    pages: bool = False,
-) -> str:
-    """The coding-stats workflow for a Target branch. No model names here —
-    settings travel in the artifact; classification is best-effort (Q13).
-
-    Parameter hygiene: branch/db are emitted as single-quoted YAML scalars
-    (never bool/numeric-looking) and travel to run lines via env + quoted
-    "$VAR" — no user value is ever interpolated into a shell string. The
-    install spec is ref-validated (check-ref-format) and single-quoted."""
+def render_workflow(branch: str, report: bool = True) -> str:
+    """The CALLER workflow adopted in a Target repo (ADR-0006 clause 5):
+    a `uses: Dahep/coding-stats@v1` update job (which lands on the Data
+    branch `coding-stats/<branch>`) plus a report job triggered on the
+    cadence the caller keeps scheduling. Tracked branches are the
+    workflow's own `on.push.branches` filter."""
     b = _yaml_scalar(branch)
-    spec = tool_spec if tool_spec is not None else install_spec()
-    land = (
-        """
-      # Landing rules (Q15 -> distinct artifact-update commit, Q17 ->
-      # GITHUB_TOKEN, Q18 -> no-op/stale/abandon): no-op updates push nothing
-      # and a superseded run abandons neutrally — never force, never block.
-      # The logic lives in `ci land` so tests can run it outside this YAML.
-      - name: land artifact update
-        run: coding-stats ci land --branch "$CODING_STATS_BRANCH"
-"""
-        if push
-        else ""
-    )
-    perms = (
-        """# Landing the artifact-update commit is the only write (Q17: GITHUB_TOKEN;
-# no PAT bits, no extra secrets).
-permissions:
-  contents: write
-"""
-        if push
-        else ""
-    )
-    pages_job = (
-        """
-  # Pages publish (an opt-in via `ci init --pages`; the Pages API errors on
-  # private unpaid repos, so the gate is the user's choice of repo/plan):
-  # deploy the same run's report.html as the site root. Job-level
-  # permissions override the workflow default — this job carries no
-  # contents: write.
-  deploy-pages:
-    needs: coding-stats
-    if: ${{ always() && needs.coding-stats.result == 'success' }}
+    report_job = """
+  # Reports render on their own cadence (the store holds only the SQL
+  # artifact). This job's permissions: checkout/fetch need contents: read;
+  # the Pages scopes belong HERE only — the update job never gets them, and
+  # they matter only when deploy-pages is "true".
+  report:
+    needs: update
+    if: ${{ always() && needs.update.result == 'success' }}
     runs-on: ubuntu-latest
     concurrency:
-      group: pages
+      group: coding-stats-report
       cancel-in-progress: false
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     permissions:
-      pages: write
-      id-token: write
+      contents: read
+      pages: write       # needed only for deploy-pages: "true"
+      id-token: write    # needed only for deploy-pages: "true"
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
         with:
-          name: coding-stats-report
-          path: site
-      - name: index page
-        run: mv site/report.html site/index.html
-      - uses: actions/configure-pages@v5
+          fetch-depth: 0
+      - uses: Dahep/coding-stats/report@v1
         with:
-          enablement: true  # first run can enable Pages itself (GITHUB_TOKEN)
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: site
-      - id: deployment
-        uses: actions/deploy-pages@v4
+          deploy-pages: "false"  # flip to "true" to publish to GitHub Pages
 """
-        if pages
-        else ""
-    )
-    return f"""# coding-stats CI — generated by `coding-stats ci init`; re-render with --upgrade.
-#
-# Artifact-only pushes must not re-trigger the pipeline (Q18.1): paths-ignore
-# is belt-and-braces — the ring ALSO closes by exclusion, because
-# .coding-stats/** is never analyzed (ADR-0003 clause 4) and such commits carry
-# no diff for the walk to process.
-#
-# Cadence is configured here, in one place: add `schedule:` (or further push
-# filters) to `on:` to taste — trigger choice never forces a landing.
+    return f"""# coding-stats CI — installed with `coding-stats ci init`;
+# upgradable by moving the action ref (manually or via Dependabot).
+name: coding-stats
+
 on:
   push:
     branches:
       - {b}
-    paths-ignore:
-      - ".coding-stats/**"
-      - ".skill-stats/**"
 
-# Parameters travel via env (quoted "$VAR" in run lines): hostile branch or
-# db values can never inject shell or YAML.
-env:
-  CODING_STATS_BRANCH: {b}
-  CODING_STATS_DB: {_yaml_scalar(db)}
+permissions: {{}}
 
-{perms}jobs:
-  coding-stats:
+jobs:
+  # One `uses:` step after checkout — the action pins the engine version to
+  # its own checkout, walks, classifies, and lands the Artifact on the
+  # Data branch coding-stats/<branch>; the Target branch is never touched.
+  update:
     runs-on: ubuntu-latest
+    # The same branch's runs never overlap; a superseded run abandons at
+    # landing (never mid-classification, never red).
+    concurrency:
+      group: coding-${{{{ github.workflow }}}}-${{{{ github.ref_name }}}}
+      cancel-in-progress: false
+    permissions:
+      contents: write  # the landing commit is the only write (GITHUB_TOKEN)
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # walk, blame and partial recompute need full history
-
-      - uses: astral-sh/setup-uv@v6
-      # The target repo does not depend on coding-stats: install the tool
-      # standalone, pinned to the ref that rendered this file (upgrade
-      # coding-stats and re-render with --upgrade to move the pin).
-      - run: uv tool install '{spec}'
-
-      # Classification is best-effort (Q13): it needs the opencode CLI and
-      # a provider key — the OPENCODE_API_KEY secret (Go/Zen subscription)
-      # or OPENROUTER_API_KEY (OpenRouter LLM). Without any key update still
-      # runs the deterministic stages and reports the backlog — nothing here
-      # is required for the run to succeed.
-      - name: install opencode CLI
-        continue-on-error: true  # best-effort: a failed download must not abort the run
-        run: curl -fsSL https://opencode.ai/install | bash
-      - name: update
-        run: coding-stats update --db "$CODING_STATS_DB"
-        env:
-          OPENCODE_API_KEY: ${{{{ secrets.OPENCODE_API_KEY }}}}
-          OPENROUTER_API_KEY: ${{{{ secrets.OPENROUTER_API_KEY }}}}
-{land}      - name: upload report
-        if: always()  # backlog/failed-classify runs still publish the report
-        uses: actions/upload-artifact@v4
+      # Work repos: pin the commit sha instead of the moving tag — this job
+      # holds contents: write and LLM keys.
+      - uses: Dahep/coding-stats@v1
         with:
-          name: coding-stats-report
-          path: .coding-stats/report.html
-{pages_job}"""
+          opencode-api-key: ${{{{ secrets.OPENCODE_API_KEY }}}}
+          openrouter-api-key: ${{{{ secrets.OPENROUTER_API_KEY }}}}
+{report_job if report else ""}"""
 
 
 def tool_version() -> str:
@@ -188,74 +123,25 @@ def tool_version() -> str:
     return metadata.version("coding-stats")
 
 
-def own_commit() -> str | None:
-    """The HEAD sha of the coding-stats checkout this process runs from, or
-    None when the tool is an installed copy (unpinnable: no git there)."""
-    pkg_dir = Path(__file__).resolve().parent
-    proc = subprocess.run(
-        ["git", "-C", str(pkg_dir), "rev-parse", "HEAD"], capture_output=True, text=True
-    )
-    return proc.stdout.strip() or None if proc.returncode == 0 else None
-
-
-def install_spec(tool_repo: str = DEFAULT_TOOL_REPO, tool_ref: str | None = None) -> str:
-    """The ``uv tool install`` spec for the workflow's standalone install.
-
-    Pinned at render time (upgrades move the pin via ``--upgrade``): the
-    exact commit of the coding-stats checkout that rendered the file, so a CI
-    run installs byte-for-byte the engine that rendered the rules. Installed
-    copies fall back to {ref} (set explicitly with --tool-ref to move the
-    pin)."""
-    ref = tool_ref if tool_ref is not None else (own_commit() or DEFAULT_TOOL_REF)
-    return f"coding-stats @ git+{tool_repo}@{ref}"
-
-
 def _yaml_scalar(value: str) -> str:
     """Single-quoted YAML scalar: always a string ('true' never a bool), with
     '' doubling for embedded quotes."""
     return "'" + value.replace("'", "''") + "'"
 
 
-def render_gitignore(db: str = DEFAULT_CI_DB) -> str:
-    """The store's ignore rule, derived from the configured working DB: its
-    name and sidecars are throwaway machine state (runs are stateless — the
-    committed artifact is the store) and must never be committed or confuse
-    the no-op landing check. Exact-name entries only: the artifact files
-    (.coding-stats/coding-stats.sql, report.html) can never be swallowed."""
-    name = PurePosixPath(db).name
-    entries = "\n".join(f"{name}{sfx}" for sfx in ("", "-wal", "-shm", "-journal"))
-    return (
-        "# coding-stats machine-local state — generated by `coding-stats ci init`.\n"
-        "# The working DB is throwaway: runs are stateless and the committed\n"
-        "# artifact (.coding-stats/coding-stats.sql) is the store.\n"
-        f"{entries}\n"
-    )
-
-
 def init(
     repo_dir: Path,
     branch: str,
-    db: str = DEFAULT_CI_DB,
-    push: bool = True,
+    report: bool = True,
     upgrade: bool = False,
-    tool_ref: str | None = None,
-    pages: bool = False,
 ) -> list[str]:
-    """Write the workflow and store gitignore. Identical content is an
-    idempotent assertion ('up to date'); drifted content refuses with a diff
-    summary unless `upgrade` re-renders over it. Drift is preflighted across
-    ALL managed files before anything is written — a refusal never leaves a
-    half-installed scaffold."""
-    _validate_branch(branch)
-    _validate_db(db)
-    spec = install_spec(tool_ref=tool_ref)
-    if tool_ref is not None:
-        # refs travel inside a git+https URL fragment: same ref-name charset
-        # as branches, validated the same way
-        _validate_branch(tool_ref)
+    """Write the caller workflow. Identical content is an idempotent
+    assertion ('up to date'); drifted content refuses with a diff summary
+    unless `upgrade` re-renders over it. Drift is preflighted before
+    anything is written — a refusal never leaves a half-written file."""
+    datastore.validate_ref(branch)
     plan = [
-        (WORKFLOW_REL, render_workflow(branch, db, push, tool_spec=spec, pages=pages)),
-        (GITIGNORE_REL, render_gitignore(db)),
+        (WORKFLOW_REL, render_workflow(branch, report=report)),
     ]
     drifted = []
     for rel, content in plan:
@@ -281,61 +167,67 @@ def init(
     return out
 
 
-_INVALID_REF_RE = re.compile(r"[\x00-\x1f\x7f ~^:?*\[\\]")
+def report_landing(landing: Landing) -> None:
+    """Print the landing outcome exactly once (the CLI's reporting step):
+    neutral ::notice:: annotation + step summary for abandonment and skips
+    (Q18/ADR-0006: never a red failure for superseded or skipped runs), a
+    plain line otherwise."""
+    line = f"coding-stats ci land: {landing.status} — {landing.detail}"
+    if landing.status in ("abandoned", "skipped"):
+        print(f"::notice::{line}")
+    else:
+        print(line)
+    step_summary(line)
 
 
-def _validate_branch(branch: str) -> None:
-    """Ref-name rules of git/GitHub (check-ref-format). Rendering is safe for
-    any string; this refuses names git itself would reject."""
-    bad = (
-        not branch
-        or bool(_INVALID_REF_RE.search(branch))
-        or ".." in branch
-        or "@{" in branch
-        or branch == "@"
-        or branch.startswith("/")
-        or branch.endswith("/")
-        or "//" in branch
-        or branch.endswith(".")
-        or branch.endswith(".lock")
-        or any(p.startswith(".") or p.endswith(".lock") for p in branch.split("/"))
-    )
-    if bad:
-        raise ValueError(f"invalid branch name {branch!r}: not a valid git/GitHub ref")
+def step_summary(line: str) -> None:
+    """Append one line to the GITHUB_STEP_SUMMARY (noop outside Actions)."""
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as fh:
+            fh.write(f"### {line}\n")
 
 
-def _validate_db(db: str) -> None:
-    """The working DB must never collide with the artifact files the store
-    commits (.coding-stats/.gitignore is generated from this name)."""
-    if PurePosixPath(db).name in {"coding-stats.sql", "report.html"}:
-        raise ValueError(f"db path {db!r} collides with a committed artifact file")
+def land(store: datastore.DataStore, repo: Path, remote: str = "origin") -> Landing:
+    """The landing verb, retargeted to the Data branch (ADR-0006 clause 1 —
+    the ADR-0003 rules Q15/Q17/Q18 stand):
 
+    'noop' — the store worktree's .coding-stats/ is unchanged (nothing is
+    pushed, so unchanged data never lands);
+    'skipped' — the caller refused the Target branch (under coding-stats/ or
+    a Data-branch ref-path clash): a neutral notice, never a red run;
+    'abandoned' — the Data branch tip moved under this run since it was read
+    (another run landed first, including the check-to-push race) or the
+    history diverged (never force); a run whose *Target* moved on is judged
+    on the Data branch alone and still lands its cumulative Artifact;
+    'landed' — the artifact update is committed as coding-stats[bot] in the
+    Data-branch worktree (its parent is the previous Data tip, or none for
+    the first commit of a fresh orphan branch) and pushed to exactly
+    refs/heads/<data-branch>. Unrelated push failures (auth, network) raise.
 
-def commit_or_abandon(repo: Path, branch: str, remote: str = "origin") -> Landing:
-    """The landing verb (ADR-0003 clause 6, Q15/Q17/Q18):
-    'noop' — .coding-stats/ is unchanged (no-op discipline: nothing is pushed);
-    'abandoned' — the checked-out push is behind the branch tip (a newer push
-    landed while this run worked, including the check-to-push race window) or
-    history diverged (never force);
-    'landed' — the artifact update is committed as coding-stats[bot] and pushed
-    to exactly `branch`. Unrelated push failures (auth, network) raise."""
-    if not _store_dirty(repo):
+    Identity: `store.target` stays the Repository key's branch — the Data
+    branch never becomes one. Remote ops run from `repo` (the main checkout)
+    because remote URLs may be relative; only index/worktree ops run inside
+    the worktree."""
+    if not _store_dirty(store.worktree):
         return Landing("noop", "no artifact changes to land")
-    base = _git(repo, "rev-parse", "HEAD").strip()
-    _fetch_tip(repo, branch, remote)
-    tip = _tip(repo, branch, remote)
-    if tip != base:
-        if _is_ancestor(repo, base, tip):
+    base = _head(store.worktree)  # None on an unborn (first-run) branch
+    remote_ok = datastore.remote_url(repo, remote) is not None
+    tip = datastore.fetch_tip(repo, store.data_branch, remote) if remote_ok else None
+    if tip is not None and tip != base:
+        if base is None or _is_ancestor(repo, base, tip):
             return Landing(
                 "abandoned",
-                f"a newer push landed on {branch} while this run worked;"
+                f"a newer push landed on {store.data_branch} while this run worked;"
                 " its own run covers the data",
             )
         if not _is_ancestor(repo, tip, base):
-            return Landing("abandoned", f"history diverged from {remote}/{branch}; never force")
-    _git(repo, "add", "-A", "--", ".coding-stats")
+            return Landing(
+                "abandoned", f"history diverged from {remote}/{store.data_branch}; never force"
+            )
+    _git(store.worktree, "add", "-A", "--", _STORE_PATH)
     _git(
-        repo,
+        store.worktree,
         "-c",
         f"user.name={BOT_NAME}",
         "-c",
@@ -344,52 +236,33 @@ def commit_or_abandon(repo: Path, branch: str, remote: str = "origin") -> Landin
         "-m",
         SUBJECT,
         "--",
-        ".coding-stats",
+        _STORE_PATH,
     )
+    head = _git(store.worktree, "rev-parse", "HEAD").strip()
+    if not remote_ok:
+        return Landing("landed", f"{store.data_branch} committed locally; no remote to push")
     try:
-        _push(repo, remote, branch)
+        _push(repo, remote, store.data_branch, head)
     except subprocess.CalledProcessError as exc:
-        # Q18 race: the branch advanced between our staleness check and this
-        # push and the push was rejected. Superseded runs end neutrally —
-        # never force, never block; anything else (auth, network) is a real
+        # Q18 race: the Data branch advanced between our staleness check and
+        # this push and the push was rejected. Superseded runs end neutrally
+        # — never force, never block; anything else (auth, network) is a real
         # error and must surface.
-        _fetch_tip(repo, branch, remote)
-        tip = _tip(repo, branch, remote)
-        if tip != base and not _is_ancestor(repo, tip, base):
+        tip = datastore.fetch_tip(repo, store.data_branch, remote)
+        if tip is not None and (base is None or not _is_ancestor(repo, tip, base)):
             return Landing(
                 "abandoned",
-                f"a newer push landed on {branch} during the landing attempt;"
+                f"a newer push landed on {store.data_branch} during the landing attempt;"
                 " superseded (the local artifact commit stays unpushed)",
             )
         raise exc
-    return Landing("landed", f"artifact-update commit pushed to {remote} {branch}")
+    return Landing("landed", f"artifact-update commit pushed to {remote} {store.data_branch}")
 
 
-def report_landing(landing: Landing) -> None:
-    """Print the landing outcome exactly once (the CLI's reporting step):
-    neutral ::notice:: annotation + step summary for abandonment (Q18: never
-    a red failure for superseded runs), a plain line otherwise."""
-    line = f"coding-stats ci land: {landing.status} — {landing.detail}"
-    if landing.status == "abandoned":
-        print(f"::notice::{line}")
-    else:
-        print(line)
-    summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary:
-        with open(summary, "a", encoding="utf-8") as fh:
-            fh.write(f"### {line}\n")
-
-
-def _push(repo: Path, remote: str, branch: str) -> None:
-    _git(repo, "push", remote, f"HEAD:refs/heads/{branch}")
-
-
-def _fetch_tip(repo: Path, branch: str, remote: str) -> None:
-    _git(repo, "fetch", remote, f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}")
-
-
-def _tip(repo: Path, branch: str, remote: str) -> str:
-    return _git(repo, "rev-parse", f"refs/remotes/{remote}/{branch}").strip()
+def _push(repo: Path, remote: str, branch: str, head: str) -> None:
+    # by sha, not HEAD: HEAD inside the worktree is the landing commit, but
+    # remote URLs may be relative and resolve against the main checkout
+    _git(repo, "push", remote, f"{head}:refs/heads/{branch}")
 
 
 def _diff(rel: str, current: str, generated: str) -> str:
@@ -408,20 +281,7 @@ def _diff(rel: str, current: str, generated: str) -> str:
     return "\n".join(lines)
 
 
-def _git(repo: Path, *args: str) -> str:
-    return subprocess.run(
-        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
-    ).stdout
-
-
-def _store_dirty(repo: Path) -> bool:
-    return bool(_git(repo, "status", "--porcelain", "--", ".coding-stats/").strip())
-
-
-def _is_ancestor(repo: Path, maybe_ancestor: str, descendant: str) -> bool:
-    proc = subprocess.run(
-        ["git", "-C", str(repo), "merge-base", "--is-ancestor", maybe_ancestor, descendant],
-        capture_output=True,
-        check=False,
-    )
-    return proc.returncode == 0
+_git = datastore.git_run
+_store_dirty = datastore.store_dirty
+_head = datastore.head_sha
+_is_ancestor = datastore.is_ancestor

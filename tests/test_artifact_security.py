@@ -17,7 +17,7 @@ import pytest
 
 from coding_stats import artifact, recovery
 from coding_stats.cli import main
-from conftest import commit_files, run
+from conftest import commit_files, run, store_dir
 
 
 class Scripted:
@@ -45,7 +45,7 @@ def _updated_repo(tmp_path) -> Path:
         "coding_stats.cli.Session",
         lambda model, sid=None: Scripted(['{"k":"new","title":"one","about":"x","why":"y"}']),
     ):
-        main(["update", "--db", db_path, "--no-detect", "--no-lineage", "--no-report"])
+        main(["update", "--db", db_path, "--no-detect", "--no-lineage"])
     return repo
 
 
@@ -59,7 +59,7 @@ def _rechecksum(data: bytes) -> bytes:
 
 
 def _hostile_artifact(repo: Path, payload: str) -> bytes:
-    art = repo / ".coding-stats" / "coding-stats.sql"
+    art = store_dir(repo) / "coding-stats.sql"
     return _rechecksum(art.read_bytes() + ("\n" + payload + "\n").encode())
 
 
@@ -90,7 +90,7 @@ def test_materialize_refuses_hostile_sql(tmp_path, payload):
 
 def test_gather_refuses_hostile_artifact(tmp_path):
     repo = _updated_repo(tmp_path)
-    art = repo / ".coding-stats" / "coding-stats.sql"
+    art = store_dir(repo) / "coding-stats.sql"
     art.write_bytes(_hostile_artifact(repo, "ATTACH DATABASE '/tmp/opencode/pwned.db' AS v;"))
     union = tmp_path / "union.db"
     with pytest.raises(SystemExit) as excinfo:
@@ -111,7 +111,7 @@ def test_recovery_rebuild_refuses_hostile_anchor(tmp_path):
 
 def test_benign_artifact_materializes_with_curated_shape(tmp_path):
     repo = _updated_repo(tmp_path)
-    art = repo / ".coding-stats" / "coding-stats.sql"
+    art = store_dir(repo) / "coding-stats.sql"
     assert artifact.verify(art) is None
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row

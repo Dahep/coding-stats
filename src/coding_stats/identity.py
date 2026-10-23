@@ -85,6 +85,64 @@ def slug_from_clone_url(url: str) -> str:
     return _slug("-".join(parts)) or "repo"
 
 
+def branch_slug(branch: str) -> str:
+    """Readable, deterministic branch slug for feature-id prefixes: same
+    normalization as the repo slug ('/' already maps to '-' in _slug)."""
+    return _slug(branch) or "branch"
+
+
+def key_base(key: str) -> str:
+    """The Repository key's URL part (the branch trails the last '@'; '@'
+    is outside the slug alphabet, so the split is unambiguous for slugged
+    branch names)."""
+    return key.rsplit("@", 1)[0]
+
+
+def repo_slug(plain: str, branch: str | None) -> str:
+    """The repositories row's slug: the ``{repo}@{branch}`` form (ADR-0006
+    clause 2) — one row still corresponds to one Repository key (URL +
+    branch), and feature-id allocation reads it."""
+    return f"{plain}@{branch_slug(branch)}" if branch else plain
+
+
+def reprefix_features(conn: sqlite3.Connection, our_slug: str) -> int:
+    """Re-prefix every feature id of the ingested rows: branch-carrying ids
+    keep their ``@branch`` part (the branch that first classified the
+    feature — never flattened to the gathering checkout's slug) while their
+    repo part is rewritten; branch-less old-style ids take our full
+    ``{repo}@{branch}`` slug. Local numbers preserved. Returns rewritten count."""
+    repo_part = our_slug.split("@", 1)[0]
+    pat = re.compile(r"^(.+)-(\d+)$")
+
+    def rewrite(value: str) -> str:
+        m = pat.match(value)
+        if not m:
+            return value
+        p, n = m.group(1), m.group(2)
+        if "@" in p:
+            _, branch_old = p.split("@", 1)
+            return f"{repo_part}@{branch_old}-{n}"
+        return f"{our_slug}-{n}"
+
+    out = 0
+    for old_id in [str(r["id"]) for r in conn.execute("SELECT id FROM features")]:
+        new_id = rewrite(old_id)
+        if new_id != old_id:
+            conn.execute("UPDATE features SET id = ? WHERE id = ?", (new_id, old_id))
+            out += 1
+    for table, col in (
+        ("commits_features", "feature_id"),
+        ("fixes_features", "feature_id"),
+        ("feature_line_samples", "feature_id"),
+    ):
+        for r in conn.execute(f"SELECT DISTINCT {col} v FROM {table}"):
+            old_val = str(r["v"])
+            new_val = rewrite(old_val)
+            if new_val != old_val:
+                conn.execute(f"UPDATE {table} SET {col} = ? WHERE {col} = ?", (new_val, old_val))
+    return out
+
+
 def local_identity(path: str) -> tuple[str, str]:
     """(key base, slug) shim for a machine-local repo path: 'local:<basename>'
     plus the sanitized basename. A placeholder, not a real identity."""
@@ -157,9 +215,10 @@ def register_repository(conn: sqlite3.Connection, repo: Path, branch: str | None
 
     Wave 1: a DB manages exactly one repository (the row the DB was init'd
     against); a second row is refused rather than silently half-supported."""
-    base, slug, clone_url = resolved_identity(repo)
+    base, plain_slug, clone_url = resolved_identity(repo)
+    slug = repo_slug(plain_slug, branch)
     key = repo_key(base, branch)
-    existing = conn.execute("SELECT id, repo_key FROM repositories ORDER BY id").fetchall()
+    existing = conn.execute("SELECT id, repo_key, slug FROM repositories ORDER BY id").fetchall()
     if len(existing) > 1:
         raise RuntimeError("wave 1 manages a single repository row per DB")
     with conn:
@@ -168,6 +227,10 @@ def register_repository(conn: sqlite3.Connection, repo: Path, branch: str | None
             rid = int(row["id"])
             if key != row["repo_key"]:
                 rid = _relabel(conn, rid, str(row["repo_key"]), key, slug, branch, clone_url)
+            elif str(row["slug"]) != slug:
+                # non-identity refresh: the slug now carries the branch; the
+                # key (Repository key) is unchanged, so this is normalization
+                conn.execute("UPDATE repositories SET slug = ? WHERE id = ?", (slug, rid))
         else:
             cur = conn.execute(
                 "INSERT INTO repositories (repo_key, slug, branch, clone_url, added_at)"

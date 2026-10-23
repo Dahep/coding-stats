@@ -53,6 +53,42 @@ def add_feature(conn, title: str, about: str = "", created_at: str = "2026-01-01
     return create_feature(conn, repo_id, title, about, created_at)
 
 
+def store_worktree(repo: Path, branch: str = "main") -> Path:
+    """The Data-branch worktree the engine defaults to (datastore.
+    default_worktree's .git-dir case): ci land commits/pushes from here."""
+    return repo / ".git" / "coding-stats-store" / branch
+
+
+def store_dir(repo: Path, branch: str = "main") -> Path:
+    """The artifact store inside the Data-branch worktree."""
+    return store_worktree(repo, branch) / ".coding-stats"
+
+
+def git_out(repo: Path, *args: str) -> str:
+    """Read-only git output for assertions."""
+    import subprocess
+
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
+    ).stdout
+
+
+def bare_remote(tmp_path) -> str:
+    import subprocess
+
+    path = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(path)], check=True)
+    return str(path)
+
+
+def with_remote(repo: Path, bare) -> None:
+    import subprocess
+
+    run(repo, "remote", "add", "origin", bare)
+    run(repo, "push", "-q", "-u", "origin", "main")
+    subprocess.run(["git", "-C", bare, "symbolic-ref", "HEAD", "refs/heads/main"], check=True)
+
+
 @pytest.fixture()
 def repo(tmp_path: Path) -> Path:
     r = tmp_path / "repo"

@@ -157,8 +157,10 @@ def _step_1(conn: sqlite3.Connection) -> None:
         )
     key = slug = None
     if isinstance(repo_value, str):
-        base, slug = identity.local_identity(repo_value)
-        key = identity.repo_key(base, branch_value if isinstance(branch_value, str) else None)
+        base, plain_slug = identity.local_identity(repo_value)
+        branch_v = branch_value if isinstance(branch_value, str) else None
+        slug = identity.repo_slug(plain_slug, branch_v) if branch_v else plain_slug
+        key = identity.repo_key(base, branch_v)
 
     stats: dict[int, gitwalk.DiffStat] = {}
     stale: set[int] = set()
@@ -380,8 +382,133 @@ def _step_2(conn: sqlite3.Connection) -> None:
     )
 
 
+def _step_3(conn: sqlite3.Connection) -> None:
+    """The union's feature key becomes (repository, id) (ADR-0006 clause 4).
+
+    A seeded feature id (``{repo}@{branch}``-prefixed, minted by the branch
+    that first classified it) legitimately appears in SEVERAL branch
+    artifacts of one repo, each keeping its own live lines. Under a
+    global-TEXT-id PK that second insert dies; the id alone is not a
+    sufficient key. Dependent tables keep the feature_id column but lose the
+    REFERENCES to features(id): SQLite cannot FK a composite target from a
+    single column, while the commit_id-side references stay exact.
+    For a single-repo DB the change is invisible (one repositories row; the
+    id was already unique within it)."""
+    # migration carriers first: copy functions cannot alter PKs, only rebuild
+    conn.execute(
+        """CREATE TABLE features_migration (
+               id TEXT NOT NULL,
+               title TEXT NOT NULL,
+               about TEXT NOT NULL DEFAULT '',
+               title_history_json TEXT NOT NULL DEFAULT '[]',
+               created_at TEXT NOT NULL,
+               created_run_id INTEGER REFERENCES runs(id),
+               repo_id INTEGER NOT NULL REFERENCES repositories(id),
+               live_lines INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY (repo_id, id)
+           )"""
+    )
+    conn.execute(
+        """INSERT INTO features_migration (id, title, about, title_history_json,
+               created_at, created_run_id, repo_id, live_lines)
+           SELECT id, title, about, title_history_json, created_at, created_run_id,
+                  repo_id, live_lines
+           FROM features ORDER BY id, repo_id"""
+    )
+    conn.execute(
+        """CREATE TABLE commits_features_migration (
+               commit_id INTEGER NOT NULL,
+               feature_id TEXT NOT NULL,
+               role TEXT NOT NULL
+           )"""
+    )
+    conn.execute(
+        "INSERT INTO commits_features_migration SELECT commit_id, feature_id, role"
+        " FROM commits_features ORDER BY commit_id, feature_id"
+    )
+    conn.execute(
+        """CREATE TABLE fixes_features_migration (
+               fix_commit_id INTEGER NOT NULL,
+               feature_id TEXT NOT NULL,
+               via_fix_commit_id INTEGER
+           )"""
+    )
+    conn.execute(
+        "INSERT INTO fixes_features_migration SELECT fix_commit_id, feature_id,"
+        " via_fix_commit_id FROM fixes_features"
+        " ORDER BY fix_commit_id, feature_id, via_fix_commit_id"
+    )
+    conn.execute(
+        """CREATE TABLE feature_line_samples_migration (
+               feature_id TEXT NOT NULL,
+               at_commit_sha TEXT NOT NULL,
+               live_lines INTEGER NOT NULL
+           )"""
+    )
+    conn.execute(
+        "INSERT INTO feature_line_samples_migration SELECT feature_id, at_commit_sha,"
+        " live_lines FROM feature_line_samples ORDER BY feature_id, at_commit_sha"
+    )
+    # swap: carriers out, curated shape in (children of features gone too)
+    conn.execute("DROP TABLE feature_line_samples")
+    conn.execute("DROP TABLE fixes_features")
+    conn.execute("DROP TABLE commits_features")
+    conn.execute("DROP TABLE features")
+    conn.execute("ALTER TABLE features_migration RENAME TO features")
+    conn.execute(
+        """CREATE TABLE commits_features (
+               commit_id INTEGER NOT NULL REFERENCES commits(id),
+               feature_id TEXT NOT NULL,
+               role TEXT NOT NULL CHECK (role IN ('defines', 'touches')),
+               PRIMARY KEY (commit_id, feature_id),
+               UNIQUE (feature_id, commit_id)
+           )"""
+    )
+    conn.execute(
+        "INSERT INTO commits_features (commit_id, feature_id, role)"
+        " SELECT commit_id, feature_id, role FROM commits_features_migration"
+        " ORDER BY commit_id, feature_id"
+    )
+    conn.execute(
+        """CREATE TABLE fixes_features (
+               fix_commit_id INTEGER NOT NULL REFERENCES commits(id),
+               feature_id TEXT NOT NULL,
+               via_fix_commit_id INTEGER REFERENCES commits(id),
+               PRIMARY KEY (fix_commit_id, feature_id),
+               UNIQUE (fix_commit_id, feature_id, via_fix_commit_id)
+           )"""
+    )
+    conn.execute(
+        "INSERT INTO fixes_features (fix_commit_id, feature_id, via_fix_commit_id)"
+        " SELECT fix_commit_id, feature_id, via_fix_commit_id FROM fixes_features_migration"
+        " ORDER BY fix_commit_id, feature_id, via_fix_commit_id"
+    )
+    conn.execute(
+        """CREATE TABLE feature_line_samples (
+               feature_id TEXT NOT NULL,
+               at_commit_sha TEXT NOT NULL,
+               live_lines INTEGER NOT NULL,
+               PRIMARY KEY (feature_id, at_commit_sha)
+           )"""
+    )
+    conn.execute(
+        "INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines)"
+        " SELECT feature_id, at_commit_sha, live_lines"
+        " FROM feature_line_samples_migration ORDER BY feature_id, at_commit_sha"
+    )
+    for name in (
+        "feature_line_samples_migration",
+        "fixes_features_migration",
+        "commits_features_migration",
+    ):
+        conn.execute(f"DROP TABLE {name}")
+    conn.execute("CREATE INDEX idx_commits_features_feature ON commits_features(feature_id)")
+    conn.execute("CREATE INDEX idx_fixes_features_feature ON fixes_features(feature_id)")
+
+
 SCHEMA_STEPS: list[Step] = [
     STEP_0_SQL,  # 0: initial schema
     _step_1,  # 1: repository identity, repo-scoped commits, prefixed feature ids
     _step_2,  # 2: features.live_lines + feature_line_samples (Sample rows)
+    _step_3,  # 3: union-wide feature key (repository, id) — ADR-0006 clause 4
 ]

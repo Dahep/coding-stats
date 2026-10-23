@@ -1,0 +1,79 @@
+name: coding-stats report
+description: >-
+  Gather every coding-stats/* Data branch of the caller repo (Shared commits
+  dedup), render one HTML report, upload it as an Actions artifact —
+  GitHub Pages deployment is opt-in (ADR-0006 clause 5).
+inputs:
+  deploy-pages:
+    description: >-
+      Deploy the rendered report to GitHub Pages; the caller's report job
+      carries "pages: write" / "id-token: write".
+    default: 'false'
+  include-db:
+    description: Also upload the gathered union DB and expose the db-path output.
+    default: 'false'
+  artifact-name:
+    description: Name of the uploaded Actions artifact (the report).
+    default: coding-stats-report
+outputs:
+  report-path:
+    description: Path of the rendered HTML report file.
+    value: ${{ env.CODING_STATS_REPORT_PATH }}
+  db-path:
+    description: Path of the gathered union DB.
+    value: ${{ env.CODING_STATS_UNION }}
+runs:
+  using: composite
+  steps:
+    # The engine version is exactly the action ref the caller pinned: it
+    # runs from this repo's checkout — the ROOT one above this action's
+    # report/ directory (pyproject.toml lives there) — no separate install.
+    - name: engine paths (env only; no interpolation into run lines)
+      shell: bash
+      run: |
+        echo "CODING_STATS_UNION=$RUNNER_TEMP/coding-stats-union.db" >> "$GITHUB_ENV"
+        echo "CODING_STATS_REPORT_DIR=$RUNNER_TEMP/coding-stats-report" >> "$GITHUB_ENV"
+        echo "CODING_STATS_REPORT_PATH=$RUNNER_TEMP/coding-stats-report/index.html" >> "$GITHUB_ENV"
+        mkdir -p "$RUNNER_TEMP/coding-stats-report"
+    - name: gather every coding-stats/* data branch
+      shell: bash
+      run: |
+        git -C "$GITHUB_WORKSPACE" fetch --prune origin \
+          "+refs/heads/coding-stats/*:refs/remotes/origin/coding-stats/*"
+        echo "gathered sources: $(git -C "$GITHUB_WORKSPACE" for-each-ref --format='%(refname:short)' refs/remotes/origin/coding-stats | tr '\n' ' ')"
+        uv run --project "$GITHUB_ACTION_PATH/.." coding-stats gather \
+          --db "$CODING_STATS_UNION" "$GITHUB_WORKSPACE"
+    - name: render report
+      shell: bash
+      run: |
+        uv run --project "$GITHUB_ACTION_PATH/.." coding-stats report \
+          --db "$CODING_STATS_UNION" --html "$CODING_STATS_REPORT_PATH"
+    - name: upload report artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ env.CODING_STATS_REPORT_PATH }}
+        if-no-files-found: error
+    - name: upload union db artifact
+      if: ${{ inputs.include-db == 'true' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}-db
+        path: ${{ env.CODING_STATS_UNION }}
+        if-no-files-found: error
+    # Pages are opt-in (the Pages API errors on private/unpaid repos, so the
+    # gate is the caller's choice). The Pages permissions belong to the
+    # caller's REPORT job — the update job never gets them.
+    - name: configure pages
+      if: ${{ inputs.deploy-pages == 'true' }}
+      uses: actions/configure-pages@v5
+      with:
+        enablement: true  # first run can enable Pages itself (GITHUB_TOKEN)
+    - name: upload pages artifact
+      if: ${{ inputs.deploy-pages == 'true' }}
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: ${{ env.CODING_STATS_REPORT_DIR }}
+    - name: deploy pages
+      if: ${{ inputs.deploy-pages == 'true' }}
+      uses: actions/deploy-pages@v4
