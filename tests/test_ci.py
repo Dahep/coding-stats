@@ -52,11 +52,12 @@ def test_ci_init_writes_workflow_and_is_idempotent(repo):
         "OPENCODE_API_KEY",
         "coding-stats update --db",
         "coding-stats ci land --branch",
-        "actions/upload-artifact",
-        "if: always()",
         "schedule",  # cadence configurable in one obvious place
     ):
         assert needle in text
+    # reports render through Dahep/coding-stats/report@v1 (ADR-0006): the
+    # rendered update workflow carries no report/upload step
+    assert "upload-artifact" not in text
     assert "glm" not in text  # no model names: settings travel in the artifact
     gi = repo / ".coding-stats" / ".gitignore"
     assert "working.db" in gi.read_text(encoding="utf-8")  # throwaway DB never commits
@@ -79,10 +80,17 @@ def test_ci_init_refuses_drift_unless_upgrade(repo):
 
 
 def test_ci_init_no_push_omits_landing_step(repo):
+    import yaml
+
     ci.init(repo, "main", push=False)
-    text = (repo / ".github" / "workflows" / "coding-stats.yml").read_text(encoding="utf-8")
-    assert "ci land" not in text
-    assert "contents: write" not in text  # nothing is written without the landing step
+    doc = yaml.safe_load(
+        (repo / ".github" / "workflows" / "coding-stats.yml").read_text("utf-8")
+    )
+    runs = [step.get("run", "") for step in doc["jobs"]["coding-stats"]["steps"]]
+    assert not any("ci land" in run for run in runs)
+    assert "contents: write" not in (
+        repo / ".github" / "workflows" / "coding-stats.yml"
+    ).read_text("utf-8")  # nothing is written without the landing step
 
 
 def _newer_data_landing(tmp_path, bare, base) -> None:
@@ -337,51 +345,6 @@ def test_ci_workflow_installs_tool_standalone(repo):
     assert "coding-stats update --db" in text  # direct invocation
     # installer is best-effort: a failed download must not abort the run
     assert "continue-on-error: true" in text
-
-
-def test_ci_pages_job_is_opt_in(repo):
-    import yaml
-
-    ci.init(repo, "main")  # default: no Pages deployment is rendered
-    text = (repo / ".github" / "workflows" / "coding-stats.yml").read_text("utf-8")
-    assert "deploy-pages" not in text
-    assert "id-token" not in text
-
-    ci.init(repo, "main", pages=True, upgrade=True)  # opt-in re-render moves it in
-    doc = yaml.safe_load(
-        (repo / ".github" / "workflows" / "coding-stats.yml").read_text("utf-8")
-    )
-    job = doc["jobs"]["deploy-pages"]
-    # scoped permissions override the workflow default job-locally: the
-    # landing commit keeps contents: write, the pages job never gets it
-    assert job["needs"] == "coding-stats"
-    assert job["permissions"] == {"pages": "write", "id-token": "write"}
-    assert job["environment"]["name"] == "github-pages"
-    uses = [step["uses"] for step in job["steps"] if "uses" in step]
-    assert any(u.startswith("actions/deploy-pages@v") for u in uses)
-    assert any(u.startswith("actions/upload-pages-artifact@v") for u in uses)
-    assert doc["jobs"]["coding-stats"].get("permissions") is None
-
-
-def test_ci_pages_job_deploys_last_landed_report(repo):
-    import yaml
-
-    ci.init(repo, "main", pages=True)
-    text = (repo / ".github" / "workflows" / "coding-stats.yml").read_text("utf-8")
-    assert "actions/download-artifact@v4" in text
-    assert "mv site/report.html site/index.html" in text
-    doc = yaml.safe_load(text)
-    deploys = doc["jobs"]["deploy-pages"]
-    assert deploys["concurrency"]["group"] == "pages"
-    assert "- name: coding-stats-report" not in text  # no artifact name drift
-
-
-def test_ci_init_refuses_drift_unless_upgrade_pages(repo):
-    """--pages is itself part of the rendered content: flipping it without
-    --upgrade is drift and refuses, never silently halves the scaffold."""
-    ci.init(repo, "main")
-    with pytest.raises(ci.DriftError, match="--upgrade"):
-        ci.init(repo, "main", pages=True)
 
 
 def test_ci_init_drift_preflight_is_all_or_nothing(repo):

@@ -73,8 +73,9 @@ def main(argv: list[str] | None = None) -> None:
 
     up = sub.add_parser(
         "update",
-        help="verify -> walk -> classify -> detect -> lineage -> live-lines ->"
-        " report -> serialize + digest",
+        help="verify -> walk -> seed -> classify -> detect -> lineage -> live-lines"
+        " -> serialize + digest (ADR-0006: the store holds only the SQL artifact;"
+        " reports render via the report verb/action)",
     )
     up.add_argument("--db", default="coding-stats.db")
     up.add_argument("--no-classify", action="store_true", help="skip LLM classification")
@@ -94,7 +95,6 @@ def main(argv: list[str] | None = None) -> None:
     )
     ci_init.add_argument("--no-push", action="store_true", help="render without the landing step")
     ci_init.add_argument("--upgrade", action="store_true", help="overwrite a drifted workflow")
-    ci_init.add_argument("--pages", action="store_true", help="publish report.html to GitHub Pages")
     ci_init.add_argument(
         "--tool-ref",
         default=None,
@@ -176,7 +176,6 @@ def main(argv: list[str] | None = None) -> None:
                     push=not args.no_push,
                     upgrade=args.upgrade,
                     tool_ref=args.tool_ref,
-                    pages=args.pages,
                 ):
                     print(msg)
             except ci.DriftError as exc:
@@ -325,7 +324,6 @@ def _run_update(
     import os as _os
 
     from . import artifact, livelines, recovery
-    from .htmlreport import write_report
 
     settings = _settings(conn)
     if "repo" in settings:
@@ -462,9 +460,6 @@ def _run_update(
         f" {live.unattributed_lines}, {live.samples_written} samples written"
     )
 
-    if not args.no_report:
-        report_path = write_report(conn, store_dir / ".coding-stats" / "report.html")
-        print(f"wrote {report_path}")
     if not args.no_serialize:
         path = artifact.write(conn, store_dir, with_report=False)
         err = artifact.verify(path)

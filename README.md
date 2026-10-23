@@ -87,6 +87,16 @@ To run the update in CI, adopt the composite action `Dahep/coding-stats@v1`
 lands every update on the Data branch `coding-stats/<branch>` — the analyzed
 branch itself never receives bot commits.
 
+For reports there is a second composite action, `Dahep/coding-stats/report@v1`
+(see `report/action.yml`): it gathers every `coding-stats/*` Data branch of
+the repo with Shared-commit dedup, renders one HTML report, uploads it as an
+Actions artifact (and optionally the union DB, `include-db: true`) and deploys
+to Pages only when `deploy-pages: true` (with `pages: write` / `id-token:
+write` permissions in the report job). Trigger it by `workflow_run` after the
+update workflow, a schedule, or manual dispatch — a `push` trigger on
+`coding-stats/**` never fires, because pushes made with `GITHUB_TOKEN` do not
+start workflows.
+
 `classify` shells out to the `opencode` CLI (`opencode run --format json`,
 model configurable at `init` with `--model`, default `opencode/glm-5.3-flash`)
 in its own scratch session dir so it never touches other sessions. If a reply

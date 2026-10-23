@@ -125,7 +125,7 @@ def test_migrate_renamed_repo_reuses_db_and_relabels(tmp_path, repo, monkeypatch
     assert _db_key(dest) == "https://github.com/Dahep/coding-stats@main"
     assert _counts(dest) == (2, 2)  # verdicts survived the migration
     assert artifact.verify(repo / ".coding-stats" / "coding-stats.sql") is None
-    assert (repo / ".coding-stats" / "report.html").exists()
+    # the store holds only the SQL artifact (ADR-0006 clause 5)
     assert not (repo / ".skill-stats").exists()
     assert not (repo / ".github" / "workflows" / "skill-stats.yml").exists()
 

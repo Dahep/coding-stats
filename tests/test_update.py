@@ -49,7 +49,6 @@ def test_update_end_to_end_lands_artifact(tmp_path, repo, capsys, monkeypatch):
 
     art_path = store_dir(repo) / "coding-stats.sql"
     assert artifact.verify(art_path) is None
-    assert (store_dir(repo) / "report.html").exists()
 
     mat = sqlite3.connect(tmp_path / "mat.db")
     mat.row_factory = sqlite3.Row
