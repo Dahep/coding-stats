@@ -117,9 +117,7 @@ def test_migration_prints_removal_pr_steps(tmp_path, repo, capsys, monkeypatch):
     assert "git rm -r .coding-stats" in out or ".github/workflows" in out
 
 
-def test_migration_prints_the_scaffold_removal_only_for_the_old_workflow(
-    tmp_path, repo, capsys
-):
+def test_migration_prints_the_scaffold_removal_only_for_the_old_workflow(tmp_path, repo, capsys):
     """The actions-based caller workflow stays: the printed removal steps
     carry the scaffold's rm line only when the old rendered workflow
     (uv tool install) sits on the Target branch."""
