@@ -87,19 +87,15 @@ def main(argv: list[str] | None = None) -> None:
     ci_grp = sub.add_parser("ci", help="CI scaffold: workflow rendering + artifact landing")
     ci_sub = ci_grp.add_subparsers(dest="ci_cmd", required=True)
     ci_init = ci_sub.add_parser(
-        "init", help="write .github/workflows/coding-stats.yml (idempotent, refuses drift)"
+        "init",
+        help="write the short caller workflow that uses the coding-stats actions"
+        " (idempotent, refuses drift)",
     )
     ci_init.add_argument("--branch", default=None, help="Target branch (default: current)")
     ci_init.add_argument(
-        "--db", default=ci.DEFAULT_CI_DB, help="working DB the workflow runs update against"
+        "--no-report", action="store_true", help="write only the update workflow (no report job)"
     )
-    ci_init.add_argument("--no-push", action="store_true", help="render without the landing step")
     ci_init.add_argument("--upgrade", action="store_true", help="overwrite a drifted workflow")
-    ci_init.add_argument(
-        "--tool-ref",
-        default=None,
-        help="git ref to install the tool from (default: this checkout's commit)",
-    )
     ci_land = ci_sub.add_parser(
         "land", help="land the artifact-update commit (Q15/Q17/Q18 rules; usable anywhere)"
     )
@@ -177,10 +173,8 @@ def main(argv: list[str] | None = None) -> None:
                 for msg in ci.init(
                     top,
                     branch,
-                    db=args.db,
-                    push=not args.no_push,
+                    report=not args.no_report,
                     upgrade=args.upgrade,
-                    tool_ref=args.tool_ref,
                 ):
                     print(msg)
             except ci.DriftError as exc:

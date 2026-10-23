@@ -1,16 +1,19 @@
-"""CI scaffold (ADR-0003 clauses 6-7, ADR-0006 clause 1): workflow rendering
-and Data-branch artifact landing.
+"""CI scaffold (ADR-0006 clause 5): the caller workflow and Data-branch
+artifact landing.
 
-``ci init`` writes ``.github/workflows/coding-stats.yml`` (plus the store's
-``.gitignore`` for the throwaway CI working DB) idempotently: identical
-content is a no-op assertion, drifted content refuses with a diff summary
-unless ``--upgrade`` — the same replace-vs-refuse semantics as
-identity.register_repository.
+``ci init`` writes the short caller workflow (``.github/workflows/
+coding-stats.yml``) that adopts the composite actions ``Dahep/
+coding-stats@v1`` (update; lands on the Data branch) and ``Dahep/
+coding-stats/report@v1`` — idempotently: identical content is a no-op
+assertion, drifted content refuses with a diff summary unless
+``--upgrade``. The rendered-engine workflow, its git-pin rendering and
+the Pages job are gone: the engine version is the action ref the caller
+pins, and reports belong to the report action.
 
-``ci land`` is the push-side verb the workflow calls (``uv run coding-stats ci
-land``): it keeps the landing rules — Q15 -> a distinct artifact-update
-commit, Q17 -> GITHUB_TOKEN so no PAT, Q18 -> no-op/stale/abandon — in Python
-where they are engine-testable instead of inline shell.  ADR-0006 retargeted
+``ci land`` is the push-side verb the update action calls: it keeps the
+landing rules — Q15 -> a distinct artifact-update commit, Q17 ->
+GITHUB_TOKEN so no PAT, Q18 -> no-op/stale/abandon — in Python where
+they are engine-testable instead of inline shell.  ADR-0006 retargeted
 it: the landing commits the `.coding-stats/` store of the Data-branch
 worktree (mounted by ``datastore.prepare``) and pushes HEAD to exactly the
 Data branch ``coding-stats/<target>`` — the Target branch never receives bot
@@ -22,17 +25,11 @@ import os
 import subprocess
 from dataclasses import dataclass
 from importlib import metadata
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from . import datastore
 
-DEFAULT_CI_DB = ".coding-stats/working.db"
 WORKFLOW_REL = ".github/workflows/coding-stats.yml"
-GITIGNORE_REL = ".coding-stats/.gitignore"
-# Fallback ref when the tool cannot see its own checkout (installed copy).
-DEFAULT_TOOL_REPO = "https://github.com/Dahep/coding-stats.git"
-DEFAULT_TOOL_REF = "main"
-
 SUBJECT = "coding-stats artifact update (auto)"
 BOT_NAME = "coding-stats[bot]"
 BOT_EMAIL = "coding-stats[bot]@users.noreply.github.com"
@@ -52,97 +49,70 @@ class Landing:
     detail: str
 
 
-def render_workflow(
-    branch: str,
-    db: str = DEFAULT_CI_DB,
-    push: bool = True,
-    tool_spec: str | None = None,
-) -> str:
-    """The coding-stats workflow for a Target branch. No model names here —
-    settings travel in the artifact; classification is best-effort (Q13).
-
-    Parameter hygiene: branch/db are emitted as single-quoted YAML scalars
-    (never bool/numeric-looking) and travel to run lines via env + quoted
-    "$VAR" — no user value is ever interpolated into a shell string. The
-    install spec is ref-validated (check-ref-format) and single-quoted."""
+def render_workflow(branch: str, report: bool = True) -> str:
+    """The CALLER workflow adopted in a Target repo (ADR-0006 clause 5):
+    a `uses: Dahep/coding-stats@v1` update job (which lands on the Data
+    branch `coding-stats/<branch>`) plus a report job triggered on the
+    cadence the caller keeps scheduling. Tracked branches are the
+    workflow's own `on.push.branches` filter."""
     b = _yaml_scalar(branch)
-    spec = tool_spec if tool_spec is not None else install_spec()
-    land = (
-        """
-      # Landing rules (Q15 -> distinct artifact-update commit, Q17 ->
-      # GITHUB_TOKEN, Q18 -> no-op/stale/abandon): no-op updates push nothing
-      # and a superseded run abandons neutrally — never force, never block.
-      # The logic lives in `ci land` so tests can run it outside this YAML.
-      - name: land artifact update
-        run: coding-stats ci land --branch "$CODING_STATS_BRANCH"
+    report_job = """
+  # Reports render on their own cadence (the store holds only the SQL
+  # artifact). The Pages permissions belong to THIS job only — the update
+  # job never gets them; drop the deploy-pages input when not using Pages.
+  report:
+    needs: update
+    if: ${{ always() && needs.update.result == 'success' }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: coding-stats-report
+      cancel-in-progress: false
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: Dahep/coding-stats/report@v1
+        with:
+          deploy-pages: "true"
 """
-        if push
-        else ""
-    )
-    perms = (
-        """# Landing the artifact-update commit is the only write (Q17: GITHUB_TOKEN;
-# no PAT bits, no extra secrets).
-permissions:
-  contents: write
-"""
-        if push
-        else ""
-    )
-    return f"""# coding-stats CI — generated by `coding-stats ci init`; re-render with --upgrade.
-#
-# Artifact-only pushes must not re-trigger the pipeline (Q18.1): paths-ignore
-# is belt-and-braces — the ring ALSO closes by exclusion, because
-# .coding-stats/** is never analyzed (ADR-0003 clause 4) and such commits carry
-# no diff for the walk to process.
-#
-# Cadence is configured here, in one place: add `schedule:` (or further push
-# filters) to `on:` to taste — trigger choice never forces a landing.
+    return f"""# coding-stats CI — installed with `coding-stats ci init`;
+# upgradable by moving the action ref (manually or via Dependabot).
+name: coding-stats
+
 on:
   push:
     branches:
       - {b}
-    paths-ignore:
-      - ".coding-stats/**"
-      - ".skill-stats/**"
 
-# Parameters travel via env (quoted "$VAR" in run lines): hostile branch or
-# db values can never inject shell or YAML. The artifact lives on the orphan
-# Data branch coding-stats/<branch> (ADR-0006); the update manages the store
-# itself and `ci land` pushes it — the Target branch never receives bot
-# commits. Reports render through `Dahep/coding-stats/report@v1`, never
-# inside this workflow (the store holds only the SQL artifact).
-env:
-  CODING_STATS_BRANCH: {b}
-  CODING_STATS_DB: {_yaml_scalar(db)}
+permissions: {{}}
 
-{perms}jobs:
-  coding-stats:
+jobs:
+  # One `uses:` step after checkout — the action pins the engine version to
+  # its own checkout, walks, classifies, and lands the Artifact on the
+  # Data branch coding-stats/<branch>; the Target branch is never touched.
+  update:
     runs-on: ubuntu-latest
+    # The same branch's runs never overlap; a superseded run abandons at
+    # landing (never mid-classification, never red).
+    concurrency:
+      group: coding-${{{{ github.workflow }}}}-${{{{ github.ref_name }}}}
+      cancel-in-progress: false
+    permissions:
+      contents: write  # the landing commit is the only write (GITHUB_TOKEN)
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # walk, blame and partial recompute need full history
-
-      - uses: astral-sh/setup-uv@v6
-      # The target repo does not depend on coding-stats: install the tool
-      # standalone, pinned to the ref that rendered this file (upgrade
-      # coding-stats and re-render with --upgrade to move the pin).
-      - run: uv tool install '{spec}'
-
-      # Classification is best-effort (Q13): it needs the opencode CLI and
-      # a provider key — the OPENCODE_API_KEY secret (Go/Zen subscription)
-      # or OPENROUTER_API_KEY (OpenRouter LLM). Without any key update still
-      # runs the deterministic stages and reports the backlog — nothing here
-      # is required for the run to succeed.
-      - name: install opencode CLI
-        continue-on-error: true  # best-effort: a failed download must not abort the run
-        run: curl -fsSL https://opencode.ai/install | bash
-      - name: update
-        run: coding-stats update --db "$CODING_STATS_DB"
-        env:
-          OPENCODE_API_KEY: ${{{{ secrets.OPENCODE_API_KEY }}}}
-          OPENROUTER_API_KEY: ${{{{ secrets.OPENROUTER_API_KEY }}}}
-{land}"""
+      # Work repos: pin the commit sha instead of the moving tag — this job
+      # holds contents: write and LLM keys.
+      - uses: Dahep/coding-stats@v1
+        with:
+          opencode-api-key: ${{{{ secrets.OPENCODE_API_KEY }}}}
+          openrouter-api-key: ${{{{ secrets.OPENROUTER_API_KEY }}}}
+{report_job if report else ""}"""
 
 
 def tool_version() -> str:
@@ -151,73 +121,25 @@ def tool_version() -> str:
     return metadata.version("coding-stats")
 
 
-def own_commit() -> str | None:
-    """The HEAD sha of the coding-stats checkout this process runs from, or
-    None when the tool is an installed copy (unpinnable: no git there)."""
-    pkg_dir = Path(__file__).resolve().parent
-    proc = subprocess.run(
-        ["git", "-C", str(pkg_dir), "rev-parse", "HEAD"], capture_output=True, text=True
-    )
-    return proc.stdout.strip() or None if proc.returncode == 0 else None
-
-
-def install_spec(tool_repo: str = DEFAULT_TOOL_REPO, tool_ref: str | None = None) -> str:
-    """The ``uv tool install`` spec for the workflow's standalone install.
-
-    Pinned at render time (upgrades move the pin via ``--upgrade``): the
-    exact commit of the coding-stats checkout that rendered the file, so a CI
-    run installs byte-for-byte the engine that rendered the rules. Installed
-    copies fall back to {ref} (set explicitly with --tool-ref to move the
-    pin)."""
-    ref = tool_ref if tool_ref is not None else (own_commit() or DEFAULT_TOOL_REF)
-    return f"coding-stats @ git+{tool_repo}@{ref}"
-
-
 def _yaml_scalar(value: str) -> str:
     """Single-quoted YAML scalar: always a string ('true' never a bool), with
     '' doubling for embedded quotes."""
     return "'" + value.replace("'", "''") + "'"
 
 
-def render_gitignore(db: str = DEFAULT_CI_DB) -> str:
-    """The store's ignore rule, derived from the configured working DB: its
-    name and sidecars are throwaway machine state (runs are stateless — the
-    committed artifact is the store) and must never be committed or confuse
-    the no-op landing check. Exact-name entries only: the artifact files
-    (.coding-stats/coding-stats.sql, report.html) can never be swallowed."""
-    name = PurePosixPath(db).name
-    entries = "\n".join(f"{name}{sfx}" for sfx in ("", "-wal", "-shm", "-journal"))
-    return (
-        "# coding-stats machine-local state — generated by `coding-stats ci init`.\n"
-        "# The working DB is throwaway: runs are stateless and the committed\n"
-        "# artifact (.coding-stats/coding-stats.sql) is the store.\n"
-        f"{entries}\n"
-    )
-
-
 def init(
     repo_dir: Path,
     branch: str,
-    db: str = DEFAULT_CI_DB,
-    push: bool = True,
+    report: bool = True,
     upgrade: bool = False,
-    tool_ref: str | None = None,
 ) -> list[str]:
-    """Write the workflow and store gitignore. Identical content is an
-    idempotent assertion ('up to date'); drifted content refuses with a diff
-    summary unless `upgrade` re-renders over it. Drift is preflighted across
-    ALL managed files before anything is written — a refusal never leaves a
-    half-installed scaffold."""
-    _validate_branch(branch)
-    _validate_db(db)
-    spec = install_spec(tool_ref=tool_ref)
-    if tool_ref is not None:
-        # refs travel inside a git+https URL fragment: same ref-name charset
-        # as branches, validated the same way
-        _validate_branch(tool_ref)
+    """Write the caller workflow. Identical content is an idempotent
+    assertion ('up to date'); drifted content refuses with a diff summary
+    unless `upgrade` re-renders over it. Drift is preflighted before
+    anything is written — a refusal never leaves a half-written file."""
+    datastore.validate_ref(branch)
     plan = [
-        (WORKFLOW_REL, render_workflow(branch, db, push, tool_spec=spec)),
-        (GITIGNORE_REL, render_gitignore(db)),
+        (WORKFLOW_REL, render_workflow(branch, report=report)),
     ]
     drifted = []
     for rel, content in plan:
@@ -241,22 +163,6 @@ def init(
         path.write_text(content, encoding="utf-8")
         out.append(f"{rel}: written")
     return out
-
-
-_INVALID_REF_RE = datastore._INVALID_REF_RE
-
-
-def _validate_branch(branch: str) -> None:
-    """Ref-name rules of git/GitHub (check-ref-format) — shared with the
-    Data-branch store (datastore.validate_ref)."""
-    datastore.validate_ref(branch)
-
-
-def _validate_db(db: str) -> None:
-    """The working DB must never collide with the artifact files the store
-    commits (.coding-stats/.gitignore is generated from this name)."""
-    if PurePosixPath(db).name in {"coding-stats.sql", "report.html"}:
-        raise ValueError(f"db path {db!r} collides with a committed artifact file")
 
 
 def report_landing(landing: Landing) -> None:

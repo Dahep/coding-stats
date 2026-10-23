@@ -126,8 +126,16 @@ def detect(
     if legacy_db is not None:
         db_key = _stored_db_key(legacy_db)
         if db_key is None:
-            raise MigrationError(f"legacy DB {legacy_db} has no repositories row")
-        if db_key != stored:
+            # no repositories row: an empty DB or a pre-step-1 legacy schema.
+            # The committed artifact is the authority either way — rebuild
+            # from it instead of aborting (a raw file copy of a live WAL DB
+            # can legitimately trail its rows).
+            notices.append(
+                f"ignoring {legacy_db}: no repositories row (empty or pre-step-1"
+                " legacy DB); rebuilding from the artifact"
+            )
+            legacy_db = None
+        elif db_key != stored:
             if explicit:
                 raise MigrationError(
                     f"legacy DB {legacy_db} is keyed {db_key!r} but the legacy artifact is"
@@ -171,7 +179,22 @@ def detect(
 
     if legacy_db is not None:
         relation = _horizon_relation(repo, legacy_db, header.covered_through)
-        if relation in ("equal", "db-ahead"):
+        if db_key is None:
+            # no repositories row: an empty DB or a pre-step-1 legacy schema.
+            # The key cannot be verified, so the DB is never REUSED — but the
+            # artifact stays authoritative and the horizon relation still
+            # tells the user where their DB stood.
+            notices.append(
+                f"ignoring {legacy_db} for reuse: no repositories row (empty or"
+                " pre-step-1 legacy DB)"
+            )
+            seed = "rebuild-artifact"
+            if relation == "artifact-ahead":
+                notices.append(
+                    f"the legacy artifact classifies ahead of {legacy_db}; seeding"
+                    " from the artifact so no verdicts are lost"
+                )
+        elif relation in ("equal", "db-ahead"):
             seed = "reuse-db"
         elif relation == "artifact-ahead":
             notices.append(
@@ -261,8 +284,7 @@ def _horizon_relation(repo: Path, legacy_db: Path, artifact_horizon: str) -> str
     horizon: 'equal' | 'db-ahead' | 'artifact-ahead' | 'diverged'. Both are
     target-branch commit shas; a git ancestry check decides which side holds
     the newer analysis."""
-    conn = sqlite3.connect(f"file:{legacy_db}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = _open_read_snapshot(legacy_db)
     try:
         db_horizon = artifact.covered_through(conn)
     finally:
@@ -312,11 +334,38 @@ def _default_dest() -> Path:
     return Path("coding-stats.db")
 
 
+def _open_read_snapshot(path: Path) -> sqlite3.Connection:
+    """A consistent in-memory read snapshot of a (legacy) SQLite DB.
+
+    A plain ``mode=ro`` open is NOT enough here: legacy DBs run in WAL
+    mode (persistent in the file header), and a read-only connection
+    cannot create the ``-shm``/``-wal`` sidecars when they are absent —
+    the open (or the first read) fails with an OperationalError that
+    looks like a missing table. A normal connection may create sidecars
+    (harmless: this file is machine-local state the migration owns), and
+    the backup API yields one consistent snapshot including WAL content."""
+    src = sqlite3.connect(path)
+    try:
+        snap = sqlite3.connect(":memory:")
+        try:
+            src.backup(snap)
+        except Exception:
+            snap.close()
+            raise
+    finally:
+        src.close()
+    snap.row_factory = sqlite3.Row
+    return snap
+
+
 def _stored_db_key(path: Path) -> str | None:
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = _open_read_snapshot(path)
     try:
         rows = conn.execute("SELECT repo_key FROM repositories").fetchall()
+    except sqlite3.OperationalError:
+        # a pre-step-1 legacy DB (the old tool's own schema) has no
+        # repositories table: no usable key — rebuild-from-artifact territory
+        return None
     finally:
         conn.close()
     if not rows:
@@ -429,7 +478,7 @@ def _atomic_copy(source: Path, db_path: Path) -> None:
     tmp_path = db_path.parent / (db_path.name + ".migrate-tmp")
     for suffix in ("", *_SIDECARS):
         Path(str(tmp_path) + suffix).unlink(missing_ok=True)
-    src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    src = _open_read_snapshot(source)
     try:
         dst = sqlite3.connect(tmp_path)
         try:

@@ -7,7 +7,7 @@ import sqlite3
 
 import pytest
 
-from coding_stats import artifact, datastore, db, gitwalk, identity
+from coding_stats import artifact, db, identity
 from coding_stats.cli import main
 from conftest import commit_files, run, store_dir
 from test_seeding import _mat_rows
@@ -69,9 +69,7 @@ def test_migration_moves_the_committed_store_to_the_data_branch(
     assert artifact.verify(art) is None
     ids = _mat_rows(art.read_text(encoding="utf-8"), "SELECT id FROM features")
     assert ids == [("repo@main-1",), ("repo@main-2",)]  # minted with the branch prefix
-    assert artifact.verify(repo_art := store_dir(repo, "main") / "coding-stats.sql") is None
     # the landing only pushed data-branch refs
-    assert datastore.remote_data_refs(repo) or True
     assert subprocess_head(repo) == target_head  # Target head untouched
     conn = sqlite3.connect(":memory:")
     conn.executescript(art.read_text(encoding="utf-8"))

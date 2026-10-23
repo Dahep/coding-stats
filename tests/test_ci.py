@@ -38,33 +38,46 @@ def _store_changes(repo):
     )
 
 
-def test_ci_init_writes_workflow_and_is_idempotent(repo):
+def test_ci_init_writes_caller_workflow_and_is_idempotent(repo):
+    import yaml
+
     ci.init(repo, "main")
     wf = repo / ".github" / "workflows" / "coding-stats.yml"
     text = wf.read_text(encoding="utf-8")
-    for needle in (
-        "paths-ignore",
-        ".coding-stats/**",
-        "fetch-depth: 0",
-        "contents: write",
-        "astral-sh/setup-uv",
-        "https://opencode.ai/install",
-        "OPENCODE_API_KEY",
-        "coding-stats update --db",
-        "coding-stats ci land --branch",
-        "schedule",  # cadence configurable in one obvious place
-    ):
-        assert needle in text
-    # reports render through Dahep/coding-stats/report@v1 (ADR-0006): the
-    # rendered update workflow carries no report/upload step
-    assert "upload-artifact" not in text
+    doc = yaml.safe_load(text)
+    on = doc.get("on", doc.get(True))  # PyYAML 1.1 reads bare `on` as bool
+    assert on["push"]["branches"] == ["main"]
+    jobs = doc["jobs"]
+    assert set(jobs) == {"update", "report"}
+    update = jobs["update"]
+    assert update["permissions"] == {"contents": "write"}  # the only write
+    assert update["concurrency"]["cancel-in-progress"] is False  # never kills a classifying run
+    uses = [step.get("uses", "") for step in update["steps"]]
+    assert "Dahep/coding-stats@v1" in uses  # one `uses:` step adoption
+    checkout = [s for s in update["steps"] if s.get("uses", "").startswith("actions/checkout")]
+    assert checkout[0]["with"]["fetch-depth"] == 0
+    assert "fetch-depth: 0" in text
+    report = jobs["report"]
+    # Pages permissions live in the report job only (ADR-0006 clause 5)
+    assert report["permissions"] == {"pages": "write", "id-token": "write"}
+    assert "Dahep/coding-stats/report@v1" in [
+        step.get("uses", "") for step in report["steps"]
+    ]
     assert "glm" not in text  # no model names: settings travel in the artifact
-    gi = repo / ".coding-stats" / ".gitignore"
-    assert "working.db" in gi.read_text(encoding="utf-8")  # throwaway DB never commits
 
     msgs = ci.init(repo, "main")  # idempotent assertion
     assert wf.read_text(encoding="utf-8") == text
     assert any("up to date" in m for m in msgs)
+
+
+def test_ci_init_no_report_omits_the_report_job(repo):
+    import yaml
+
+    ci.init(repo, "main", report=False)
+    doc = yaml.safe_load(
+        (repo / ".github" / "workflows" / "coding-stats.yml").read_text("utf-8")
+    )
+    assert set(doc["jobs"]) == {"update"}
 
 
 def test_ci_init_refuses_drift_unless_upgrade(repo):
@@ -77,20 +90,6 @@ def test_ci_init_refuses_drift_unless_upgrade(repo):
     assert "# hand edit" in wf.read_text(encoding="utf-8")  # refused: untouched
     ci.init(repo, "main", upgrade=True)
     assert "# hand edit" not in wf.read_text(encoding="utf-8")
-
-
-def test_ci_init_no_push_omits_landing_step(repo):
-    import yaml
-
-    ci.init(repo, "main", push=False)
-    doc = yaml.safe_load(
-        (repo / ".github" / "workflows" / "coding-stats.yml").read_text("utf-8")
-    )
-    runs = [step.get("run", "") for step in doc["jobs"]["coding-stats"]["steps"]]
-    assert not any("ci land" in run for run in runs)
-    assert "contents: write" not in (
-        repo / ".github" / "workflows" / "coding-stats.yml"
-    ).read_text("utf-8")  # nothing is written without the landing step
 
 
 def _newer_data_landing(tmp_path, bare, base) -> None:
@@ -296,25 +295,19 @@ def _pyproject_version() -> str:
 
 
 def test_render_workflow_is_injection_safe_for_hostile_values():
-    import re
-
     import yaml
 
     for branch in ("feature;id", "true", "café branch", "1.0"):
-        text = ci.render_workflow(branch, db=".coding-stats/my db.sql")
+        text = ci.render_workflow(branch)
         doc = yaml.safe_load(text)
         on = doc.get("on", doc.get(True))  # PyYAML 1.1 reads bare `on` as bool
         assert on["push"]["branches"] == [branch]  # clean strings: 'true' is not a bool
-        assert doc["env"]["CODING_STATS_BRANCH"] == branch
-        assert doc["env"]["CODING_STATS_DB"] == ".coding-stats/my db.sql"
-        for step in doc["jobs"]["coding-stats"]["steps"]:
-            run_line = step.get("run", "")
-            # parameters travel via env only: no user value ever lands in a
-            # run line (word-boundary check; '1.0' inside an unrelated
-            # constant like ==0.1.0 is not interpolation)
-            assert not re.search(rf"(?<![\w.-]){re.escape(branch)}(?![\w.-])", run_line)
-            assert ";id" not in run_line  # no injection surface in run: lines
-        assert '"$CODING_STATS_BRANCH"' in text and '"$CODING_STATS_DB"' in text
+        # the branch name only ever appears as the quoted YAML scalar — the
+        # caller workflow has no run: lines and no env interpolation
+        for job in doc["jobs"].values():
+            for step in job["steps"]:
+                assert branch not in step.get("run", "")
+                assert ";id" not in step.get("run", "")
 
 
 def test_ci_init_validates_branch_ref_name(repo):
@@ -326,47 +319,3 @@ def test_ci_init_validates_branch_ref_name(repo):
     doc = yaml.safe_load((repo / ".github" / "workflows" / "coding-stats.yml").read_text("utf-8"))
     on = doc.get("on", doc.get(True))
     assert on["push"]["branches"] == ["feature;id"]
-
-
-def test_ci_workflow_installs_tool_standalone(repo):
-    ci.init(repo, "main")
-    text = (repo / ".github" / "workflows" / "coding-stats.yml").read_text("utf-8")
-    sha = ci.own_commit()
-    spec = ci.install_spec(tool_ref=sha)
-    # the target repo does not depend on coding-stats: install the tool
-    # standalone, pinned to the rendering checkout's commit (not PyPI — the
-    # package is not published; git install keeps upgrades re-render
-    # testable) — from bigger repos, --tool-ref moves the pin explicitly
-    assert f"uv tool install '{spec}'" in text
-    if sha:
-        assert sha in text
-    assert "uv sync" not in text  # no target-dependency assumption
-    assert "uv run coding-stats" not in text
-    assert "coding-stats update --db" in text  # direct invocation
-    # installer is best-effort: a failed download must not abort the run
-    assert "continue-on-error: true" in text
-
-
-def test_ci_init_drift_preflight_is_all_or_nothing(repo):
-    gi = repo / ".coding-stats" / ".gitignore"
-    gi.parent.mkdir(parents=True, exist_ok=True)
-    gi.write_text("# hand edited\n", encoding="utf-8")  # drifted store gitignore
-    with pytest.raises(ci.DriftError, match="--upgrade"):
-        ci.init(repo, "main")  # workflow is missing but must NOT be half-written
-    assert not (repo / ".github" / "workflows" / "coding-stats.yml").exists()
-    assert gi.read_text(encoding="utf-8") == "# hand edited\n"
-
-
-def test_ci_init_custom_db_gitignore_covers_sidecars(repo):
-    ci.init(repo, "main", db=".coding-stats/ci state.db")
-    gi = (repo / ".coding-stats" / ".gitignore").read_text(encoding="utf-8")
-    for entry in (
-        "ci state.db\n",
-        "ci state.db-wal\n",
-        "ci state.db-shm\n",
-        "ci state.db-journal\n",
-    ):
-        assert entry in gi  # computed from the configured db, not hardcoded
-    # and the gitignore can never swallow the artifact files themselves
-    with pytest.raises(ValueError, match="coding-stats.sql"):
-        ci.init(repo, "main", db=".coding-stats/coding-stats.sql", upgrade=True)
