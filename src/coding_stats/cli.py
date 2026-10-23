@@ -415,6 +415,14 @@ def _run_update(
     print(f"walked {n} new commits")
 
     if not args.no_classify:
+        from .seeding import seed_from_siblings
+
+        if not legacy_store:
+            seed = seed_from_siblings(conn, repo_dir, store.data_branch)
+            if seed.seeded:
+                print(f"seeded {seed.seeded} commits from {', '.join(seed.sources)}")
+
+    if not args.no_classify:
         pending_before = _pending_count(conn)
         try:
             SESSION_DIR.mkdir(parents=True, exist_ok=True)
