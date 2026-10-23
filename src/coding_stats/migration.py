@@ -477,3 +477,57 @@ def init_ci(repo: Path, branch: str, upgrade: bool = False) -> list[str]:
     from . import ci  # late import keeps module-level deps flat
 
     return ci.init(repo, branch, upgrade=upgrade)
+
+
+def migrate_to_data_branch(
+    repo: Path, target: str | None = None, remote: str = "origin"
+) -> list[str]:
+    """ADR-0006 clause 6 (ticket #26): move a repo from the ADR-0003 layout
+    (a committed .coding-stats/ store on the Target branch) onto its orphan
+    Data branch. Verifies first (refusing damage), re-prefixes the ids, and
+    pushes ONLY refs/heads/coding-stats/<target>; the Target branch itself
+    never receives a commit. Idempotent: a Data branch already holding a
+    verifying, branch-carrying artifact reports 'already migrated'."""
+    from . import ci, datastore, gitwalk, identity  # late imports (module cycle)
+
+    branch = target or gitwalk.current_branch(repo)
+    legacy = repo / ".coding-stats" / "coding-stats.sql"
+    out: list[str] = []
+    if datastore.remote_data_refs(repo, remote).get(datastore.data_branch(branch)):
+        return ["already migrated"]
+
+    if not legacy.exists():
+        return ["nothing to migrate (no committed .coding-stats/ on this Target)"]
+    err = artifact.verify(legacy)
+    if err is not None:
+        raise MigrationError(
+            f"the committed .coding-stats/ artifact does not verify ({err}); nothing migrated"
+        )
+    out.append("committed artifact: digest ok")
+    # re-prefix in memory: the ids upgrade to the {repo}@{branch} form
+    rows = sqlite3.connect(":memory:")
+    rows.row_factory = sqlite3.Row
+    try:
+        artifact.materialize(rows, legacy.read_bytes())
+        plain = identity.resolved_identity(repo)[1]
+        identity.reprefix_features(rows, identity.repo_slug(plain, branch))
+    finally:
+        data = artifact.serialize(rows)
+        rows.close()
+    out.append("ids re-prefixed to {repo}@{branch}")
+
+    store = datastore.prepare(repo, branch)
+    art = store.worktree / ".coding-stats" / "coding-stats.sql"
+    art.parent.mkdir(parents=True, exist_ok=True)
+    art.write_bytes(data)
+    landing = ci.land(store, repo, remote)
+    out.append(f"coding-stats landing: {landing.status} — {landing.detail}")
+    out.append(
+        "removal is a normal PR (migration never pushes to the Target branch): next steps\n"
+        "  git checkout <target>\n"
+        "  git rm -r .coding-stats\n"
+        "  rm .github/workflows/coding-stats.yml   # regenerate via ci init's slim call\n"
+        "  git commit -m 'drop the in-branch stats store (moved to the Data branch)'\n"
+        "  git push origin <target>"
+    )
+    return out

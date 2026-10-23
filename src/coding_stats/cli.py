@@ -136,7 +136,12 @@ def main(argv: list[str] | None = None) -> None:
         "--ci", action="store_true", help="also write the coding-stats CI scaffold (ci init)"
     )
     mig.add_argument("--dry-run", action="store_true", help="print the plan, change nothing")
-
+    mig.add_argument(
+        "--data-branch",
+        action="store_true",
+        help="ADR-0006 clause 6: move the committed .coding-stats/ store onto the"
+        " orphan Data branch (instead of the legacy skill-stats migration)",
+    )
     args = parser.parse_args(argv)
 
     settings: dict[str, Any] = {}
@@ -211,6 +216,14 @@ def main(argv: list[str] | None = None) -> None:
         if identity.toplevel(repo) is None:
             sys.exit(f"not a git repo: {repo}")
         branch = args.branch or gitwalk.current_branch(repo) or "main"
+        if args.data_branch:
+            # ADR-0006 clause 6: committed ADR-0003 store → the Data branch
+            try:
+                for line in migration.migrate_to_data_branch(repo, branch):
+                    print(line)
+            except migration.MigrationError as exc:
+                sys.exit(f"error: {exc}")
+            return
         try:
             plan = migration.detect(repo, args.db, args.legacy_db, args.fresh, branch)
         except migration.MigrationError as exc:

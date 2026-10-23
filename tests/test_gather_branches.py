@@ -164,7 +164,6 @@ def _crafted(path: str | None, cleanup_winner: bool = False, fix: bool = False):
           VALUES (3, 'eq@later-1', NULL);
         """
         )
-    cleanup_winner = cleanup_winner
     if cleanup_winner:
         # the winner (earliest) emits no features: its唯一 attribution set empty
         conn.executescript(
