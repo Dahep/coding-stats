@@ -584,11 +584,21 @@ def migrate_to_data_branch(
             " re-run migrate)"
         )
         return out
+    # the old-rendered scaffold goes WITH the store; an actions-based caller
+    # workflow (already the adopter shape) stays untouched
+    old = repo / ci.WORKFLOW_REL
+    is_old_scaffold = old.exists() and "uv tool install" in old.read_text(encoding="utf-8")
+    scaffold_line = (
+        "  rm .github/workflows/coding-stats.yml  # the old rendered scaffold;"
+        " regenerate with 'coding-stats ci init'\n"
+        if is_old_scaffold
+        else ""
+    )
     out.append(
         "removal is a normal PR (migration never pushes to the Target branch): next steps\n"
         "  git checkout <target>\n"
         "  git rm -r .coding-stats\n"
-        "  rm .github/workflows/coding-stats.yml   # regenerate via ci init's slim call\n"
+        f"{scaffold_line}"
         "  git commit -m 'drop the in-branch stats store (moved to the Data branch)'\n"
         "  git push origin <target>"
     )
