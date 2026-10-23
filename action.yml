@@ -57,8 +57,6 @@ inputs:
     description: "Debug pass-through to update --no-lineage: skip the lineage closure."
     required: false
     default: "false"
-    required: false
-    default: "false"
 
 outputs:
   data-branch:

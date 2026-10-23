@@ -316,16 +316,20 @@ def test_ci_land_parents_previous_data_tip_and_survives_target_movement(repo, tm
     assert second != first
 
 
-def test_dogfood_workflow_is_the_generated_caller_workflow():
+def test_ci_dogfood_workflow_is_the_generated_caller_workflow():
     """This repo adopts like any other caller: the committed workflow is
     `ci init`'s render, with only this repo's per-repo opt-in (Pages)
-    flipped on — the actions ref is the same public `@v1`, never `./`."""
+    flipped on — the actions ref is the same public `@v1`, never `./`.
+    Structural equality (modulo the one flipped input): rewording ci.py's
+    comments can never break the adopter/caller parity."""
+    import yaml
+
     committed = Path(__file__).parents[1] / ".github" / "workflows" / "coding-stats.yml"
-    got = committed.read_text(encoding="utf-8")
-    generated = ci.render_workflow("main")
-    # the one per-repo opt-in (Pages), normalized away for the byte-compare
-    pages_flipped = 'deploy-pages: "true"  # this repo\'s per-repo opt-in (publishes the report)'
-    not_flipped = 'deploy-pages: "false"  # flip to "true" to publish to GitHub Pages'
-    assert got.replace(pages_flipped, not_flipped) == generated
-    assert "uses: Dahep/coding-stats@v1" in got
-    assert "uses: Dahep/coding-stats/report@v1" in got
+    got = yaml.safe_load(committed.read_text(encoding="utf-8"))
+    on = got.get("on", got.get(True))  # PyYAML 1.1 reads bare `on` as bool
+    assert on["push"]["branches"] == ["main"]
+    rendered = yaml.safe_load(ci.render_workflow("main"))
+    # normalize the single per-repo opt-in on BOTH sides, then compare whole
+    for doc in (got, rendered):
+        doc["jobs"]["report"]["steps"][-1]["with"]["deploy-pages"] = "normalized"
+    assert got == rendered

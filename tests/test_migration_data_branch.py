@@ -114,82 +114,44 @@ def test_migration_prints_removal_pr_steps(tmp_path, repo, capsys, monkeypatch):
     _committed_store(repo, ['{"k":"new","title":"o","about":"","why":"y"}'])
     main(["migrate", str(repo), "--data-branch"])
     out = capsys.readouterr().out
-    assert "git rm -r .coding-stats" in out or ".github/workflows" in out
+    assert "git rm -r .coding-stats" in out
+    assert "git rm -r .github/workflows" not in out  # no workflow: nothing else to remove
 
 
-def test_migration_prints_the_scaffold_removal_only_for_the_old_workflow(tmp_path, repo, capsys):
-    """The actions-based caller workflow stays: the printed removal steps
-    carry the scaffold's rm line only when the old rendered workflow
-    (uv tool install) sits on the Target branch."""
-    from coding_stats import gitwalk as _gw
-    from coding_stats import identity as _id
-    from coding_stats.classify import create_feature
+def test_migration_never_offers_to_remove_an_actions_based_workflow(tmp_path, repo, capsys):
+    """The PR's declared guarantee pinned: an ACTIONS-BASED caller workflow
+    (the shape every adopter writes) is never offered for deletion — the
+    detection reads the Target branch's COMMITTED workflow (so the fixture
+    commits what it writes)."""
+    from coding_stats.ci import render_workflow
 
     commit_files(repo, "one", {"a.txt": "a\n"})
-
-    def committed_store():
-        conn = db.connect(str(repo.parent / "m.db"))
-        _id.register_repository(conn, repo, "main")
-        _gw.walk(repo, conn, "main")
-        for c in conn.execute("SELECT id FROM commits").fetchall():
-            fid = create_feature(conn, 1, "f", "", "2026-01-01T00:00:00Z")
-            conn.execute(
-                "INSERT INTO commits_features (commit_id, feature_id, role)"
-                " VALUES (?, ?, 'defines')",
-                (c["id"], fid),
-            )
-            conn.execute(
-                "INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output,"
-                " model, classified_at) VALUES (?, 'feature', 'x', '{}', 'm', datetime('now'))",
-                (c["id"],),
-            )
-        store = repo / ".coding-stats"
-        store.mkdir(parents=True, exist_ok=True)
-        (store / "coding-stats.sql").write_bytes(artifact.serialize(conn))
-        conn.close()
-        run(repo, "add", "-A", "--", ".coding-stats")
-        run(repo, "commit", "-m", "coding-stats artifact update (auto)")
-
-    committed_store()
+    (repo / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+    (repo / ".github" / "workflows" / "coding-stats.yml").write_text(
+        render_workflow("main"), encoding="utf-8"
+    )
+    run(repo, "add", "-A", "--", ".github")
+    run(repo, "commit", "-m", "adopter workflow")
+    _committed_store(repo, [])
     main(["migrate", str(repo), "--data-branch"])
     out = capsys.readouterr().out
     assert "git rm -r .coding-stats" in out
-    assert "rm .github/workflows" not in out  # no workflow present: nothing to remove
+    assert ".github/workflows" not in out.split("next steps", 1)[1]
 
 
 def test_migration_offers_to_remove_the_old_rendered_scaffold(tmp_path, repo, capsys):
     """The old rendered scaffold (uv tool install) goes WITH the store: its
-    rm line appears in the printed steps."""
-    from coding_stats import gitwalk as _gw
-    from coding_stats import identity as _id
-    from coding_stats.classify import create_feature
-
+    git-rm line appears — staged, so the printed list is safe to run
+    verbatim."""
     commit_files(repo, "one", {"a.txt": "a\n"})
-    conn = db.connect(str(repo.parent / "m.db"))
-    _id.register_repository(conn, repo, "main")
-    _gw.walk(repo, conn, "main")
-    for c in conn.execute("SELECT id FROM commits").fetchall():
-        fid = create_feature(conn, 1, "f", "", "2026-01-01T00:00:00Z")
-        conn.execute(
-            "INSERT INTO commits_features (commit_id, feature_id, role) VALUES (?, ?, 'defines')",
-            (c["id"], fid),
-        )
-        conn.execute(
-            "INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output,"
-            " model, classified_at) VALUES (?, 'feature', 'x', '{}', 'm', datetime('now'))",
-            (c["id"],),
-        )
-    store = repo / ".coding-stats"
-    store.mkdir(parents=True, exist_ok=True)
-    (store / "coding-stats.sql").write_bytes(artifact.serialize(conn))
-    conn.close()
-    run(repo, "add", "-A", "--", ".coding-stats")
-    run(repo, "commit", "-m", "coding-stats artifact update (auto)")
     (repo / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
     (repo / ".github" / "workflows" / "coding-stats.yml").write_text(
         "# rendered scaffold\n- run: uv tool install 'coding-stats @ git+x'\n",
         encoding="utf-8",
     )
+    run(repo, "add", "-A", "--", ".github")
+    run(repo, "commit", "-m", "old scaffold")
+    _committed_store(repo, [])
     main(["migrate", str(repo), "--data-branch"])
     out = capsys.readouterr().out
-    assert "rm .github/workflows/coding-stats.yml" in out
+    assert "git rm -r .github/workflows/coding-stats.yml" in out
