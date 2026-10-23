@@ -81,7 +81,6 @@ def main(argv: list[str] | None = None) -> None:
     up.add_argument("--no-classify", action="store_true", help="skip LLM classification")
     up.add_argument("--no-detect", action="store_true", help="skip blame-based fix detection")
     up.add_argument("--no-lineage", action="store_true", help="skip lineage closure")
-    up.add_argument("--no-report", action="store_true", help="skip report.html regeneration")
     up.add_argument("--no-serialize", action="store_true", help="skip artifact write")
 
     ci_grp = sub.add_parser("ci", help="CI scaffold: workflow rendering + artifact landing")
@@ -148,6 +147,8 @@ def main(argv: list[str] | None = None) -> None:
         db_path = new_db(args.db, args)
         conn = db.connect(db_path)
         branch = args.branch or gitwalk.current_branch(repo)
+        if branch == "HEAD":
+            sys.exit("detached HEAD: pass --branch <target> explicitly")
         identity.register_repository(conn, repo, branch)  # writes repositories row + repo_id
         cfg = {
             "repo": str(repo),
@@ -168,6 +169,11 @@ def main(argv: list[str] | None = None) -> None:
         if top is None:
             sys.exit("not inside a git repository")
         branch = args.branch or gitwalk.current_branch(top)
+        if branch == "HEAD":
+            sys.exit(
+                "detached HEAD: pass --branch <target> explicitly"
+                " (a detached checkout names no Target branch)"
+            )
         if args.ci_cmd == "init":
             try:
                 for msg in ci.init(
@@ -210,6 +216,8 @@ def main(argv: list[str] | None = None) -> None:
         if identity.toplevel(repo) is None:
             sys.exit(f"not a git repo: {repo}")
         branch = args.branch or gitwalk.current_branch(repo) or "main"
+        if branch == "HEAD":
+            sys.exit("detached HEAD: pass --branch <target> explicitly")
         if args.data_branch:
             # ADR-0006 clause 6: committed ADR-0003 store → the Data branch
             try:
@@ -364,7 +372,7 @@ def _run_update(
             store = datastore.prepare(repo_dir, branch)
         except datastore.StoreSkip as exc:
             print(f"::notice::coding-stats update skipped: {exc}")
-            ci.step_summary(f"### coding-stats update skipped: {exc}")
+            ci.step_summary(f"coding-stats update skipped: {exc}")
             print("update skipped; nothing was walked, classified, or landed")
             return conn
         store_dir = store.worktree
@@ -420,14 +428,12 @@ def _run_update(
     print(f"walked {n} new commits")
 
     if not args.no_classify:
-        from .seeding import seed_from_siblings
-
         if not legacy_store:
+            from .seeding import seed_from_siblings
+
             seed = seed_from_siblings(conn, repo_dir, store.data_branch)
             if seed.seeded:
                 print(f"seeded {seed.seeded} commits from {', '.join(seed.sources)}")
-
-    if not args.no_classify:
         pending_before = _pending_count(conn)
         try:
             SESSION_DIR.mkdir(parents=True, exist_ok=True)
@@ -468,7 +474,7 @@ def _run_update(
     )
 
     if not args.no_serialize:
-        path = artifact.write(conn, store_dir, with_report=False)
+        path = artifact.write(conn, store_dir)
         err = artifact.verify(path)
         print(f"wrote {path} (digest {'ok' if err is None else 'MISMATCH ' + str(err)})")
         if recovered:

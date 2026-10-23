@@ -45,7 +45,7 @@ def _updated_repo(tmp_path) -> Path:
         "coding_stats.cli.Session",
         lambda model, sid=None: Scripted(['{"k":"new","title":"one","about":"x","why":"y"}']),
     ):
-        main(["update", "--db", db_path, "--no-detect", "--no-lineage", "--no-report"])
+        main(["update", "--db", db_path, "--no-detect", "--no-lineage"])
     return repo
 
 

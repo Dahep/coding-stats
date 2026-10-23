@@ -28,20 +28,28 @@ Single-repo DBs pass through unchanged (org rules never fire).
 
 import sqlite3
 
+from . import identity
+
+_PROJECTED_MARK = "_org_projected"
+
 
 def org(conn: sqlite3.Connection) -> sqlite3.Connection:
     """The union-wide dedup projection for reads; pass-through for a
-    single-repository DB."""
+    single-repository DB. Idempotent per connection: a projected DB carries
+    the marker table, so metric code can call org() freely without
+    re-projecting (the projection is a fresh in-memory DB every time
+    otherwise)."""
     n = conn.execute("SELECT COUNT(*) c FROM repositories").fetchone()["c"]
     if n <= 1:
+        return conn
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (_PROJECTED_MARK,)
+    ).fetchone():
         return conn
     return _project(conn)
 
 
-def _base(key: str) -> str:
-    """The URL part of a Repository key (the branch is after the last @;
-    slugs can never contain @)."""
-    return key.rsplit("@", 1)[0]
+_base = identity.key_base
 
 
 def _project(conn: sqlite3.Connection) -> sqlite3.Connection:
@@ -61,6 +69,29 @@ def _project(conn: sqlite3.Connection) -> sqlite3.Connection:
     _purge_orphaned_features(out)
     for r in conn.execute("SELECT key, value FROM settings ORDER BY key"):
         out.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (r["key"], r["value"]))
+    # gather's provenance/completeness table travels too: the least-complete
+    # sampling rule reads it on the projection exactly as on the union
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'union_artifacts'"
+    ).fetchone():
+        out.execute(
+            """CREATE TABLE union_artifacts (
+                   repo_key TEXT PRIMARY KEY,
+                   artifact_sha256 TEXT NOT NULL,
+                   covered_through TEXT NOT NULL,
+                   backfill_state TEXT NOT NULL,
+                   unattributed_lines INTEGER NOT NULL,
+                   model TEXT NOT NULL,
+                   min_target_lines INTEGER NOT NULL,
+                   source_path TEXT NOT NULL
+               )"""
+        )
+        for r in conn.execute("SELECT * FROM union_artifacts ORDER BY repo_key"):
+            out.execute(
+                "INSERT INTO union_artifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                tuple(r),
+            )
+    out.execute(f"CREATE TABLE {_PROJECTED_MARK} (ok)")
     out.commit()
     return out
 
@@ -249,6 +280,19 @@ def _copy_links(
                 str(r["feature_id"]),
                 commit_map[int(via)] if via is not None else None,
             ),
+        )
+    # Sample rows have no repo dimension either: a seeded id's (id, sha) row
+    # is ONE union row. Keys may disagree on the value; rows read in
+    # (feature_id, at_commit_sha, live_lines) order make the lowest value
+    # the deterministic winner of the IGNORE.
+    for r in conn.execute(
+        """SELECT feature_id, at_commit_sha, live_lines FROM feature_line_samples
+           ORDER BY feature_id, at_commit_sha, live_lines"""
+    ):
+        out.execute(
+            "INSERT OR IGNORE INTO feature_line_samples (feature_id, at_commit_sha, live_lines)"
+            " VALUES (?, ?, ?)",
+            (str(r["feature_id"]), str(r["at_commit_sha"]), int(r["live_lines"])),
         )
 
 

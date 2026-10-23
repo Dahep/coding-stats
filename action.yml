@@ -57,8 +57,6 @@ inputs:
     description: "Debug pass-through to update --no-lineage: skip the lineage closure."
     required: false
     default: "false"
-  no-report:
-    description: "Debug pass-through to update --no-report: skip report.html regeneration."
     required: false
     default: "false"
 
@@ -116,7 +114,6 @@ runs:
         CODING_STATS_SKIP_CLASSIFY: "${{ inputs.no-classify }}"
         CODING_STATS_SKIP_DETECT: "${{ inputs.no-detect }}"
         CODING_STATS_SKIP_LINEAGE: "${{ inputs.no-lineage }}"
-        CODING_STATS_SKIP_REPORT: "${{ inputs.no-report }}"
         OPENCODE_API_KEY: "${{ inputs.opencode-api-key }}"
         OPENROUTER_API_KEY: "${{ inputs.openrouter-api-key }}"
       run: |
@@ -127,7 +124,6 @@ runs:
         if [ "$CODING_STATS_SKIP_CLASSIFY" = "true" ]; then flags+=(--no-classify); fi
         if [ "$CODING_STATS_SKIP_DETECT" = "true" ]; then flags+=(--no-detect); fi
         if [ "$CODING_STATS_SKIP_LINEAGE" = "true" ]; then flags+=(--no-lineage); fi
-        if [ "$CODING_STATS_SKIP_REPORT" = "true" ]; then flags+=(--no-report); fi
         uv run --project "$GITHUB_ACTION_PATH" coding-stats update --db "$db" "${flags[@]}"
 
     # Landing rules live in `ci land` (engine-tested): no-op pushes nothing,

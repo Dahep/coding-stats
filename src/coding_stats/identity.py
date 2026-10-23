@@ -91,6 +91,13 @@ def branch_slug(branch: str) -> str:
     return _slug(branch) or "branch"
 
 
+def key_base(key: str) -> str:
+    """The Repository key's URL part (the branch trails the last '@'; '@'
+    is outside the slug alphabet, so the split is unambiguous for slugged
+    branch names)."""
+    return key.rsplit("@", 1)[0]
+
+
 def repo_slug(plain: str, branch: str | None) -> str:
     """The repositories row's slug: the ``{repo}@{branch}`` form (ADR-0006
     clause 2) — one row still corresponds to one Repository key (URL +

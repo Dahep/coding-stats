@@ -28,7 +28,7 @@ from pathlib import Path
 
 from . import artifact, datastore, db, gitwalk, identity
 
-STORE_PATH = ".coding-stats/coding-stats.sql"
+STORE_PATH = datastore.STORE_TREE
 
 # machine-local + user config survive a rebuild; derived measurement state
 # never does (it is re-derived, or travels with the artifact's own rows)

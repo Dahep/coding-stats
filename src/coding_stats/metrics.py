@@ -101,7 +101,9 @@ def fixes_rolling(
     fixes reach through the fixes_features lineage closure — a feature counts
     once however many fixes touch it. Dates are normalized by SQLite
     (strftime) so month buckets and windows share one timezone convention.
-    The last sample is always placed at the latest commit date."""
+    The last sample is always placed at the latest commit date. Org-level:
+    Shared commits count once (the projection dedups them)."""
+    conn = org(conn)
     end_s = conn.execute(
         "SELECT MAX(strftime('%Y-%m-%d', committed_at)) d FROM commits"
     ).fetchone()["d"]

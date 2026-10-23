@@ -11,16 +11,16 @@ import pytest
 from coding_stats import artifact, ci, datastore, db, identity
 from coding_stats.cli import main
 from coding_stats.metrics import feature_ranking, snapshot
-from conftest import commit_files, run, store_worktree
-from test_seeding import Scripted, _bare, _with_remote
+from conftest import bare_remote, commit_files, run, store_worktree, with_remote
+from test_seeding import Scripted
 
 
 def test_gather_two_data_branches_of_same_repo(tmp_path, repo, capsys, monkeypatch):
     """No refusal for two Target branches; seed-copied ids stay verbatim; the
     org totals count a Shared sha and a duplicated feature id once."""
     commit_files(repo, "shared feature", {"s.txt": "s1\ns2\n"})
-    bare = _bare(tmp_path)
-    _with_remote(repo, bare)
+    bare = bare_remote(tmp_path)
+    with_remote(repo, bare)
     db1 = str(tmp_path / "main.db")
     main(["init", str(repo), "--db", db1])
     monkeypatch.setattr(
@@ -66,8 +66,8 @@ def test_regather_one_key_keeps_the_others_rows(tmp_path, repo, capsys, monkeypa
     """Re-gathering of one key must never delete another key's rows for a
     shared (seeded) feature id or its commits."""
     commit_files(repo, "shared feature", {"s.txt": "s1\n"})
-    bare = _bare(tmp_path)
-    _with_remote(repo, bare)
+    bare = bare_remote(tmp_path)
+    with_remote(repo, bare)
     db1 = str(tmp_path / "main.db")
     main(["init", str(repo), "--db", db1])
     monkeypatch.setattr(
@@ -169,7 +169,8 @@ def _crafted(path: str | None, cleanup_winner: bool = False, fix: bool = False):
         """
         )
     if cleanup_winner:
-        # the winner (earliest) emits no features: its唯一 attribution set empty
+        # the winner (earliest) is a cleanup verdict: it defines no feature,
+        # so its attribution set for the shared sha is empty
         conn.executescript(
             """
         INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output,
@@ -283,8 +284,8 @@ def test_drifted_defining_sha_gathers_loudly(tmp_path, repo, capsys):
     """The same id defined by different shas across two of the repo's
     artifacts: a gather error naming BOTH keys — never a silent merge."""
     commit_files(repo, "base", {"a.txt": "a\n"})
-    bare = _bare(tmp_path)
-    _with_remote(repo, bare)
+    bare = bare_remote(tmp_path)
+    with_remote(repo, bare)
     _drifted_artifact(tmp_path, repo, "b1", "repo@x-1", "x40")
     _drifted_artifact(tmp_path, repo, "b2", "repo@x-1", "y40")
     union = str(tmp_path / "union.db")
@@ -302,8 +303,8 @@ def test_gather_unmounted_data_branch_refs(tmp_path, repo, capsys, monkeypatch):
     """Sources with UNMOUNTED data branches (refs fetched, no store on
     disk) — gather reads the artifacts straight out of the refs."""
     commit_files(repo, "shared feature", {"s.txt": "s1\n"})
-    bare = _bare(tmp_path)
-    _with_remote(repo, bare)
+    bare = bare_remote(tmp_path)
+    with_remote(repo, bare)
     db1 = str(tmp_path / "main.db")
     main(["init", str(repo), "--db", db1])
     monkeypatch.setattr(

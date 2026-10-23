@@ -2,30 +2,11 @@
 (ci land) — local bare remotes, no GH API."""
 
 import subprocess
-from pathlib import Path
 
 import pytest
 
 from coding_stats import ci, datastore
-from conftest import commit_files, run, store_worktree
-
-
-def _git(repo, *args) -> str:
-    return subprocess.run(
-        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
-    ).stdout
-
-
-def _bare(tmp_path) -> str:
-    path = tmp_path / "remote.git"
-    subprocess.run(["git", "init", "--bare", "-q", str(path)], check=True)
-    return str(path)
-
-
-def _with_remote(repo, bare) -> None:
-    run(repo, "remote", "add", "origin", bare)
-    run(repo, "push", "-q", "-u", "origin", "main")
-    _git(bare, "symbolic-ref", "HEAD", "refs/heads/main")
+from conftest import bare_remote, commit_files, git_out, run, store_worktree, with_remote
 
 
 def _store_changes(repo):
@@ -58,8 +39,14 @@ def test_ci_init_writes_caller_workflow_and_is_idempotent(repo):
     assert checkout[0]["with"]["fetch-depth"] == 0
     assert "fetch-depth: 0" in text
     report = jobs["report"]
-    # Pages permissions live in the report job only (ADR-0006 clause 5)
-    assert report["permissions"] == {"pages": "write", "id-token": "write"}
+    # Pages permissions live in the report job only (ADR-0006 clause 5);
+    # checkout/fetch need contents: read (job-level permissions deny the rest)
+    assert report["permissions"] == {
+        "contents": "read",
+        "pages": "write",
+        "id-token": "write",
+    }
+    assert report["steps"][-1]["with"]["deploy-pages"] == "false"  # Pages stays opt-in
     assert "Dahep/coding-stats/report@v1" in [step.get("uses", "") for step in report["steps"]]
     assert "glm" not in text  # no model names: settings travel in the artifact
 
@@ -104,7 +91,7 @@ def _newer_data_landing(tmp_path, bare, base) -> None:
 
 
 def _branch_tip(git_dir, branch) -> str:
-    return _git(git_dir, "rev-parse", "refs/heads/" + branch).strip()
+    return git_out(git_dir, "rev-parse", "refs/heads/" + branch).strip()
 
 
 def _branch_exists(git_dir, branch) -> bool:
@@ -117,42 +104,43 @@ def _branch_exists(git_dir, branch) -> bool:
 
 def test_ci_land_noop_without_store_changes(repo, tmp_path):
     commit_files(repo, "base", {"a.txt": "a\n"})
-    _with_remote(repo, _bare(tmp_path))
+    with_remote(repo, bare_remote(tmp_path))
     store = datastore.prepare(repo, "main")
-    before = _git(repo, "rev-parse", "HEAD").strip()
+    before = git_out(repo, "rev-parse", "HEAD").strip()
     assert ci.land(store, repo, "origin").status == "noop"
-    assert _git(repo, "rev-parse", "HEAD").strip() == before  # Target untouched
-    assert not _branch_exists(_bare(tmp_path), "coding-stats/main")  # nothing pushed
+    assert git_out(repo, "rev-parse", "HEAD").strip() == before  # Target untouched
+    assert not _branch_exists(bare_remote(tmp_path), "coding-stats/main")  # nothing pushed
 
 
 def test_ci_land_commits_and_pushes(repo, tmp_path):
     commit_files(repo, "base", {"a.txt": "a\n"})
-    bare = _bare(tmp_path)
-    _with_remote(repo, bare)
-    target_before = _git(bare, "rev-parse", "refs/heads/main").strip()
-    _git(bare, "update-ref", "refs/heads/other", target_before)
-    other_before = _git(bare, "rev-parse", "refs/heads/other").strip()
+    bare = bare_remote(tmp_path)
+    with_remote(repo, bare)
+    target_before = git_out(bare, "rev-parse", "refs/heads/main").strip()
+    git_out(bare, "update-ref", "refs/heads/other", target_before)
+    other_before = git_out(bare, "rev-parse", "refs/heads/other").strip()
     store = datastore.prepare(repo, "main")
     _store_changes(repo)
 
     assert ci.land(store, repo, "origin").status == "landed"
     assert (
-        _git(store.worktree, "log", "-1", "--format=%an|%ae|%s").strip()
+        git_out(store.worktree, "log", "-1", "--format=%an|%ae|%s").strip()
         == "coding-stats[bot]|coding-stats[bot]@users.noreply.github.com"
         "|coding-stats artifact update (auto)"
     )
-    head = _git(store.worktree, "rev-parse", "HEAD").strip()
+    head = git_out(store.worktree, "rev-parse", "HEAD").strip()
     assert _branch_tip(bare, "coding-stats/main") == head  # pushed to the Data branch
     with pytest.raises(subprocess.CalledProcessError):
-        _git(store.worktree, "rev-parse", "HEAD^")  # first commit: no parent (orphan root)
-    assert _git(bare, "rev-parse", "refs/heads/main").strip() == target_before  # Target never moved
-    assert _git(bare, "rev-parse", "refs/heads/other").strip() == other_before
+        git_out(store.worktree, "rev-parse", "HEAD^")  # first commit: no parent (orphan root)
+    main_tip = git_out(bare, "rev-parse", "refs/heads/main").strip()
+    assert main_tip == target_before  # the Target branch never moved
+    assert git_out(bare, "rev-parse", "refs/heads/other").strip() == other_before
 
 
 def test_ci_land_abandons_when_newer_data_push_landed(repo, tmp_path, capsys):
     commit_files(repo, "base", {"a.txt": "a\n"})
-    bare = _bare(tmp_path)
-    _with_remote(repo, bare)
+    bare = bare_remote(tmp_path)
+    with_remote(repo, bare)
     store = datastore.prepare(repo, "main")
     _store_changes(repo)
     # first: our own run lands (an orphan tip exists on the remote now)
@@ -171,7 +159,7 @@ def test_ci_land_abandons_when_newer_data_push_landed(repo, tmp_path, capsys):
     assert "::notice::" in out  # neutral annotation: never a red run (Q18)
     assert _branch_tip(bare, "coding-stats/main") == tip  # nothing pushed
     # the abandoned run did not add a second artifact-update commit
-    log = _git(store.worktree, "log", "--format=%s")
+    log = git_out(store.worktree, "log", "--format=%s")
     assert log.count("coding-stats artifact update (auto)") == 1
 
 
@@ -180,8 +168,8 @@ def test_ci_land_abandons_when_newer_data_push_landed(repo, tmp_path, capsys):
 
 def test_ci_land_push_race_abandons_neutrally(repo, tmp_path, monkeypatch):
     commit_files(repo, "base", {"a.txt": "a\n"})
-    bare = _bare(tmp_path)
-    _with_remote(repo, bare)
+    bare = bare_remote(tmp_path)
+    with_remote(repo, bare)
     store = datastore.prepare(repo, "main")
     _store_changes(repo)
     # our own first landing so the remote Data branch exists for the race
@@ -200,8 +188,8 @@ def test_ci_land_push_race_abandons_neutrally(repo, tmp_path, monkeypatch):
 
 def test_ci_land_push_race_diverged_abandons(repo, tmp_path, monkeypatch):
     commit_files(repo, "base", {"a.txt": "a\n"})
-    bare = _bare(tmp_path)
-    _with_remote(repo, bare)
+    bare = bare_remote(tmp_path)
+    with_remote(repo, bare)
     store = datastore.prepare(repo, "main")
     _store_changes(repo)
     assert ci.land(store, repo, "origin").status == "landed"
@@ -215,7 +203,7 @@ def test_ci_land_push_race_diverged_abandons(repo, tmp_path, monkeypatch):
     (orphan / "o.txt").write_text("o\n", encoding="utf-8")
     run(orphan, "add", "-A")
     run(orphan, "commit", "-m", "orphan root")
-    orphan_sha = _git(orphan, "rev-parse", "HEAD").strip()
+    orphan_sha = git_out(orphan, "rev-parse", "HEAD").strip()
 
     def racy_push(repo_, remote, branch, head):
         # force-move the remote Data tip to the unrelated (diverged) orphan root
@@ -225,16 +213,16 @@ def test_ci_land_push_race_diverged_abandons(repo, tmp_path, monkeypatch):
     monkeypatch.setattr(ci, "_push", racy_push)
     result = ci.land(store, repo, "origin")
     assert result.status == "abandoned"  # divergence also ends neutrally (never force)
-    assert _git(bare, "rev-parse", "refs/heads/coding-stats/main").strip() == orphan_sha
+    assert git_out(bare, "rev-parse", "refs/heads/coding-stats/main").strip() == orphan_sha
 
 
 def test_ci_land_unrelated_push_failure_raises(repo, tmp_path, monkeypatch):
     commit_files(repo, "base", {"a.txt": "a\n"})
-    bare = _bare(tmp_path)
-    _with_remote(repo, bare)
+    bare = bare_remote(tmp_path)
+    with_remote(repo, bare)
     store = datastore.prepare(repo, "main")
     _store_changes(repo)
-    stored_head_before = _git(repo, "rev-parse", "refs/heads/main").strip()
+    stored_head_before = git_out(repo, "rev-parse", "refs/heads/main").strip()
 
     def auth_fail(repo_, remote, branch, head):
         raise subprocess.CalledProcessError(128, ["git", "push"], stderr="Authentication failed")
@@ -242,7 +230,7 @@ def test_ci_land_unrelated_push_failure_raises(repo, tmp_path, monkeypatch):
     monkeypatch.setattr(ci, "_push", auth_fail)
     with pytest.raises(subprocess.CalledProcessError):
         ci.land(store, repo, "origin")  # real errors still raise
-    assert _git(repo, "rev-parse", "refs/heads/main").strip() == stored_head_before
+    assert git_out(repo, "rev-parse", "refs/heads/main").strip() == stored_head_before
 
 
 def test_ci_land_local_without_remote(repo):
@@ -253,7 +241,7 @@ def test_ci_land_local_without_remote(repo):
     _store_changes(repo)
     result = ci.land(store, repo, "origin")
     assert result.status == "landed" and "no remote" in result.detail
-    head = _git(store.worktree, "rev-parse", "HEAD").strip()
+    head = git_out(store.worktree, "rev-parse", "HEAD").strip()
     assert _branch_tip(repo, "coding-stats/main") == head  # branch exists locally
     # the landing never touched the Target branch
     assert store.worktree == store_worktree(repo)
@@ -263,7 +251,7 @@ def test_ci_land_cli_prints_status_once(tmp_path, repo, capsys, monkeypatch):
     from coding_stats.cli import main
 
     commit_files(repo, "base", {"a.txt": "a\n"})
-    _with_remote(repo, _bare(tmp_path))
+    with_remote(repo, bare_remote(tmp_path))
     datastore.prepare(repo, "main")
     _store_changes(repo)
     monkeypatch.chdir(repo)
@@ -274,20 +262,6 @@ def test_ci_land_cli_prints_status_once(tmp_path, repo, capsys, monkeypatch):
 
 
 # ------------------------ parameter hygiene, tool install, init hardening ---
-
-
-def _pyproject_version() -> str:
-    import tomllib
-
-    data = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text("utf-8"))
-    return str(data["project"]["version"])
-
-
-def _pyproject_version() -> str:
-    import tomllib
-
-    data = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text("utf-8"))
-    return str(data["project"]["version"])
 
 
 def test_render_workflow_is_injection_safe_for_hostile_values():
@@ -315,3 +289,27 @@ def test_ci_init_validates_branch_ref_name(repo):
     doc = yaml.safe_load((repo / ".github" / "workflows" / "coding-stats.yml").read_text("utf-8"))
     on = doc.get("on", doc.get(True))
     assert on["push"]["branches"] == ["feature;id"]
+
+
+def test_ci_land_parents_previous_data_tip_and_survives_target_movement(repo, tmp_path):
+    """A second landing parents on the previous Data tip; a Target branch
+    that moved on in between does NOT abandon — the Data tip alone judges
+    staleness, so paid classification always lands (ADR-0006 clause 1)."""
+    commit_files(repo, "base", {"a.txt": "a\n"})
+    bare = bare_remote(tmp_path)
+    with_remote(repo, bare)
+    store = datastore.prepare(repo, "main")
+    _store_changes(repo)
+    assert ci.land(store, repo, "origin").status == "landed"
+    first = _branch_tip(bare, "coding-stats/main")
+
+    # the Target branch moves on (a human commit) while our run works
+    commit_files(repo, "human work on main", {"a.txt": "a\nb\n"})
+    run(repo, "push", "-q", "origin", "main")
+
+    (store.worktree / ".coding-stats" / "incoming.sql").write_text("-- v2\n", encoding="utf-8")
+    result = ci.land(store, repo, "origin")
+    assert result.status == "landed"  # Target movement is not staleness
+    second = _branch_tip(bare, "coding-stats/main")
+    assert git_out(store.worktree, "rev-parse", "HEAD^").strip() == first  # parented
+    assert second != first

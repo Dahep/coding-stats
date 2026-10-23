@@ -420,10 +420,7 @@ def test_migration_matches_fresh_walk(repo, tmp_path):
     # --- equivalence: same metrics, same per-commit derived columns
     a = snapshot_to_json(snapshot(moved))
     b = snapshot_to_json(snapshot(fresh))
-    if a != b:
-        print("SNAP-A:", a)
-        print("SNAP-B:", b)
-    assert a == b
+    assert a == b, f"migrated and fresh snapshots diverge:\nmoved: {a}\nfresh: {b}"
 
     def commit_facts(conn):
         return {

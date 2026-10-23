@@ -4,23 +4,10 @@ the LLM — while the deterministic stages keep running on B. External seam:
 main([...]) over temp repos + bare origin."""
 
 import sqlite3
-import subprocess
 
 from coding_stats import artifact, ci, datastore, db, gitwalk, identity
 from coding_stats.cli import main
-from conftest import commit_files, run, store_worktree
-
-
-def _bare(tmp_path) -> str:
-    path = tmp_path / "remote.git"
-    subprocess.run(["git", "init", "--bare", "-q", str(path)], check=True)
-    return str(path)
-
-
-def _with_remote(repo, bare) -> None:
-    run(repo, "remote", "add", "origin", bare)
-    run(repo, "push", "-q", "-u", "origin", "main")
-    subprocess.run(["git", "-C", bare, "symbolic-ref", "HEAD", "refs/heads/main"], check=True)
+from conftest import bare_remote, commit_files, run, store_worktree, with_remote
 
 
 class Scripted:
@@ -87,8 +74,8 @@ def _art(repo, branch="main") -> str:
 def test_update_seeds_shared_commits_from_verifying_sibling(tmp_path, repo, capsys, monkeypatch):
 
     commit_files(repo, "shared feature", {"s.txt": "s1\ns2\n"})
-    bare = _bare(tmp_path)
-    _with_remote(repo, bare)
+    bare = bare_remote(tmp_path)
+    with_remote(repo, bare)
     db1 = str(tmp_path / "main.db")
     main(["init", str(repo), "--db", db1])
     log1 = []
@@ -139,8 +126,8 @@ def test_update_seeds_shared_commits_from_verifying_sibling(tmp_path, repo, caps
 
 def test_seeding_skips_non_verifying_sibling(tmp_path, repo, capsys, monkeypatch):
     commit_files(repo, "shared feature", {"s.txt": "s1\n"})
-    bare = _bare(tmp_path)
-    _with_remote(repo, bare)
+    bare = bare_remote(tmp_path)
+    with_remote(repo, bare)
     db1 = str(tmp_path / "main.db")
     main(["init", str(repo), "--db", db1])
     log1 = []
@@ -179,8 +166,8 @@ def test_seeding_skips_non_verifying_sibling(tmp_path, repo, capsys, monkeypatch
 
 def test_seeding_multi_source_earliest_wins(tmp_path, repo, capsys, monkeypatch):
     commit_files(repo, "shared feature", {"s.txt": "s1\n"})
-    bare = _bare(tmp_path)
-    _with_remote(repo, bare)
+    bare = bare_remote(tmp_path)
+    with_remote(repo, bare)
     db_path = str(tmp_path / "u.db")
     main(["init", str(repo), "--db", db_path])
     # two same-repo siblings cover the same sha; the EARLIER verdict wins
@@ -192,6 +179,28 @@ def test_seeding_multi_source_earliest_wins(tmp_path, repo, capsys, monkeypatch)
     main(["update", "--db", db_path])
     out = capsys.readouterr().out
     assert "seeded 1 commits from coding-stats/early" in out
+    assert _mat_rows(
+        _art(repo, "main"),
+        "SELECT verdict, classified_at FROM commit_verdicts",
+    ) == [("feature", "2026-01-01T00:00:00Z")]
+
+
+def test_seeding_tie_breaks_by_repository_key(tmp_path, repo, capsys, monkeypatch):
+    """Equal classified_at across two covering siblings: the lexicographic
+    Repository key decides (the same rule gather's dedup applies)."""
+    commit_files(repo, "shared feature", {"s.txt": "s1\n"})
+    bare = bare_remote(tmp_path)
+    with_remote(repo, bare)
+    db_path = str(tmp_path / "u.db")
+    main(["init", str(repo), "--db", db_path])
+    _sibling(tmp_path, repo, "zeta", "2026-01-01T00:00:00Z", verdict="cleanup")
+    _sibling(tmp_path, repo, "alpha", "2026-01-01T00:00:00Z", verdict="feature")
+    capsys.readouterr()
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr("coding_stats.cli.Session", lambda model, sid=None: Scripted([], []))
+    main(["update", "--db", db_path])
+    out = capsys.readouterr().out
+    assert "seeded 1 commits from coding-stats/alpha" in out  # key order, not ref order
     assert _mat_rows(
         _art(repo, "main"),
         "SELECT verdict, classified_at FROM commit_verdicts",

@@ -21,7 +21,7 @@ outputs:
     value: ${{ env.CODING_STATS_REPORT_PATH }}
   db-path:
     description: Path of the gathered union DB.
-    value: ${{ env.CODING_STATS_DB_PATH }}
+    value: ${{ env.CODING_STATS_UNION }}
 runs:
   using: composite
   steps:

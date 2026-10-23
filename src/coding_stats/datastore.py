@@ -37,6 +37,9 @@ CODING_DATA_PREFIX = "coding-stats/"
 # machine-local store root inside the checkout's .git dir (default_worktree)
 STORE_DIR = "coding-stats-store"
 
+# the artifact's path inside any tree (a Data branch's, a checkout's)
+STORE_TREE = ".coding-stats/coding-stats.sql"
+
 # git/GitHub ref-name rules (check-ref-format); shared with ci's scaffold
 # rendering — a Target branch name must be a valid ref, and the composed
 # Data-branch name must survive as a ref too.
@@ -106,7 +109,7 @@ def default_worktree(repo: Path, target: str) -> Path:
     return Path(tempfile.gettempdir()) / STORE_DIR / f"{Path(repo).name}-{key}" / target
 
 
-def _git(repo: Path, *args: str, check: bool = True) -> str:
+def git_run(repo: Path, *args: str, check: bool = True) -> str:
     return subprocess.run(
         ["git", "-C", str(repo), *args], check=check, capture_output=True, text=True
     ).stdout
@@ -130,7 +133,7 @@ def remote_data_refs(repo: Path, remote: str = "origin") -> dict[str, str]:
     I/O here — a Data branch never fetched behaves as 'no artifact yet'
     (first run), and the ls-remote that would add networking is ci land's
     job. {} when neither exists."""
-    out = _git(
+    out = git_run(
         repo,
         "for-each-ref",
         "--format=%(refname) %(objectname)",
@@ -154,23 +157,30 @@ def remote_data_refs(repo: Path, remote: str = "origin") -> dict[str, str]:
     return refs
 
 
-def remote_tip(repo: Path, data_branch: str, remote: str = "origin") -> str | None:
-    """The remote Data branch's tip sha, or None when it does not exist."""
-    return remote_data_refs(repo, remote).get(data_branch)
-
-
 def fetch_tip(repo: Path, data_branch: str, remote: str = "origin") -> str | None:
     """(sha | None) after fetching the Data branch tip into
     refs/remotes/origin/<data_branch> — ancestry checks then work on local
     objects even though the landing HEAD lives in the worktree. None when
     the remote does not hold the branch; unreachable remotes raise (ci
     land's network step, a real failure there)."""
-    out = _git(repo, "ls-remote", remote, f"refs/heads/{data_branch}")
+    out = git_run(repo, "ls-remote", remote, f"refs/heads/{data_branch}")
     tip = out.strip().split("\t")[0] or None
     if tip is None:
         return None
-    _git(repo, "fetch", remote, f"+refs/heads/{data_branch}:refs/remotes/{remote}/{data_branch}")
+    git_run(repo, "fetch", remote, f"+refs/heads/{data_branch}:refs/remotes/{remote}/{data_branch}")
     return tip
+
+
+def read_artifact_at(repo: Path, tip_sha: str) -> bytes | None:
+    """A Data branch tip's artifact bytes, read straight out of its
+    committed tree (no checkout needed). None when the tip's tree holds
+    no artifact."""
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "show", f"{tip_sha}:{STORE_TREE}"],
+        capture_output=True,
+        check=False,
+    )
+    return proc.stdout if proc.returncode == 0 else None
 
 
 def anchor_ref(repo: Path, data_branch: str, remote: str = "origin") -> str | None:
@@ -191,13 +201,13 @@ def anchor_ref(repo: Path, data_branch: str, remote: str = "origin") -> str | No
 
 
 def _registered(repo: Path) -> set[Path]:
-    out = _git(repo, "worktree", "list", "--porcelain")
+    out = git_run(repo, "worktree", "list", "--porcelain")
     paths = {line[len("worktree ") :] for line in out.splitlines() if line.startswith("worktree ")}
     return {Path(p).resolve() for p in paths}
 
 
-def _head(worktree: Path) -> str | None:
-    """The worktree's HEAD sha, or None on an unborn (orphan) branch."""
+def head_sha(worktree: Path) -> str | None:
+    """HEAD sha, or None on an unborn branch (a fresh orphan Data branch)."""
     proc = subprocess.run(
         ["git", "-C", str(worktree), "rev-parse", "--verify", "--quiet", "HEAD"],
         capture_output=True,
@@ -227,7 +237,16 @@ def _discard_worktree(repo: Path, worktree: Path) -> None:
     shutil.rmtree(worktree, ignore_errors=True)
 
 
-def _dirty(worktree: Path) -> bool:
+def is_ancestor(repo: Path, maybe_ancestor: str, descendant: str) -> bool:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", maybe_ancestor, descendant],
+        capture_output=True,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
+def store_dirty(worktree: Path) -> bool:
     proc = subprocess.run(
         ["git", "-C", str(worktree), "status", "--porcelain", "--", ".coding-stats/"],
         capture_output=True,
@@ -275,6 +294,22 @@ def prepare(
         )
     tip = refs.get(branch)
 
+    # ADR-0006 clause 2: two branch names that normalize to one slug
+    # (`release/2.x`, `release-2.x`) would mint colliding feature-id
+    # prefixes — a hard error, not a skip (the ids would be ambiguous
+    # forever).
+    from . import identity
+
+    my_slug = identity.branch_slug(target)
+    for name in sorted(refs):
+        other = name[len(CODING_DATA_PREFIX) :]
+        if other != target and identity.branch_slug(other) == my_slug:
+            raise ValueError(
+                f"branch names {target!r} and {other!r} normalize to the same"
+                f" feature-id prefix slug {my_slug!r}; feature ids could not"
+                " tell them apart — rename one of the branches"
+            )
+
     wt_resolve = wt.resolve()
     known = wt_resolve in {p.resolve() for p in _registered(repo)}
     if not known and wt.exists():
@@ -319,7 +354,7 @@ def prepare(
             )
         known = True
     elif sync and tip is not None:
-        if _dirty(wt):
+        if store_dirty(wt):
             # leftover store state from an interrupted run: keep it — the
             # digest verdict (below) decides whether it is trustworthy and
             # a no-op landing check re-derives correctness from the DB
@@ -338,7 +373,7 @@ def prepare(
     # landed state: HEAD born at the tip for a fetched Data branch, unborn
     # for a first run with no remote branch — the landing verb's first
     # commit creates the orphan branch.
-    head = _head(wt)
+    head = head_sha(wt)
     print(
         f"data branch {branch}: mounted at {wt}"
         + (f" (at {head[:12]})" if head else " (unborn; first landing creates it)")

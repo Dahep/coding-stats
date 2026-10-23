@@ -24,7 +24,6 @@ INPUTS = {
     "no-classify",
     "no-detect",
     "no-lineage",
-    "no-report",
 }
 
 
@@ -50,7 +49,7 @@ def test_declared_inputs_outputs_and_composite_shape():
     assert inputs["target-branch"]["default"] == "${{ github.ref_name }}"
     for name in sorted(INPUTS):
         assert not inputs[name].get("required", False), name
-    for flag in ("no-classify", "no-detect", "no-lineage", "no-report"):
+    for flag in ("no-classify", "no-detect", "no-lineage"):
         assert inputs[flag]["default"] == "false"  # boolean pass-through flags
     for key in ("opencode-api-key", "openrouter-api-key"):
         assert inputs[key]["default"] == ""  # optional: no key is not an error
@@ -60,7 +59,7 @@ def test_declared_inputs_outputs_and_composite_shape():
 
 def test_trim_flags_pass_through_to_update():
     (update,) = _runs_matching("coding-stats update --db")
-    for flag in ("--no-classify", "--no-detect", "--no-lineage", "--no-report"):
+    for flag in ("--no-classify", "--no-detect", "--no-lineage"):
         assert flag in update
     assert "flags" in update  # flags travel as words, built from env only
 

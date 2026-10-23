@@ -92,7 +92,7 @@ def test_update_trim_flags(tmp_path, repo, capsys, monkeypatch):
         "coding_stats.cli.Session",
         lambda model, sid=None: FakeSession(['{"k":"fix","why":"r"}'] * 2),
     )
-    main(["update", "--db", db_path, "--no-classify", "--no-serialize", "--no-report"])
+    main(["update", "--db", db_path, "--no-classify", "--no-serialize"])
     out = capsys.readouterr().out
     assert "classified 2 commits" not in out  # the classify stage did not run
     assert "artifact not written" in out

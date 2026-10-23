@@ -35,8 +35,8 @@ from pathlib import Path
 
 from . import artifact, datastore, db, identity
 
-STORE_REL = ".coding-stats/coding-stats.sql"
-_STORE_TREE_PATH = ".coding-stats/coding-stats.sql"
+STORE_REL = datastore.STORE_TREE
+_STORE_TREE_PATH = datastore.STORE_TREE
 
 _UNION_ARTIFACTS_DDL = """
 CREATE TABLE IF NOT EXISTS union_artifacts (
@@ -114,31 +114,36 @@ def gather(union_path: Path, sources: list[Path]) -> GatherResult:
 
 
 def _artifact_blobs(source: Path) -> list[tuple[str, bytes]]:
-    """(label, artifact bytes) a source expands to: an explicit file, a
-    checkout's committed store, every mounted Data-branch store of a
-    Data-branch-layout repo (ADR-0006), or — when nothing is mounted — the
-    Data branches the checkout has fetched, read straight out of their refs."""
+    """(label, artifact bytes) a source expands to: an explicit file, every
+    mounted Data-branch store of a Data-branch-layout repo (ADR-0006) — or,
+    when nothing is mounted, the Data branches the checkout has fetched,
+    read straight out of their refs — and, only when NO Data branch is
+    known, the ADR-0003 committed store (a mid-migration checkout must not
+    have its stale committed store shadow the newer Data branches)."""
     if not source.is_dir():
-        return [(str(source), source.read_bytes())]
-    p = source / STORE_REL
-    if p.exists():
-        return [(str(p), p.read_bytes())]
+        try:
+            return [(str(source), source.read_bytes())]
+        except OSError as exc:
+            raise GatherError(f"{source}: cannot read artifact ({exc})") from exc
     out: list[tuple[str, bytes]] = []
     roots = source / ".git" / datastore.STORE_DIR
     if roots.is_dir():
-        for art in sorted(roots.glob(f"*/{_STORE_TREE_PATH}")):
-            out.append((str(art), art.read_bytes()))
+        for child in sorted(roots.iterdir()):
+            art = child / _STORE_TREE_PATH
+            if art.exists():  # iterdir, not glob: targets may nest (release/2.x)
+                out.append((str(art), art.read_bytes()))
     if not out:
         # Data branches not mounted as worktrees (e.g. a runner whose fetch
         # step created refs only): read the artifact out of each known tip
-        from .seeding import sibling_artifact
-
         refs = datastore.remote_data_refs(source)
         for name in sorted(refs):
-            data = sibling_artifact(source, refs[name])
+            data = datastore.read_artifact_at(source, refs[name])
             if data is not None:
                 out.append((f"{source} [{name}]", data))
     if not out:
+        p = source / STORE_REL
+        if p.exists():
+            return [(str(p), p.read_bytes())]
         raise GatherError(f"{source}: cannot read artifact ({p})")
     return out
 
@@ -150,11 +155,6 @@ def _load(source: Path, label: str, data: bytes) -> _Ingest:
     err = artifact.verify_bytes(data)
     if err is not None:
         raise GatherError(f"{label}: refusing artifact ({err})")
-    if header is None:
-        raise GatherError(f"{source}: not a coding-stats artifact (no valid header)")
-    err = artifact.verify_bytes(data)
-    if err is not None:
-        raise GatherError(f"{source}: refusing artifact ({err})")
 
     rows = sqlite3.connect(":memory:")
     rows.row_factory = sqlite3.Row
@@ -162,14 +162,14 @@ def _load(source: Path, label: str, data: bytes) -> _Ingest:
         artifact.materialize(rows, data)
     except artifact.MaterializeError as exc:
         rows.close()
-        raise GatherError(f"{source}: {exc}") from exc
+        raise GatherError(f"{label}: {exc}") from exc
     repo_row = rows.execute("SELECT * FROM repositories ORDER BY id LIMIT 1").fetchone()
     if repo_row is None:
-        raise GatherError(f"{source}: artifact carries no repository row")
+        raise GatherError(f"{label}: artifact carries no repository row")
     key = str(repo_row["repo_key"])
     if key != header.repository_key:
         raise GatherError(
-            f"{source}: inconsistent artifact (header says {header.repository_key!r},"
+            f"{label}: inconsistent artifact (header says {header.repository_key!r},"
             f" rows say {key!r})"
         )
     slug = str(repo_row["slug"])
@@ -391,11 +391,12 @@ def _upsert(conn: sqlite3.Connection, item: _Ingest) -> None:
             ),
         )
     for r in src.execute("SELECT * FROM feature_line_samples ORDER BY feature_id, at_commit_sha"):
-        # a duplicated (seeded) feature id's sample rows exist per key too;
-        # the union keeps one per (id, sample commit): the first requester
-        # in deterministic ingest order (sorted by Repository key) wins
+        # a duplicated (seeded) feature id's sample row is shared in the
+        # union (keyed (feature_id, at_commit_sha) with no repo dimension):
+        # re-gathering a key REPLACES the row with its newest artifact's
+        # value (last-wins, matching union_artifacts), never duplicating
         conn.execute(
-            "INSERT OR IGNORE INTO feature_line_samples (feature_id, at_commit_sha, live_lines)"
+            "INSERT OR REPLACE INTO feature_line_samples (feature_id, at_commit_sha, live_lines)"
             " VALUES (?, ?, ?)",
             (r["feature_id"], r["at_commit_sha"], r["live_lines"]),
         )
@@ -427,7 +428,14 @@ def _insert_repo(conn: sqlite3.Connection, item: _Ingest, repo_id: int) -> None:
 
 
 def _purge_repo(conn: sqlite3.Connection, repo_id: int) -> None:
-    """Drop one repository's union rows (children first: FK enforcement is on)."""
+    """Drop one repository's union rows (children first: FK enforcement is
+    on). Feature-scoped rows in the dimension-less dependent tables
+    (feature_line_samples, fixes_features, commits_features) are NOT scoped
+    by feature ownership here — a seeded feature id legitimately lives under
+    SEVERAL keys of one repo, so this key's purge must never reach another
+    key's rows. They are instead swept afterwards as orphans: rows whose
+    feature id no longer exists under ANY key (the feature was purged
+    everywhere)."""
     where = "IN (SELECT id FROM commits WHERE repo_id = ?)"
     conn.execute(f"DELETE FROM commit_verdicts WHERE commit_id {where}", (repo_id,))
     conn.execute(f"DELETE FROM commits_features WHERE commit_id {where}", (repo_id,))
@@ -440,17 +448,20 @@ def _purge_repo(conn: sqlite3.Connection, repo_id: int) -> None:
         (repo_id, repo_id),
     )
     conn.execute(
-        f"DELETE FROM fixes_features WHERE fix_commit_id {where} OR via_fix_commit_id {where}"
-        " OR feature_id IN (SELECT id FROM features WHERE repo_id = ?)",
-        (repo_id, repo_id, repo_id),
-    )
-    conn.execute(
-        "DELETE FROM feature_line_samples WHERE feature_id IN"
-        " (SELECT id FROM features WHERE repo_id = ?)",
-        (repo_id,),
+        f"DELETE FROM fixes_features WHERE fix_commit_id {where} OR via_fix_commit_id {where}",
+        (repo_id, repo_id),
     )
     conn.execute("DELETE FROM features WHERE repo_id = ?", (repo_id,))
     conn.execute("DELETE FROM commits WHERE repo_id = ?", (repo_id,))
+    _sweep_orphaned_feature_rows(conn)
+
+
+def _sweep_orphaned_feature_rows(conn: sqlite3.Connection) -> None:
+    """Feature-scoped rows whose feature id exists under NO key anymore
+    (the same purge rule the walk applies to features without defining
+    commits). Rows for ids still alive under another key stay."""
+    for table in ("feature_line_samples", "fixes_features", "commits_features"):
+        conn.execute(f"DELETE FROM {table} WHERE feature_id NOT IN (SELECT id FROM features)")
 
 
 def _write_union_settings(conn: sqlite3.Connection) -> None:

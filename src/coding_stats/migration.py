@@ -542,8 +542,14 @@ def migrate_to_data_branch(
     branch = target or gitwalk.current_branch(repo)
     legacy = repo / ".coding-stats" / "coding-stats.sql"
     out: list[str] = []
-    if datastore.remote_data_refs(repo, remote).get(datastore.data_branch(branch)):
-        return ["already migrated"]
+    # idempotent only against a VERIFYING artifact: a Data branch whose tip
+    # carries no (or a damaged) artifact does not count as migrated — the
+    # migration below overwrites it with the Target's verified store
+    data_tip = datastore.remote_data_refs(repo, remote).get(datastore.data_branch(branch))
+    if data_tip is not None:
+        data = datastore.read_artifact_at(repo, data_tip)
+        if data is not None and artifact.verify_bytes(data) is None:
+            return ["already migrated"]
 
     if not legacy.exists():
         return ["nothing to migrate (no committed .coding-stats/ on this Target)"]
@@ -560,8 +566,8 @@ def migrate_to_data_branch(
         artifact.materialize(rows, legacy.read_bytes())
         plain = identity.resolved_identity(repo)[1]
         identity.reprefix_features(rows, identity.repo_slug(plain, branch))
-    finally:
         data = artifact.serialize(rows)
+    finally:
         rows.close()
     out.append("ids re-prefixed to {repo}@{branch}")
 
@@ -571,6 +577,13 @@ def migrate_to_data_branch(
     art.write_bytes(data)
     landing = ci.land(store, repo, remote)
     out.append(f"coding-stats landing: {landing.status} — {landing.detail}")
+    if landing.status != "landed":
+        out.append(
+            "NOT removed from the Target branch: the landing did not push"
+            " (keep .coding-stats/ until a run lands the Data branch, then"
+            " re-run migrate)"
+        )
+        return out
     out.append(
         "removal is a normal PR (migration never pushes to the Target branch): next steps\n"
         "  git checkout <target>\n"

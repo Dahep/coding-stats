@@ -64,7 +64,7 @@ def test_serialize_is_byte_stable_and_digest_verifies(tmp_path, repo):
     assert first == second  # byte-equal across calls
     path = artifact.write(conn, repo)
     assert path == repo / ".coding-stats" / "coding-stats.sql"
-    assert (repo / ".coding-stats" / "report.html").exists()
+    # the store holds only the SQL artifact (ADR-0006 clause 5)
     assert artifact.verify(path) is None
     content = path.read_text(encoding="utf-8")
     assert artifact.digest_of(path) == _header(content, "digest")
@@ -121,7 +121,7 @@ def test_artifact_curation_excludes_machine_state(tmp_path, repo):
 
 def test_artifact_materializes_standalone_with_committed_shapes(tmp_path, repo):
     conn, fa, h1, h2 = _built_db(tmp_path, repo)
-    path = artifact.write(conn, repo, with_report=False)
+    path = artifact.write(conn, repo)
     mat = sqlite3.connect(tmp_path / "materialized.db")
     mat.row_factory = sqlite3.Row
     mat.executescript(path.read_text(encoding="utf-8"))
@@ -192,7 +192,7 @@ def test_header_values_are_injection_safe(tmp_path, repo):
     evil = "x\nCREATE TABLE pwned(x);\n\x07\"quoted\"'\\'"
     conn.execute("UPDATE repositories SET repo_key = ?", (evil,))
     conn.commit()
-    path = artifact.write(conn, repo, with_report=False)
+    path = artifact.write(conn, repo)
     content = path.read_bytes()
 
     # header values stay inside their single comment line: nothing executable
@@ -213,7 +213,7 @@ def test_header_dot_command_probe_is_byte_safe(tmp_path, repo):
     conn, *_ = _built_db(tmp_path, repo)
     conn.execute("UPDATE repositories SET repo_key = ?", ("-- .shell echo pwned",))
     conn.commit()
-    path = artifact.write(conn, repo, with_report=False)
+    path = artifact.write(conn, repo)
     content = path.read_bytes()
     # encodes nothing -> stays literal for readability, but no line ever
     # starts with '.' (sqlite3 dot-command) or leaves the comment
@@ -227,7 +227,7 @@ def test_header_dot_command_probe_is_byte_safe(tmp_path, repo):
 
 def test_verify_is_byte_exact(tmp_path, repo):
     conn, *_ = _built_db(tmp_path, repo)
-    path = artifact.write(conn, repo, with_report=False)
+    path = artifact.write(conn, repo)
     data = path.read_bytes()
 
     crlf = tmp_path / "crlf.sql"

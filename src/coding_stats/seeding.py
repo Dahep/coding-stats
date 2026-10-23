@@ -23,13 +23,10 @@ Rules per ADR-0006 / ticket #22:
 """
 
 import sqlite3
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import artifact, datastore
-
-_STORE_REL_IN_TREE = ".coding-stats/coding-stats.sql"
+from . import artifact, datastore, identity
 
 
 @dataclass(frozen=True)
@@ -44,19 +41,26 @@ class _Source:
 
     data_branch: str
     repo_key: str
-    order: tuple[str, str, str]  # (earliest classified_at, repository key, branch)
     rows: sqlite3.Connection
     by_sha: dict[str, int]  # sha -> the sibling's local commit id
 
+    def verdict_at(self, commit_id: int) -> str | None:
+        """The sibling's classified_at for one of its commits, or None when
+        the commit carries no verdict (a walked-but-unclassified backlog)."""
+        row = self.rows.execute(
+            "SELECT classified_at FROM commit_verdicts WHERE commit_id = ?", (commit_id,)
+        ).fetchone()
+        return str(row["classified_at"]) if row else None
+
 
 def seed_from_siblings(
-    conn: sqlite3.Connection, repo_dir: Path, our_data_branch: str, quiet: bool = False
+    conn: sqlite3.Connection, repo_dir: Path, our_data_branch: str
 ) -> SeedResult:
     """Seed every unclassified walk commit whose sha a verifying sibling
     Data branch already classified. Returns the seeded count and sources."""
     our_base, our_rid = _our_identity(conn)
     refs = datastore.remote_data_refs(repo_dir)
-    sources = _winning_sources(repo_dir, our_base, refs, our_data_branch, quiet)
+    sources = _winning_sources(repo_dir, our_base, refs, our_data_branch)
     if not sources:
         return SeedResult(0, ())
     seeded = 0
@@ -67,9 +71,9 @@ def seed_from_siblings(
                LEFT JOIN commit_verdicts v ON v.commit_id = c.id
                WHERE v.commit_id IS NULL ORDER BY c.walk_index"""
         ).fetchall()
-        for c in pending:  # each commit is seeded once: earliest source wins
+        for c in pending:  # each commit is seeded once
             sha = str(c["sha"])
-            cover = next((s for s in sources if sha in s.by_sha), None)
+            cover = _winner_for_sha(sources, sha)
             if cover is None:
                 continue
             _copy_commit(conn, our_rid, cover, int(c["id"]), sha)
@@ -79,27 +83,31 @@ def seed_from_siblings(
     return SeedResult(seeded, tuple(used))
 
 
+def _winner_for_sha(sources: list[_Source], sha: str) -> _Source | None:
+    """The source whose verdict for THIS sha has the earliest classified_at,
+    ties broken by the lexicographic Repository key (the same rule gather's
+    dedup applies). Per-sha, not per-artifact: a source whose global minimum
+    belongs to another sha must not win here."""
+    best: tuple[tuple[str, str], _Source] | None = None
+    for s in sources:
+        src_id = s.by_sha.get(sha)
+        if src_id is None:
+            continue  # this source never walked the sha
+        v = s.verdict_at(src_id)
+        if v is None:
+            continue  # the sibling walk reached the sha but never classified it
+        cand = (v, s.repo_key)
+        if best is None or cand < best[0]:
+            best = (cand, s)
+    return best[1] if best else None
+
+
 def _our_identity(conn: sqlite3.Connection) -> tuple[str, int]:
     """(Repository key base — without the branch part — our repository id)."""
     row = conn.execute("SELECT id, repo_key FROM repositories ORDER BY id").fetchone()
     if row is None:
         return "", 0
-    key = str(row["repo_key"])
-    return key.rsplit("@", 1)[0], int(row["id"])
-
-
-def _sibling_artifact(repo_dir: Path, tip_sha: str) -> bytes | None:
-    """The sibling Data branch's artifact bytes read straight out of its
-    committed tree (no checkout needed)."""
-    proc = subprocess.run(
-        ["git", "-C", str(repo_dir), "show", f"{tip_sha}:{_STORE_REL_IN_TREE}"],
-        capture_output=True,
-        check=False,
-    )
-    return proc.stdout if proc.returncode == 0 else None
-
-
-sibling_artifact = _sibling_artifact
+    return identity.key_base(str(row["repo_key"])), int(row["id"])
 
 
 def _winning_sources(
@@ -107,24 +115,22 @@ def _winning_sources(
     our_base: str,
     refs: dict[str, str],
     our_data_branch: str,
-    quiet: bool,
 ) -> list[_Source]:
-    """Every verifying sibling artifact of the same repo, in win order."""
+    """Every verifying sibling artifact of the same repo."""
     sources: list[_Source] = []
     for name in sorted(refs):
         if name == our_data_branch:
             continue  # our own branch is not its own seeding source
-        data = _sibling_artifact(repo_dir, refs[name])
+        data = datastore.read_artifact_at(repo_dir, refs[name])
         if data is None:
             continue  # no artifact (or unreachable tree): not a source
         header = artifact.parse_header(data)
         if header is None:
             continue  # not a coding-stats artifact at all
-        if header.repository_key.rsplit("@", 1)[0] != our_base:
+        if identity.key_base(header.repository_key) != our_base:
             continue  # another repo's Data branch: never a seeding source
         if artifact.verify_bytes(data) is not None:
-            if not quiet:
-                print(f"seeding source {name}: digest does not verify; skipped")
+            print(f"seeding source {name}: digest does not verify; skipped")
             continue  # a damaged sibling can't spread its data
         rows = sqlite3.connect(":memory:")
         rows.row_factory = sqlite3.Row
@@ -132,26 +138,18 @@ def _winning_sources(
             artifact.materialize(rows, data)
         except artifact.MaterializeError as exc:
             rows.close()
-            if not quiet:
-                print(f"seeding source {name}: refused ({exc})")
+            print(f"seeding source {name}: refused ({exc})")
             continue
-        earliest = rows.execute("SELECT MIN(classified_at) t FROM commit_verdicts").fetchone()
         sources.append(
             _Source(
                 data_branch=name,
                 repo_key=header.repository_key,
-                order=(
-                    str(earliest["t"] or ""),
-                    header.repository_key,
-                    name,
-                ),
                 rows=rows,
                 by_sha={
                     str(r["sha"]): int(r["id"]) for r in rows.execute("SELECT sha, id FROM commits")
                 },
             )
         )
-    sources.sort(key=lambda s: s.order)
     return sources
 
 

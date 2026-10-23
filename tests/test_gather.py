@@ -61,7 +61,7 @@ def _repo_with_artifact(
             return super().send(message)
 
     with mock.patch("coding_stats.cli.Session", lambda model, sid=None: Session(list(replies))):
-        flags = ["--no-detect", "--no-lineage", "--no-report"]
+        flags = ["--no-detect", "--no-lineage"]
         if no_classify:
             flags.append("--no-classify")
         main(["update", "--db", db_path, *flags])
@@ -176,7 +176,7 @@ def test_gather_upserts_newer_artifact_of_same_key(tmp_path):
             ]
         ),
     ):
-        main(["update", "--db", db_path, "--no-detect", "--no-lineage", "--no-report"])
+        main(["update", "--db", db_path, "--no-detect", "--no-lineage"])
     main(["gather", "--db", str(union), str(repo)])
 
     assert _rows(union, "SELECT COUNT(*) c FROM commit_verdicts")[0]["c"] == 2  # last-wins
@@ -340,7 +340,7 @@ def test_union_sampling_complete_is_least_complete(tmp_path):
         "coding_stats.cli.Session",
         lambda model, sid=None: Scripted(['{"k":"new","title":"later","about":"x","why":"y"}']),
     ):
-        main(["update", "--db", a_db, "--no-detect", "--no-lineage", "--no-report"])
+        main(["update", "--db", a_db, "--no-detect", "--no-lineage"])
     main(["gather", "--db", str(union), str(a), str(b)])
     conn = _connect(union)
     page = htmlreport.build(conn)
@@ -565,8 +565,13 @@ def test_union_branch_branding(tmp_path):
 
     page = htmlreport.build(conn)
     conn.close()
-    assert "(dev)" in page  # the lone repo's Target branch, not a 'main' default
+    # the {repo}@{branch} slug brands the lone repo's Target branch itself
+    # (not a 'main' default) — and the parenthesised branch tag is never
+    # repeated next to it
+    assert "alpha-repo@dev" in page
     assert "(main)" not in page
+    assert "(dev)" not in page
+    assert "alpha-repo@dev (dev)" not in page
 
     b = _repo_with_artifact(
         tmp_path,
@@ -673,7 +678,7 @@ def test_gather_aliases_shim_and_canonical_artifacts_of_one_repo(tmp_path):
             ]
         ),
     ):
-        main(["update", "--db", db2, "--no-detect", "--no-lineage", "--no-report"])
+        main(["update", "--db", db2, "--no-detect", "--no-lineage"])
 
     union = tmp_path / "union.db"
     main(["gather", "--db", str(union), str(repo1), str(repo2)])

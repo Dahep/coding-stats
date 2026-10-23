@@ -58,8 +58,9 @@ def render_workflow(branch: str, report: bool = True) -> str:
     b = _yaml_scalar(branch)
     report_job = """
   # Reports render on their own cadence (the store holds only the SQL
-  # artifact). The Pages permissions belong to THIS job only — the update
-  # job never gets them; drop the deploy-pages input when not using Pages.
+  # artifact). This job's permissions: checkout/fetch need contents: read;
+  # the Pages scopes belong HERE only — the update job never gets them, and
+  # they matter only when deploy-pages is "true".
   report:
     needs: update
     if: ${{ always() && needs.update.result == 'success' }}
@@ -68,15 +69,16 @@ def render_workflow(branch: str, report: bool = True) -> str:
       group: coding-stats-report
       cancel-in-progress: false
     permissions:
-      pages: write
-      id-token: write
+      contents: read
+      pages: write       # needed only for deploy-pages: "true"
+      id-token: write    # needed only for deploy-pages: "true"
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: Dahep/coding-stats/report@v1
         with:
-          deploy-pages: "true"
+          deploy-pages: "false"  # flip to "true" to publish to GitHub Pages
 """
     return f"""# coding-stats CI — installed with `coding-stats ci init`;
 # upgradable by moving the action ref (manually or via Dependabot).
@@ -263,17 +265,6 @@ def _push(repo: Path, remote: str, branch: str, head: str) -> None:
     _git(repo, "push", remote, f"{head}:refs/heads/{branch}")
 
 
-def _head(repo: Path) -> str | None:
-    """HEAD sha, or None on an unborn branch (a fresh orphan Data branch)."""
-    proc = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", "HEAD"],
-        capture_output=True,
-        check=False,
-        text=True,
-    )
-    return proc.stdout.strip() or None if proc.returncode == 0 else None
-
-
 def _diff(rel: str, current: str, generated: str) -> str:
     lines = list(
         difflib.unified_diff(
@@ -290,20 +281,7 @@ def _diff(rel: str, current: str, generated: str) -> str:
     return "\n".join(lines)
 
 
-def _git(repo: Path, *args: str) -> str:
-    return subprocess.run(
-        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
-    ).stdout
-
-
-def _store_dirty(repo: Path) -> bool:
-    return bool(_git(repo, "status", "--porcelain", "--", ".coding-stats/").strip())
-
-
-def _is_ancestor(repo: Path, maybe_ancestor: str, descendant: str) -> bool:
-    proc = subprocess.run(
-        ["git", "-C", str(repo), "merge-base", "--is-ancestor", maybe_ancestor, descendant],
-        capture_output=True,
-        check=False,
-    )
-    return proc.returncode == 0
+_git = datastore.git_run
+_store_dirty = datastore.store_dirty
+_head = datastore.head_sha
+_is_ancestor = datastore.is_ancestor

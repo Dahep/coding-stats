@@ -25,7 +25,14 @@ def test_declared_inputs_and_outputs(doc):
     assert doc["inputs"]["include-db"]["default"] == "false"
     assert "artifact-name" in doc["inputs"]
     assert doc["outputs"]["report-path"]["value"] == "${{ env.CODING_STATS_REPORT_PATH }}"
-    assert doc["outputs"]["db-path"]["value"] == "${{ env.CODING_STATS_DB_PATH }}"
+    # db-path aliases the union var the engine-paths step actually writes
+    assert doc["outputs"]["db-path"]["value"] == "${{ env.CODING_STATS_UNION }}"
+    evaluated = "\n".join(
+        line
+        for line in ACTION.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert "CODING_STATS_UNION=" in evaluated  # the env var exists, not just the mapping
 
 
 def test_engine_installed_from_repo_root_above_the_action_path(doc):

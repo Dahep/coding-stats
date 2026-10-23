@@ -61,7 +61,7 @@ def _legacy_repo(tmp_path, repo, monkeypatch=None, old_origin=True):
             "coding_stats.cli.Session", lambda model, sid=None: FakeSession(replies)
         )
         extra = []
-    main(["update", "--db", str(legacy_db), "--no-serialize", "--no-report", *extra])
+    main(["update", "--db", str(legacy_db), "--no-serialize", *extra])
     conn = sqlite3.connect(legacy_db)
     conn.row_factory = sqlite3.Row
     store = repo / ".skill-stats"
@@ -318,7 +318,7 @@ def test_migrate_db_behind_artifact_seeds_from_artifact(tmp_path, repo, monkeypa
         '{"k":"new","title":"feature d","about":"x","why":"y"}',
     ]
     monkeypatch.setattr("coding_stats.cli.Session", lambda model, sid=None: FakeSession(replies))
-    main(["update", "--db", str(tmp_path / "legacy.db"), "--no-serialize", "--no-report"])
+    main(["update", "--db", str(tmp_path / "legacy.db"), "--no-serialize"])
     monkeypatch.setattr("coding_stats.cli.Session", lambda model, sid=None: FakeSession([]))
     store = repo / ".skill-stats"
     conn = sqlite3.connect(tmp_path / "legacy.db")
@@ -409,7 +409,7 @@ def test_migrate_default_destination_mirror_respects_home(tmp_path, repo, monkey
     )
     legacy_db.parent.mkdir()
     main(["init", str(repo), "--db", str(legacy_db), "--branch", "main"])
-    main(["update", "--db", str(legacy_db), "--no-serialize", "--no-report"])
+    main(["update", "--db", str(legacy_db), "--no-serialize"])
     conn = sqlite3.connect(legacy_db)
     conn.row_factory = sqlite3.Row
     store = repo / ".skill-stats"
