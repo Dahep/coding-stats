@@ -2,6 +2,7 @@
 (ci land) — local bare remotes, no GH API."""
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -313,3 +314,22 @@ def test_ci_land_parents_previous_data_tip_and_survives_target_movement(repo, tm
     second = _branch_tip(bare, "coding-stats/main")
     assert git_out(store.worktree, "rev-parse", "HEAD^").strip() == first  # parented
     assert second != first
+
+
+def test_ci_dogfood_workflow_is_the_generated_caller_workflow():
+    """This repo adopts like any other caller: the committed workflow is
+    `ci init`'s render, with only this repo's per-repo opt-in (Pages)
+    flipped on — the actions ref is the same public `@v1`, never `./`.
+    Structural equality (modulo the one flipped input): rewording ci.py's
+    comments can never break the adopter/caller parity."""
+    import yaml
+
+    committed = Path(__file__).parents[1] / ".github" / "workflows" / "coding-stats.yml"
+    got = yaml.safe_load(committed.read_text(encoding="utf-8"))
+    on = got.get("on", got.get(True))  # PyYAML 1.1 reads bare `on` as bool
+    assert on["push"]["branches"] == ["main"]
+    rendered = yaml.safe_load(ci.render_workflow("main"))
+    # normalize the single per-repo opt-in on BOTH sides, then compare whole
+    for doc in (got, rendered):
+        doc["jobs"]["report"]["steps"][-1]["with"]["deploy-pages"] = "normalized"
+    assert got == rendered

@@ -1,15 +1,18 @@
-# coding-stats dogfood (ADR-0006 clause 5): this repo adopts its own actions.
-# Every release is proven by this real run.
+# coding-stats CI — installed with `coding-stats ci init`;
+# upgradable by moving the action ref (manually or via Dependabot).
 name: coding-stats
 
 on:
   push:
     branches:
-      - main
+      - 'main'
 
 permissions: {}
 
 jobs:
+  # One `uses:` step after checkout — the action pins the engine version to
+  # its own checkout, walks, classifies, and lands the Artifact on the
+  # Data branch coding-stats/<branch>; the Target branch is never touched.
   update:
     runs-on: ubuntu-latest
     # The same branch's runs never overlap; a superseded run abandons at
@@ -18,18 +21,22 @@ jobs:
       group: coding-${{ github.workflow }}-${{ github.ref_name }}
       cancel-in-progress: false
     permissions:
-      contents: write  # the Data-branch landing is the only write (GITHUB_TOKEN)
+      contents: write  # the landing commit is the only write (GITHUB_TOKEN)
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # walk, blame and partial recompute need full history
-      # Dogfood: the action comes from THIS checkout (the pinned-ref rule
-      # collapses to the checkout itself).
-      - uses: ./
+      # Work repos: pin the commit sha instead of the moving tag — this job
+      # holds contents: write and LLM keys.
+      - uses: Dahep/coding-stats@v1
         with:
           opencode-api-key: ${{ secrets.OPENCODE_API_KEY }}
           openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
 
+  # Reports render on their own cadence (the store holds only the SQL
+  # artifact). This job's permissions: checkout/fetch need contents: read;
+  # the Pages scopes belong HERE only — the update job never gets them, and
+  # they matter only when deploy-pages is "true".
   report:
     needs: update
     if: ${{ always() && needs.update.result == 'success' }}
@@ -39,12 +46,12 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: read
-      pages: write
-      id-token: write
+      pages: write       # needed only for deploy-pages: "true"
+      id-token: write    # needed only for deploy-pages: "true"
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: ./report
+      - uses: Dahep/coding-stats/report@v1
         with:
-          deploy-pages: "true"
+          deploy-pages: "true"  # this repo's per-repo opt-in (publishes the report)

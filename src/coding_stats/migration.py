@@ -584,11 +584,29 @@ def migrate_to_data_branch(
             " re-run migrate)"
         )
         return out
+    # the old-rendered scaffold goes WITH the store; an actions-based caller
+    # workflow (already the adopter shape) stays untouched. Detection reads
+    # the TARGET branch's committed workflow — not this working tree, which
+    # may be mid-migration — and treats an unreadable file as unknown-scope
+    # (the rm line is offered only when the old render is positively seen).
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "show", f"{branch}:{ci.WORKFLOW_REL}"],
+        capture_output=True,
+        check=False,
+    )
+    workflow_text = proc.stdout.decode("utf-8", "replace") if proc.returncode == 0 else ""
+    is_old_scaffold = proc.returncode == 0 and "uv tool install" in workflow_text
+    scaffold_line = (
+        f"  git rm -r {ci.WORKFLOW_REL}               # the old rendered scaffold;"
+        " regenerate with 'coding-stats ci init'\n"
+        if is_old_scaffold
+        else ""
+    )
     out.append(
         "removal is a normal PR (migration never pushes to the Target branch): next steps\n"
         "  git checkout <target>\n"
         "  git rm -r .coding-stats\n"
-        "  rm .github/workflows/coding-stats.yml   # regenerate via ci init's slim call\n"
+        f"{scaffold_line}"
         "  git commit -m 'drop the in-branch stats store (moved to the Data branch)'\n"
         "  git push origin <target>"
     )

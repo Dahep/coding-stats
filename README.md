@@ -70,7 +70,11 @@ See `DESIGN.md` (decisions) and `CONTEXT.md` (domain language).
 
 ## Live report (dogfooding)
 
-This repository runs both actions on itself (`uses: ./` and `./report`): every
+This repository adopts coding-stats like any other repo — `ci init`'s caller
+workflow (the same `Dahep/coding-stats@v1` + report action refs every adopter
+writes), with one per-repo opt-in flipped on by hand afterwards
+(`deploy-pages: "true"`; the template ships Pages off and `ci init` does not
+remember the flip): every
 push to `main` walks, classifies, and lands the artifact on the Data branch
 `coding-stats/main` — `main`'s own history stays human-only — and the report
 gathers every Data branch and publishes to
@@ -143,24 +147,17 @@ fires: pushes made with `GITHUB_TOKEN` do not start workflows.
 
 Immutable `v1.x.y` tags plus a moving `v1` major tag, cut from `main` via
 PR-merged release commits — tags are never pushed to `main` as branch
-updates. This repo's own workflows use `uses: ./` and `./report`, so every
-release is proven by a real dogfood run.
+updates. This repo runs the released actions (`@v1`) like any other repo;
+after a release moves `v1`, the next real push to `main` is the proof run
+(the release's own merge-push resolves `@v1` to the previous tag). While
+changes await a release, nothing live proves them — the test suite is the
+only automated guarantee until a tag carries them.
 
 To run the update in CI, adopt the composite action `Dahep/coding-stats@v1`
 (see `action.yml`): one `uses:` step after `actions/checkout` with
 `fetch-depth: 0`. It installs the engine exactly at the action ref you pin and
 lands every update on the Data branch `coding-stats/<branch>` — the analyzed
 branch itself never receives bot commits.
-
-For reports there is a second composite action, `Dahep/coding-stats/report@v1`
-(see `report/action.yml`): it gathers every `coding-stats/*` Data branch of
-the repo with Shared-commit dedup, renders one HTML report, uploads it as an
-Actions artifact (and optionally the union DB, `include-db: true`) and deploys
-to Pages only when `deploy-pages: true` (with `pages: write` / `id-token:
-write` permissions in the report job). Trigger it by `workflow_run` after the
-update workflow, a schedule, or manual dispatch — a `push` trigger on
-`coding-stats/**` never fires, because pushes made with `GITHUB_TOKEN` do not
-start workflows.
 
 `classify` shells out to the `opencode` CLI (`opencode run --format json`,
 model configurable at `init` with `--model`, default `opencode/glm-5.3-flash`)

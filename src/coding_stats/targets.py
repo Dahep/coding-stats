@@ -49,7 +49,8 @@ def annotate_fix(repo: Path, conn: sqlite3.Connection, sha: str, min_target_line
 
 def annotate_all(repo: Path, conn: sqlite3.Connection, min_target_lines: int = 1) -> int:
     shas = [
-        r["sha"] for r in conn.execute(
+        r["sha"]
+        for r in conn.execute(
             """SELECT c.sha FROM commits c JOIN commit_verdicts v ON v.commit_id = c.id
                WHERE v.verdict = 'fix' ORDER BY c.walk_index"""
         )

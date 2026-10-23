@@ -114,4 +114,44 @@ def test_migration_prints_removal_pr_steps(tmp_path, repo, capsys, monkeypatch):
     _committed_store(repo, ['{"k":"new","title":"o","about":"","why":"y"}'])
     main(["migrate", str(repo), "--data-branch"])
     out = capsys.readouterr().out
-    assert "git rm -r .coding-stats" in out or ".github/workflows" in out
+    assert "git rm -r .coding-stats" in out
+    assert "git rm -r .github/workflows" not in out  # no workflow: nothing else to remove
+
+
+def test_migration_never_offers_to_remove_an_actions_based_workflow(tmp_path, repo, capsys):
+    """The PR's declared guarantee pinned: an ACTIONS-BASED caller workflow
+    (the shape every adopter writes) is never offered for deletion — the
+    detection reads the Target branch's COMMITTED workflow (so the fixture
+    commits what it writes)."""
+    from coding_stats.ci import render_workflow
+
+    commit_files(repo, "one", {"a.txt": "a\n"})
+    (repo / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+    (repo / ".github" / "workflows" / "coding-stats.yml").write_text(
+        render_workflow("main"), encoding="utf-8"
+    )
+    run(repo, "add", "-A", "--", ".github")
+    run(repo, "commit", "-m", "adopter workflow")
+    _committed_store(repo, [])
+    main(["migrate", str(repo), "--data-branch"])
+    out = capsys.readouterr().out
+    assert "git rm -r .coding-stats" in out
+    assert ".github/workflows" not in out.split("next steps", 1)[1]
+
+
+def test_migration_offers_to_remove_the_old_rendered_scaffold(tmp_path, repo, capsys):
+    """The old rendered scaffold (uv tool install) goes WITH the store: its
+    git-rm line appears — staged, so the printed list is safe to run
+    verbatim."""
+    commit_files(repo, "one", {"a.txt": "a\n"})
+    (repo / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+    (repo / ".github" / "workflows" / "coding-stats.yml").write_text(
+        "# rendered scaffold\n- run: uv tool install 'coding-stats @ git+x'\n",
+        encoding="utf-8",
+    )
+    run(repo, "add", "-A", "--", ".github")
+    run(repo, "commit", "-m", "old scaffold")
+    _committed_store(repo, [])
+    main(["migrate", str(repo), "--data-branch"])
+    out = capsys.readouterr().out
+    assert "git rm -r .github/workflows/coding-stats.yml" in out
