@@ -103,9 +103,7 @@ def default_worktree(repo: Path, target: str) -> Path:
     if git_dir.is_dir():
         return git_dir / STORE_DIR / target
     key = hashlib.sha256(str(Path(repo).resolve()).encode()).hexdigest()[:16]
-    return (
-        Path(tempfile.gettempdir()) / STORE_DIR / f"{Path(repo).name}-{key}" / target
-    )
+    return Path(tempfile.gettempdir()) / STORE_DIR / f"{Path(repo).name}-{key}" / target
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> str:
@@ -265,8 +263,7 @@ def prepare(
         (
             name
             for name in refs
-            if name != branch
-            and (name.startswith(branch + "/") or branch.startswith(name + "/"))
+            if name != branch and (name.startswith(branch + "/") or branch.startswith(name + "/"))
         ),
         None,
     )

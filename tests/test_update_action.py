@@ -113,9 +113,7 @@ def test_caller_needs_only_contents_write():
     # (a header comment may show the caller mapping one — comments evaluate
     # to nothing)
     evaluated = "\n".join(
-        line
-        for line in ACTION_TEXT.splitlines()
-        if not line.lstrip().startswith("#")
+        line for line in ACTION_TEXT.splitlines() if not line.lstrip().startswith("#")
     )
     assert "${{ secrets." not in evaluated
 

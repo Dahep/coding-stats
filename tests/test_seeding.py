@@ -3,7 +3,6 @@ reuses sibling-Data-branch verdicts for shared shas — never re-sends them to
 the LLM — while the deterministic stages keep running on B. External seam:
 main([...]) over temp repos + bare origin."""
 
-
 import sqlite3
 import subprocess
 
@@ -21,9 +20,7 @@ def _bare(tmp_path) -> str:
 def _with_remote(repo, bare) -> None:
     run(repo, "remote", "add", "origin", bare)
     run(repo, "push", "-q", "-u", "origin", "main")
-    subprocess.run(
-        ["git", "-C", bare, "symbolic-ref", "HEAD", "refs/heads/main"], check=True
-    )
+    subprocess.run(["git", "-C", bare, "symbolic-ref", "HEAD", "refs/heads/main"], check=True)
 
 
 class Scripted:
@@ -87,9 +84,7 @@ def _art(repo, branch="main") -> str:
     )
 
 
-def test_update_seeds_shared_commits_from_verifying_sibling(
-    tmp_path, repo, capsys, monkeypatch
-):
+def test_update_seeds_shared_commits_from_verifying_sibling(tmp_path, repo, capsys, monkeypatch):
 
     commit_files(repo, "shared feature", {"s.txt": "s1\ns2\n"})
     bare = _bare(tmp_path)

@@ -89,9 +89,7 @@ def test_update_writes_no_report_into_the_store(tmp_path, repo, capsys, monkeypa
     commit_files(repo, "feature", {"a.txt": "a1\n"})
     db_path = str(tmp_path / "u.db")
     main(["init", str(repo), "--db", db_path])
-    monkeypatch.setattr(
-        "coding_stats.cli.Session", lambda model, sid=None: Scripted()
-    )
+    monkeypatch.setattr("coding_stats.cli.Session", lambda model, sid=None: Scripted())
     monkeypatch.chdir(repo)
     main(["update", "--db", db_path])
     capsys.readouterr()

@@ -223,9 +223,7 @@ def register_repository(conn: sqlite3.Connection, repo: Path, branch: str | None
             elif str(row["slug"]) != slug:
                 # non-identity refresh: the slug now carries the branch; the
                 # key (Repository key) is unchanged, so this is normalization
-                conn.execute(
-                    "UPDATE repositories SET slug = ? WHERE id = ?", (slug, rid)
-                )
+                conn.execute("UPDATE repositories SET slug = ? WHERE id = ?", (slug, rid))
         else:
             cur = conn.execute(
                 "INSERT INTO repositories (repo_key, slug, branch, clone_url, added_at)"

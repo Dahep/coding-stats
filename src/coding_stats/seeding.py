@@ -44,7 +44,7 @@ class _Source:
 
     data_branch: str
     repo_key: str
-    order: tuple  # (earliest classified_at, repository key): win order
+    order: tuple[str, str, str]  # (earliest classified_at, repository key, branch)
     rows: sqlite3.Connection
     by_sha: dict[str, int]  # sha -> the sibling's local commit id
 
@@ -147,8 +147,7 @@ def _winning_sources(
                 ),
                 rows=rows,
                 by_sha={
-                    str(r["sha"]): int(r["id"])
-                    for r in rows.execute("SELECT sha, id FROM commits")
+                    str(r["sha"]): int(r["id"]) for r in rows.execute("SELECT sha, id FROM commits")
                 },
             )
         )
@@ -164,9 +163,7 @@ def _copy_commit(
     ids when the referenced sha exists here (else NULL: no dangling ints —
     the closure's deterministic re-derivation below extends what reproves)."""
     src_id = src.by_sha[sha]
-    v = src.rows.execute(
-        "SELECT * FROM commit_verdicts WHERE commit_id = ?", (src_id,)
-    ).fetchone()
+    v = src.rows.execute("SELECT * FROM commit_verdicts WHERE commit_id = ?", (src_id,)).fetchone()
     if v is not None:
         conn.execute(
             "INSERT OR IGNORE INTO commit_verdicts"
@@ -187,8 +184,7 @@ def _copy_commit(
         fid = str(link["feature_id"])
         _copy_feature(conn, src, fid, our_rid)
         conn.execute(
-            "INSERT OR IGNORE INTO commits_features (commit_id, feature_id, role)"
-            " VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO commits_features (commit_id, feature_id, role) VALUES (?, ?, ?)",
             (our_commit_id, fid, str(link["role"])),
         )
     for att in src.rows.execute(

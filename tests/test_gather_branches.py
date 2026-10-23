@@ -52,9 +52,9 @@ def test_gather_two_data_branches_of_same_repo(tmp_path, repo, capsys, monkeypat
     union = str(tmp_path / "union.db")
     main(["gather", "--db", union, str(repo)])
     recon = db.connect(union)
-    assert [r["repo_key"] for r in recon.execute(
-        "SELECT repo_key FROM repositories ORDER BY repo_key"
-    )] == ["local:repo@dev", "local:repo@main"]
+    assert [
+        r["repo_key"] for r in recon.execute("SELECT repo_key FROM repositories ORDER BY repo_key")
+    ] == ["local:repo@dev", "local:repo@main"]
     assert recon.execute("SELECT COUNT(*) c FROM commits").fetchone()["c"] == 3  # per key
     s = snapshot(recon)
     assert s.total_commits == 2  # the shared sha counted once
@@ -105,10 +105,14 @@ def test_regather_one_key_keeps_the_others_rows(tmp_path, repo, capsys, monkeypa
     ]
     assert dev_commits == [(2,)]  # dev's own two commits (shared + dev-only)
     main(["gather", "--db", union, str(repo)])  # dir source: expands to ALL
-    main([
-        "gather", "--db", union,
-        str(store_worktree(repo, "main") / ".coding-stats" / "coding-stats.sql"),
-    ])
+    main(
+        [
+            "gather",
+            "--db",
+            union,
+            str(store_worktree(repo, "main") / ".coding-stats" / "coding-stats.sql"),
+        ]
+    )
     dev_rows = [
         tuple(r)
         for r in db.connect(union).execute(
@@ -214,9 +218,7 @@ def test_loser_dependents_repoint_through_winner(tmp_path):
     assert [f.fid for f in feature_ranking(conn)] == ["eq@early-1"]
     # per-key rows untouched in the union; the org projection re-points
     view = org(conn)
-    rows = view.execute(
-        "SELECT feature_id FROM fixes_features WHERE fix_commit_id = 3"
-    ).fetchall()
+    rows = view.execute("SELECT feature_id FROM fixes_features WHERE fix_commit_id = 3").fetchall()
     assert [tuple(r)[0] for r in rows] == ["eq@early-1"]
     conn.close()
 
@@ -231,13 +233,11 @@ def test_loser_dependents_dropped_when_winner_attributes_nothing(tmp_path):
     # the winner (a cleanup verdict) attributes x40 to nothing: the fix's
     # attributed row DROPPED in the projection; per-key rows stay untouched
     view = org(conn)
-    rows = view.execute(
-        "SELECT feature_id FROM fixes_features WHERE fix_commit_id = 3"
-    ).fetchall()
+    rows = view.execute("SELECT feature_id FROM fixes_features WHERE fix_commit_id = 3").fetchall()
     assert rows == []
-    assert [tuple(r) for r in conn.execute(
-        "SELECT fix_commit_id, feature_id FROM fixes_features"
-    )] == [(3, "eq@later-1")]  # the raw union still holds the losing row
+    assert [
+        tuple(r) for r in conn.execute("SELECT fix_commit_id, feature_id FROM fixes_features")
+    ] == [(3, "eq@later-1")]  # the raw union still holds the losing row
     assert s.total_features == 0
     assert feature_ranking(conn) == []
     conn.close()
@@ -346,8 +346,8 @@ def test_gather_unmounted_data_branch_refs(tmp_path, repo, capsys, monkeypatch):
     union = str(tmp_path / "union.db")
     main(["gather", "--db", union, str(repo)])
     recon = db.connect(union)
-    assert [r["repo_key"] for r in recon.execute(
-        "SELECT repo_key FROM repositories ORDER BY repo_key"
-    )] == ["local:repo@dev", "local:repo@main"]  # both discovered via refs
+    assert [
+        r["repo_key"] for r in recon.execute("SELECT repo_key FROM repositories ORDER BY repo_key")
+    ] == ["local:repo@dev", "local:repo@main"]  # both discovered via refs
     assert snapshot(recon).total_commits == 2  # the shared sha once
     recon.close()

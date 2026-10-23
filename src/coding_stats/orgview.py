@@ -92,11 +92,27 @@ def _copy_commits(conn: sqlite3.Connection, out: sqlite3.Connection) -> dict[int
             " author_name, title, message, subject_patch_id, walk_index, kind, diff,"
             " added_lines, deleted_lines, churn_lines)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            tuple(winner[c] for c in (
-                "id", "repo_id", "sha", "parent_sha", "tree_sha", "committed_at",
-                "author_name", "title", "message", "subject_patch_id", "walk_index",
-                "kind", "diff", "added_lines", "deleted_lines", "churn_lines",
-            )),
+            tuple(
+                winner[c]
+                for c in (
+                    "id",
+                    "repo_id",
+                    "sha",
+                    "parent_sha",
+                    "tree_sha",
+                    "committed_at",
+                    "author_name",
+                    "title",
+                    "message",
+                    "subject_patch_id",
+                    "walk_index",
+                    "kind",
+                    "diff",
+                    "added_lines",
+                    "deleted_lines",
+                    "churn_lines",
+                )
+            ),
         )
         for r in rows:
             repoint[int(r["id"])] = int(winner["id"])
@@ -203,8 +219,7 @@ def _copy_links(
         if commit_map[cid] != cid:
             continue  # loser row: the winner's links apply
         out.execute(
-            "INSERT OR IGNORE INTO commits_features (commit_id, feature_id, role)"
-            " VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO commits_features (commit_id, feature_id, role) VALUES (?, ?, ?)",
             (cid, str(r["feature_id"]), r["role"]),
         )
     for r in conn.execute("SELECT * FROM fix_touches ORDER BY fix_commit_id, source_commit_id"):
@@ -300,21 +315,14 @@ def _purge_orphaned_features(out: sqlite3.Connection) -> None:
     """Features without any defining commit left never enter stats (the same
     purge rule the walk uses). Dependent rows first, then the feature rows."""
     out.execute(
-        "DELETE FROM feature_line_samples"
-        " WHERE feature_id NOT IN (SELECT id FROM features)"
+        "DELETE FROM feature_line_samples WHERE feature_id NOT IN (SELECT id FROM features)"
     )
-    out.execute(
-        "DELETE FROM fixes_features WHERE feature_id NOT IN (SELECT id FROM features)"
-    )
-    out.execute(
-        "DELETE FROM commits_features WHERE feature_id NOT IN (SELECT id FROM features)"
-    )
+    out.execute("DELETE FROM fixes_features WHERE feature_id NOT IN (SELECT id FROM features)")
+    out.execute("DELETE FROM commits_features WHERE feature_id NOT IN (SELECT id FROM features)")
     out.execute(
         """DELETE FROM features WHERE NOT EXISTS
            (SELECT 1 FROM commits_features cf
             WHERE cf.feature_id = features.id AND cf.role = 'defines')"""
     )
-    out.execute(
-        "DELETE FROM fixes_features WHERE feature_id NOT IN (SELECT id FROM features)"
-    )
+    out.execute("DELETE FROM fixes_features WHERE feature_id NOT IN (SELECT id FROM features)")
     out.execute("DELETE FROM commits_features WHERE feature_id NOT IN (SELECT id FROM features)")

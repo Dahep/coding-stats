@@ -25,9 +25,7 @@ def _bare(tmp_path) -> str:
 def _with_remote(repo, bare) -> None:
     run(repo, "remote", "add", "origin", bare)
     run(repo, "push", "-q", "-u", "origin", "main")
-    subprocess.run(
-        ["git", "-C", bare, "symbolic-ref", "HEAD", "refs/heads/main"], check=True
-    )
+    subprocess.run(["git", "-C", bare, "symbolic-ref", "HEAD", "refs/heads/main"], check=True)
 
 
 # ------------------------------------------------------- datastore.prepare ---
@@ -164,9 +162,7 @@ def test_default_worktree_linked_worktree_checkout(repo, tmp_path):
 # ---------------------------------------- update + land against a bare origin ---
 
 
-def test_update_and_land_first_run_creates_orphan_data_branch(
-    tmp_path, repo, capsys, monkeypatch
-):
+def test_update_and_land_first_run_creates_orphan_data_branch(tmp_path, repo, capsys, monkeypatch):
     """The full outside-visible seam: update writes the store on the Data
     branch worktree, land pushes it; the Target branch is untouched."""
 
@@ -223,9 +219,7 @@ def test_update_skips_legacy_store_without_data_branch(tmp_path, repo, capsys):
     assert "walked" not in out.split("::notice::", 1)[1].split("update skipped;", 1)[0]
 
 
-def test_update_reprefixes_old_format_artifact_in_place(
-    tmp_path, repo, capsys, monkeypatch
-):
+def test_update_reprefixes_old_format_artifact_in_place(tmp_path, repo, capsys, monkeypatch):
     """An artifact minted under the branch-less {repo-slug}-{n} scheme is
     re-prefixed to {repo}@{branch} when the update adopts it — classified
     history kept, the digest honestly recomputed."""

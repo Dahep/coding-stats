@@ -60,9 +60,7 @@ def test_ci_init_writes_caller_workflow_and_is_idempotent(repo):
     report = jobs["report"]
     # Pages permissions live in the report job only (ADR-0006 clause 5)
     assert report["permissions"] == {"pages": "write", "id-token": "write"}
-    assert "Dahep/coding-stats/report@v1" in [
-        step.get("uses", "") for step in report["steps"]
-    ]
+    assert "Dahep/coding-stats/report@v1" in [step.get("uses", "") for step in report["steps"]]
     assert "glm" not in text  # no model names: settings travel in the artifact
 
     msgs = ci.init(repo, "main")  # idempotent assertion
@@ -74,9 +72,7 @@ def test_ci_init_no_report_omits_the_report_job(repo):
     import yaml
 
     ci.init(repo, "main", report=False)
-    doc = yaml.safe_load(
-        (repo / ".github" / "workflows" / "coding-stats.yml").read_text("utf-8")
-    )
+    doc = yaml.safe_load((repo / ".github" / "workflows" / "coding-stats.yml").read_text("utf-8"))
     assert set(doc["jobs"]) == {"update"}
 
 

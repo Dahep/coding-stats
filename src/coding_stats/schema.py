@@ -496,8 +496,11 @@ def _step_3(conn: sqlite3.Connection) -> None:
         " SELECT feature_id, at_commit_sha, live_lines"
         " FROM feature_line_samples_migration ORDER BY feature_id, at_commit_sha"
     )
-    for name in ("feature_line_samples_migration", "fixes_features_migration",
-                 "commits_features_migration"):
+    for name in (
+        "feature_line_samples_migration",
+        "fixes_features_migration",
+        "commits_features_migration",
+    ):
         conn.execute(f"DROP TABLE {name}")
     conn.execute("CREATE INDEX idx_commits_features_feature ON commits_features(feature_id)")
     conn.execute("CREATE INDEX idx_fixes_features_feature ON fixes_features(feature_id)")

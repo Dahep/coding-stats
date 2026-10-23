@@ -190,9 +190,7 @@ def _load(source: Path, label: str, data: bytes) -> _Ingest:
             branch = str(repo_row["branch"] or "")
             canon_key = identity.repo_key(canon, branch)
             if key.startswith("local:") or key == canon_key:
-                canon_slug = identity.repo_slug(
-                    identity.slug_from_clone_url(canon), branch
-                )
+                canon_slug = identity.repo_slug(identity.slug_from_clone_url(canon), branch)
                 identity.reprefix_features(rows, canon_slug)
                 key, slug, clone_url = canon_key, canon_slug, canon
     return _Ingest(
