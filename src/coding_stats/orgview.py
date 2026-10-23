@@ -63,9 +63,9 @@ def _project(conn: sqlite3.Connection) -> sqlite3.Connection:
     _copy_repositories(conn, out)
     commit_map = _copy_commits(conn, out)  # dedup shas per repo base
     _copy_verdicts(conn, out, commit_map)
-    owner_of = _copy_features(conn, out, commit_map)
+    _copy_features(conn, out, commit_map)
     _copy_links(conn, out, commit_map)
-    _repoint_dropped_features(conn, out, commit_map, owner_of)
+    _repoint_dropped_features(conn, out, commit_map)
     _purge_orphaned_features(out)
     for r in conn.execute("SELECT key, value FROM settings ORDER BY key"):
         out.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (r["key"], r["value"]))
@@ -300,7 +300,6 @@ def _repoint_dropped_features(
     conn: sqlite3.Connection,
     out: sqlite3.Connection,
     commit_map: dict[int, int],
-    owner_of: dict[str, int],
 ) -> None:
     """fixes_features rows naming a feature whose ONLY defining commit was a
     losing dedup row re-point to each fid the winner attributes the deduped
