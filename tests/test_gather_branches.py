@@ -12,8 +12,7 @@ from coding_stats import artifact, ci, datastore, db, identity
 from coding_stats.cli import main
 from coding_stats.metrics import feature_ranking, snapshot
 from conftest import commit_files, run, store_worktree
-
-from test_seeding import Scripted, _art, _bare, _mat_rows, _with_remote
+from test_seeding import Scripted, _bare, _with_remote
 
 
 def test_gather_two_data_branches_of_same_repo(tmp_path, repo, capsys, monkeypatch):
@@ -63,7 +62,7 @@ def test_gather_two_data_branches_of_same_repo(tmp_path, repo, capsys, monkeypat
     recon.close()
 
 
-def test_regather_one_key_keeps_the_others_rows(tmp_path, repo):
+def test_regather_one_key_keeps_the_others_rows(tmp_path, repo, capsys, monkeypatch):
     """Re-gathering of one key must never delete another key's rows for a
     shared (seeded) feature id or its commits."""
     commit_files(repo, "shared feature", {"s.txt": "s1\n"})
@@ -105,9 +104,11 @@ def test_regather_one_key_keeps_the_others_rows(tmp_path, repo):
         )
     ]
     assert dev_commits == [(2,)]  # dev's own two commits (shared + dev-only)
-    main(["gather", "--db", union, str(repo)])  # re-gather main only — wait:
-    # (the dir source expands to ALL data branches, so pass the artifact)
-    main(["gather", "--db", union, store_worktree(repo, "main") / ".coding-stats" / "coding-stats.sql"])
+    main(["gather", "--db", union, str(repo)])  # dir source: expands to ALL
+    main([
+        "gather", "--db", union,
+        str(store_worktree(repo, "main") / ".coding-stats" / "coding-stats.sql"),
+    ])
     dev_rows = [
         tuple(r)
         for r in db.connect(union).execute(
@@ -204,32 +205,40 @@ def _crafted(path: str | None, cleanup_winner: bool = False, fix: bool = False):
 def test_loser_dependents_repoint_through_winner(tmp_path):
     """The losing verdict's own feature dies; a fix lineaged onto it re-points
     to the feature the winner attributes the shared sha to."""
+    from coding_stats.orgview import org
+
     union = str(tmp_path / "union.db")
     conn = _crafted(union, cleanup_winner=False, fix=True)
     s = snapshot(conn)
     assert s.total_commits == 2  # x40 (shared, once) + yfix
     assert s.total_features == 1  # eq@later-1 purged, eq@early-1 survives
     assert [f.fid for f in feature_ranking(conn)] == ["eq@early-1"]
-    rows = conn.execute(
+    # per-key rows untouched in the union; the org projection re-points
+    view = org(conn)
+    rows = view.execute(
         "SELECT feature_id FROM fixes_features WHERE fix_commit_id = 3"
     ).fetchall()
-    # the fix's attribution re-pointed to the winner's feature (deterministic)
     assert [tuple(r)[0] for r in rows] == ["eq@early-1"]
     conn.close()
 
 
 def test_loser_dependents_dropped_when_winner_attributes_nothing(tmp_path):
+    from coding_stats.orgview import org
+
     union = str(tmp_path / "union.db")
     conn = _crafted(union, cleanup_winner=True, fix=True)
     s = snapshot(conn)
     assert s.total_commits == 2
-    # the winner attributes x40 to nothing: the fix's attribution row DROPPED
-    rows = conn.execute(
+    # the winner (a cleanup verdict) attributes x40 to nothing: the fix's
+    # attributed row DROPPED in the projection; per-key rows stay untouched
+    view = org(conn)
+    rows = view.execute(
         "SELECT feature_id FROM fixes_features WHERE fix_commit_id = 3"
     ).fetchall()
     assert rows == []
-    # the loser's feature itself is purged; the surviving feature set: only
-    # what the winner's own rows defined (nothing) → zero features
+    assert [tuple(r) for r in conn.execute(
+        "SELECT fix_commit_id, feature_id FROM fixes_features"
+    )] == [(3, "eq@later-1")]  # the raw union still holds the losing row
     assert s.total_features == 0
     assert feature_ranking(conn) == []
     conn.close()
@@ -319,7 +328,8 @@ def test_gather_unmounted_data_branch_refs(tmp_path, repo, capsys, monkeypatch):
         ),
     )
     main(["update", "--db", dev_db])
-    capsys.readouterr()
+    main(["update", "--db", dev_db])
+    main(["ci", "land", "--branch", "dev"])  # land BEFORE unmounting
 
     # unmount: remove the mounted worktrees + prune; refs remain
     for branch in ("main", "dev"):
