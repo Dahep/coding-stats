@@ -81,6 +81,12 @@ uv run coding-stats ci land --branch main                             # landing 
 uv run coding-stats gather --db union.db ~/dotfiles ~/.config-repo     # union of artifacts
 ```
 
+To run the update in CI, adopt the composite action `Dahep/coding-stats@v1`
+(see `action.yml`): one `uses:` step after `actions/checkout` with
+`fetch-depth: 0`. It installs the engine exactly at the action ref you pin and
+lands every update on the Data branch `coding-stats/<branch>` — the analyzed
+branch itself never receives bot commits.
+
 `classify` shells out to the `opencode` CLI (`opencode run --format json`,
 model configurable at `init` with `--model`, default `opencode/glm-5.3-flash`)
 in its own scratch session dir so it never touches other sessions. If a reply
