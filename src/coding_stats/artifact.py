@@ -406,6 +406,18 @@ def stamp_schema_steps(conn: sqlite3.Connection, data: bytes) -> None:
     conn.commit()
 
 
+def restore_into(conn: sqlite3.Connection, data: bytes) -> None:
+    """Seed a DB from artifact bytes in ONE call: the authorizer-guarded
+    replay, then the schema-step stamp. The pairing is load-bearing — losing
+    half of it is losing #31 again: materialize alone leaves the
+    _schema_step_* bookkeeping unstamped, and a later serialize of the seeded
+    DB then derives schema-step 0 while the content is the migrated layout
+    (every later restore re-runs the migrations and crashes). Raises
+    MaterializeError on a refused artifact."""
+    materialize(conn, data)
+    stamp_schema_steps(conn, data)
+
+
 KNOWN_TABLES: dict[str, tuple[str, ...]] = {t.name: t.columns for t in _TABLES}
 
 
