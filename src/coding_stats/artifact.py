@@ -197,6 +197,16 @@ _TABLES: tuple[_Table, ...] = (
            FROM pr_evidence ORDER BY repo_id, pr_number, commit_id, rule, raw""",
     ),
     _Table(
+        "pr_watermark",
+        """CREATE TABLE pr_watermark (
+               repo_id INTEGER NOT NULL,
+               last_pr_number INTEGER NOT NULL,
+               PRIMARY KEY (repo_id)
+           );""",
+        ("repo_id", "last_pr_number"),
+        "SELECT repo_id, last_pr_number FROM pr_watermark ORDER BY repo_id",
+    ),
+    _Table(
         "features",
         """CREATE TABLE features (
                id TEXT NOT NULL,
@@ -591,6 +601,10 @@ def _check_ownership(conn: sqlite3.Connection) -> None:
             "pr_evidence",
             f"SELECT COUNT(*) c FROM pr_evidence WHERE repo_id != {rid}"
             f" OR (commit_id IS NOT NULL AND commit_id NOT IN {in_commits})",
+        ),
+        (
+            "pr_watermark",
+            f"SELECT COUNT(*) c FROM pr_watermark WHERE repo_id != {rid}",
         ),
         (
             "commits_features",

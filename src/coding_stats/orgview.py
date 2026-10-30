@@ -64,6 +64,7 @@ def _project(conn: sqlite3.Connection) -> sqlite3.Connection:
     commit_map = _copy_commits(conn, out)  # dedup shas per repo base
     _copy_verdicts(conn, out, commit_map)
     _copy_attribution(conn, out, commit_map)
+    _copy_watermarks(conn, out)
     _copy_features(conn, out, commit_map)
     _copy_links(conn, out, commit_map)
     _repoint_dropped_features(conn, out, commit_map)
@@ -194,6 +195,17 @@ def _copy_verdicts(
                 r["model"],
                 r["classified_at"],
             ),
+        )
+
+
+def _copy_watermarks(conn: sqlite3.Connection, out: sqlite3.Connection) -> None:
+    """The recorded watermarks ride the projection per repository too
+    (ticket #36): run state recorded like the evidence rows, copied
+    verbatim — never derived here."""
+    for r in conn.execute("SELECT * FROM pr_watermark ORDER BY repo_id"):
+        out.execute(
+            "INSERT INTO pr_watermark (repo_id, last_pr_number) VALUES (?, ?)",
+            (r["repo_id"], r["last_pr_number"]),
         )
 
 

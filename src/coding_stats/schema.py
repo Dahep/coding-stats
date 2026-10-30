@@ -567,6 +567,25 @@ def _step_5(conn: sqlite3.Connection) -> None:
     )
 
 
+def _step_6(conn: sqlite3.Connection) -> None:
+    """PR sweep watermark (ADR-0007 clause 2, ticket #36).
+
+    The Watermark — the last incorporated PR number of the PR-channel sweep
+    — recorded state exactly like the ``pr_evidence`` rows it guards: it
+    rides the Artifact, survives partial recompute and gather unchanged, and
+    is never re-derived. One row per repository; the run machinery advances
+    it after each PR's evidence is recorded (rows + watermark, one
+    transaction), so every interruption leaves a contiguous processed
+    prefix. ``IF NOT EXISTS`` for the same replay reason as steps 4-5."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS pr_watermark (
+               repo_id INTEGER NOT NULL REFERENCES repositories(id),
+               last_pr_number INTEGER NOT NULL,
+               PRIMARY KEY (repo_id)
+           )"""
+    )
+
+
 SCHEMA_STEPS: list[Step] = [
     STEP_0_SQL,  # 0: initial schema
     _step_1,  # 1: repository identity, repo-scoped commits, prefixed feature ids
@@ -574,4 +593,5 @@ SCHEMA_STEPS: list[Step] = [
     _step_3,  # 3: union-wide feature key (repository, id) — ADR-0006 clause 4
     _step_4,  # 4: AI attribution verdict + evidence rows — ADR-0007 baseline
     _step_5,  # 5: PR-channel evidence rows — ADR-0007 clauses 3-5 (ticket #35)
+    _step_6,  # 6: PR sweep watermark — ADR-0007 clause 2 (ticket #36)
 ]
