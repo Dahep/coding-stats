@@ -42,6 +42,16 @@ def test_engine_installed_from_repo_root_above_the_action_path(doc):
     assert (ROOT / "pyproject.toml").exists()
 
 
+def test_installs_its_own_uv(doc):
+    """The composite is self-sufficient: it runs astral-sh/setup-uv the way
+    the root update action does. The caller supplies checkout + this one
+    step only — a report job has no uv of its own, and the report@v1 box
+    went red with 'uv: command not found' the first time it ever ran
+    (before that, the #31 restore crash always skipped the job)."""
+    uses = [step["uses"] for step in doc["runs"]["steps"] if "uses" in step]
+    assert any(u.startswith("astral-sh/setup-uv@") for u in uses)
+
+
 def test_gather_covers_every_coding_stats_ref(doc):
     runs = "\n".join(step["run"] for step in doc["runs"]["steps"] if "run" in step)
     assert "refs/heads/coding-stats/*:refs/remotes/origin/coding-stats/*" in runs
