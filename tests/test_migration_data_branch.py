@@ -89,6 +89,7 @@ def test_migration_result_header_carries_the_migrated_step(tmp_path, repo, capsy
     legacy = repo / ".coding-stats" / "coding-stats.sql"
     _committed_store(repo, ['{"k":"new","title":"o","about":"","why":"y"}'])
     legacy_step = artifact.parse_header(legacy.read_bytes()).schema_step
+    assert legacy_step > 0  # the fixture must stamp too, or the compare is vacuous
 
     main(["migrate", str(repo), "--data-branch"])
     capsys.readouterr()
