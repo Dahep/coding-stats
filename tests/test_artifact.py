@@ -173,7 +173,7 @@ def test_header_fields(tmp_path, repo):
     conn, fa, h1, h2 = _built_db(tmp_path, repo)
     content = artifact.serialize(conn).decode("utf-8")
     assert content.startswith("-- coding-stats artifact\n-- format: 1\n")
-    assert _header(content, "schema-step") == "3"
+    assert _header(content, "schema-step") == "4"
     assert _header(content, "repository-key") == "local:repo@main"
     assert _header(content, "covered-through") == h2  # latest walked commit
     digest = _header(content, "digest")

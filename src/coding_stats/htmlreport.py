@@ -13,6 +13,8 @@ from datetime import date
 from pathlib import Path
 
 from .metrics import (
+    attribution_rows,
+    attribution_summary,
     feature_ranking,
     feature_repos,
     features_timeline,
@@ -647,6 +649,64 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
         conn, int(unattr_raw) if unattr_raw is not None else None, complete
     )
 
+    # ------------------------------------------------ AI attribution ----
+    attr = attribution_summary(conn)
+    attr_rows = attribution_rows(conn)
+    attr_donut = _donut(
+        [
+            ("yes", attr.verdict_counts.get("yes", 0), C["cumulative"]),
+            ("possible", attr.verdict_counts.get("possible", 0), C["churn"]),
+            ("no-evidence", attr.verdict_counts.get("no-evidence", 0), C["muted"]),
+        ]
+    )
+
+    def sha_link(sha: str) -> str:
+        return (
+            f'<a href="{html.escape(fallback_url, quote=True)}/commit/{sha}">{sha[:7]}</a>'
+            if fallback_url
+            else _esc(sha[:7])
+        )
+
+    attr_trs = []
+    for r in attr_rows:
+        ev = "".join(
+            f"<div><code>{_esc(rule)}</code> {_esc(raw)}"
+            f" <span class='muted'>{_esc(verdict)}</span></div>"
+            for rule, raw, verdict in r.evidence
+        )
+        attr_trs.append(
+            f"<tr><td>{sha_link(r.sha)}</td><td>{_esc(r.verdict)}</td>"
+            f"<td>{_esc(r.harness or '—')}</td><td>{_esc(r.model or '—')}</td>"
+            f"<td>{ev}</td></tr>"
+        )
+    attr_table = (
+        "<table><thead><tr><th>Commit</th><th>Verdict</th><th>Harness</th>"
+        "<th>Model</th><th>Evidence (rule · raw matched string)</th></tr></thead><tbody>"
+        + "".join(attr_trs)
+        + "</tbody></table>"
+        if attr_trs
+        else "<div class='note'>no attributed commits in this walk</div>"
+    )
+    harness_note = (
+        " Harnesses seen: "
+        + " · ".join(f"{_esc(h)} {n}" for h, n in attr.harness_counts)
+        + "."
+        if attr.harness_counts
+        else ""
+    )
+    attr_section = f"""<section>
+<h2>AI attribution (git-only)</h2>
+<div class="note">Per-commit attribution computed from git data alone: commit
+trailers, raw identity strings (before any mailmap resolution), body
+signatures and tool trailers — plus merge-subject branch prefixes as weak
+(<code>possible</code>) signals. <code>no-evidence</code> means no attribution
+signal matched the commit: an absence of evidence, never a statement about
+authorship. Every attribution is auditable through its evidence rows
+(rule id + the raw matched string).{harness_note}</div>
+{attr_donut}
+{attr_table}
+</section>"""
+
     churn_rows = [
         f"<tr><td class='num'>{i}</td><td>#{fid} {_esc(title)}</td>"
         + (f"<td>{_esc(repos.get(fid, ''))}</td>" if multi else "")
@@ -711,6 +771,8 @@ per feature it reaches. The table covers all {len(ranking)} features.</div>
 {hbars_fixes}
 {rank_table}
 </section>
+
+{attr_section}
 
 {live_section}
 

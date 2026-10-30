@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import cast
 
-from . import identity
+from . import aiattr, identity
 
 STORE_DIR_NAME = ".coding-stats"
 # Pre-rename artifacts committed in git history (`.skill-stats/`) stay excluded
@@ -225,6 +225,36 @@ def tree_sha(repo: Path, sha: str) -> str:
     return _git(repo, "rev-parse", f"{sha}^{{tree}}").strip()
 
 
+def commit_facts(repo: Path, sha: str) -> aiattr.CommitFacts:
+    """The RAW identity strings (lowercase git placeholders: pre-mailmap)
+    plus message text the attribution rule table reads (ticket #34)."""
+    raw = _git(repo, "show", "-s", "--format=%an%x1f%ae%x1f%cn%x1f%ce%x1f%s%x1f%B", sha)
+    an, ae, cn, ce, subject, body = raw.split("\x1f", 5)
+    return aiattr.CommitFacts(
+        author_name=an,
+        author_email=ae,
+        committer_name=cn,
+        committer_email=ce,
+        title=subject.strip(),
+        message=body.strip(),
+    )
+
+
+def backfill_attribution(conn: sqlite3.Connection, repo: Path) -> int:
+    """Re-derive AI attribution rows for walked commits that carry none
+    (restored artifacts minted before the detector, or a wiped table): the
+    rows are pure functions of the commit objects, so re-derivation is
+    deterministic. Returns the number of commits filled."""
+    rows = conn.execute(
+        """SELECT c.id, c.sha FROM commits c
+           LEFT JOIN ai_attribution a ON a.commit_id = c.id
+           WHERE a.commit_id IS NULL ORDER BY c.walk_index"""
+    ).fetchall()
+    for r in rows:
+        aiattr.record(conn, int(r["id"]), commit_facts(repo, str(r["sha"])))
+    return len(rows)
+
+
 def author_and_time(repo: Path, sha: str) -> tuple[str, str]:
     out = _git(repo, "show", "-s", "--format=%an%x1f%aI", sha).strip().split("\x1f")
     return out[0], out[1]
@@ -321,4 +351,8 @@ def walk(repo: Path, conn: sqlite3.Connection, branch: str | None = None) -> int
                 ),
             )
             added += 1
+        # AI attribution (ticket #34): recorded per walked commit, and any
+        # row left missing (a restored pre-feature artifact) is re-derived
+        # from the same commit objects — deterministic, git-only
+        backfill_attribution(conn, repo)
     return added
