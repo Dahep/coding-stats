@@ -1,4 +1,5 @@
-"""Channel-pr evidence: the merged-PR sweep of ticket #35 (ADR-0007 clauses 3-5).
+"""Channel-pr evidence: the merged-PR sweep of ticket #35 (ADR-0007 clauses 3-5)
+with the watermark-driven per-increment machinery of ticket #36 (clause 2).
 
 The PR tier reconstructs attribution the Target-branch walk alone cannot
 see — PR body footers, bot authors, and head branch names recovered from
@@ -34,6 +35,31 @@ the landed Target-branch sha. The pipeline per sweep run from a lower bound:
    functions of the Target branch); a re-run replaces that PR's rows
    wholesale rather than duplicating them (``replace_pr_rows``).
 
+The run machinery (ticket #36, ADR-0007 clause 2) — Keyed by PR number,
+NEVER merge date (PR numbers are total and append-only; dates reorder):
+
+* **Watermark** = the last incorporated PR number, recorded in the Artifact
+  next to the evidence rows and surviving partial recompute and gather
+  exactly as they do (``pr_watermark``, schema step 6).
+* **Oldest-first** walk (ascending PR number) over merged PRs above the
+  watermark; the watermark advances AFTER EACH PR's evidence is recorded
+  (rows + watermark land in one per-PR transaction, ``incorporate_pr``) —
+  never per page. Every interruption leaves a contiguous processed prefix
+  and the next run resumes at the first PR above the watermark, skipping
+  nothing and redoing at worst the single interrupted PR (its rows are
+  replaced, never extended).
+* Closed-unmerged PRs and PRs merged into another base branch are never
+  incorporated and never advance the watermark: their numbers sit below
+  whatever watermark the next merged PR produces.
+* **Stop conditions** end a run cleanly with a visible notice — never a
+  failure exit: rate-limit exhaustion (``RateLimited``), the per-run
+  processing cap, or an interruption. The next run resumes automatically.
+* **Full-history sweep** (``sweep_full``, explicit operator invocation):
+  the same oldest-first walk sharing the watermark, merely walked further —
+  its listing walk continues past the watermark bound until the beginning
+  of the PR numbering (or a stop condition), re-sweeping the full history;
+  later push runs continue after the shared watermark.
+
 Channel precedence (consumption): git-only evidence on the same commit
 outranks inherited PR evidence. The storage encodes it — where the walk
 already recorded the identical match at the same commit, the PR row is not
@@ -47,6 +73,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -58,12 +85,22 @@ from . import aiattr, gitwalk, identity
 
 CHANNEL_PR = "pr"
 DEFAULT_PER_PAGE = 100
+DEFAULT_RUN_CAP = 25  # increment runs ("a few PRs per push run")
+
+STOP_CAP = "cap"
+STOP_RATE_LIMIT = "rate-limit"
+STOP_INTERRUPTED = "interrupted"
 
 Transport = Callable[[str], Any]  # url -> parsed JSON body
 
 
 class SweepError(RuntimeError):
     """The sweep cannot run against this repository (no GitHub identity)."""
+
+
+class RateLimited(RuntimeError):
+    """The GitHub API rate budget is exhausted: a stop condition, not a
+    failure — the run ends cleanly and the next one resumes."""
 
 
 @dataclass(frozen=True)
@@ -100,12 +137,16 @@ class SweepResult:
     rows: int
     suspicious: int
     requests: int  # API requests spent (list pages only)
+    watermark: int = 0  # the watermark after the run (last incorporated PR)
+    stop: str | None = None  # None = ran to its end; else a stop condition
 
 
 def default_transport(url: str) -> Any:
     """The stdlib GitHub API transport (zero runtime dependencies). Auth via
     GITHUB_TOKEN when present (``pull-requests: read`` is enough); unauthen‐
-    cated works for public repos within the smaller rate budget."""
+    cated works for public repos within the smaller rate budget. Rate-limit
+    responses raise ``RateLimited`` — the run's clean-stop signal, never a
+    failure exit."""
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "coding-stats",
@@ -115,8 +156,15 @@ def default_transport(url: str) -> Any:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429 or (
+            exc.code == 403 and exc.headers.get("X-RateLimit-Remaining") == "0"
+        ):
+            raise RateLimited(f"GitHub API rate limit exhausted (HTTP {exc.code})") from exc
+        raise
 
 
 def _parse_pr(item: dict[str, Any]) -> PullRequest:
@@ -307,6 +355,53 @@ def effective_attribution(conn: sqlite3.Connection, commit_id: int) -> aiattr.At
     return aiattr.Attribution(verdict, harness, model, rows)
 
 
+def watermark(conn: sqlite3.Connection) -> int:
+    """The Watermark: the last incorporated PR number (0 when nothing is
+    incorporated yet). Recorded state — it rides the Artifact next to the
+    evidence rows and survives partial recompute and gather unchanged."""
+    row = conn.execute(
+        "SELECT last_pr_number FROM pr_watermark WHERE repo_id = ?",
+        (identity.repo_id_for(conn),),
+    ).fetchone()
+    return int(row["last_pr_number"]) if row is not None else 0
+
+
+def advance_watermark(conn: sqlite3.Connection, pr_number: int) -> None:
+    """Move the Watermark to ``pr_number``, monotonically (never backwards):
+    the last incorporated PR number only ever grows, so a full-history
+    sweep re-recording history below it never regresses the resume point."""
+    conn.execute(
+        "INSERT INTO pr_watermark (repo_id, last_pr_number) VALUES (?, ?)"
+        " ON CONFLICT(repo_id) DO UPDATE"
+        " SET last_pr_number = MAX(last_pr_number, excluded.last_pr_number)",
+        (identity.repo_id_for(conn), pr_number),
+    )
+
+
+def incorporate_pr(
+    conn: sqlite3.Connection,
+    repo: Path,
+    branch: str,
+    pr: PullRequest,
+    *,
+    now: str | None = None,
+    advance: bool = True,
+) -> tuple[int, int]:
+    """The per-PR step of the run machinery (ticket #36): record one PR's
+    evidence rows (replace-not-duplicate) and — when the run may claim
+    contiguous coverage — advance the Watermark to its number, BOTH in one
+    transaction. Interruption at any point leaves the previously
+    incorporated prefix intact; the interrupted PR is at worst redone
+    (replaced) by the next run. Returns (stored rows, suspicious)."""
+    observed_at = now or datetime.now(UTC).isoformat(timespec="seconds")
+    rows = _pr_rows(conn, repo, branch, pr)
+    stored = replace_pr_rows(conn, pr.number, rows, observed_at)
+    if advance:
+        advance_watermark(conn, pr.number)
+    conn.commit()  # rows + watermark land atomically, per PR (never per page)
+    return stored, sum(1 for r in rows if r.suspicious)
+
+
 def sweep(
     conn: sqlite3.Connection,
     repo: Path,
@@ -315,27 +410,103 @@ def sweep(
     *,
     transport: Transport | None = None,
     now: str | None = None,
+    max_prs: int | None = None,
 ) -> SweepResult:
-    """One manual channel-pr sweep run (ticket #35's numbered behavior).
+    """One channel-pr sweep run over merged PRs with number > ``after_pr``,
+    oldest first (ticket #35's numbered behavior on #36's machinery).
     Run after the walk: the mapping reads the walked commits, and a PR whose
     landing is not walked yet is recorded suspicious and healed by a re-run
-    (replace-per-PR) once the walk has caught up."""
+    (replace-per-PR) once the walk has caught up.
+
+    The Watermark advances per incorporated PR — but only while the run
+    claims CONTIGUOUS coverage: a bound above the watermark leaves the range
+    in between unexamined, so the watermark never claims past a gap ("zero
+    skipped PRs" stays true and a later increment walks the gap). ``max_prs``
+    caps the run (a stop condition, not a failure). A rate-limit or
+    interruption during the LISTING stops the run before anything is
+    processed — a partial listing is newest-first and would leave a gap
+    below the watermark, so its PRs are never walked. Later runs resume
+    above the watermark."""
     if after_pr < 0:
         raise SweepError(f"--after-pr must be >= 0 (got {after_pr})")
     owner, name = _github_repo(conn)
-    pulls, requests = list_merged_pulls(owner, name, after_pr, transport)
-    observed_at = now or datetime.now(UTC).isoformat(timespec="seconds")
+    pulls: list[PullRequest] = []
+    requests = 0
+    stop: str | None = None
+    try:
+        pulls, requests = list_merged_pulls(owner, name, after_pr, transport)
+    except RateLimited:
+        stop = STOP_RATE_LIMIT  # incomplete listing: nothing may be processed
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (403, 429):
+            raise
+        stop = STOP_RATE_LIMIT  # 403/429 from the API: the budget is gone
+    except KeyboardInterrupt:
+        stop = STOP_INTERRUPTED
+    # contiguous coverage only: a bound above the watermark leaves a gap the
+    # watermark must never claim over (resume = first PR above it, skipping
+    # nothing)
+    can_advance = after_pr <= watermark(conn)
     processed = rows_n = suspicious_n = 0
-    for pr in pulls:
-        if pr.base_ref != branch:
-            continue  # merged into another branch: never part of this Target
-        rows = _pr_rows(conn, repo, branch, pr)
-        stored = replace_pr_rows(conn, pr.number, rows, observed_at)
-        conn.commit()  # each PR's record lands atomically (watermark-ready)
-        processed += 1
-        rows_n += stored
-        suspicious_n += sum(1 for r in rows if r.suspicious)
-    return SweepResult(processed, rows_n, suspicious_n, requests)
+    if stop is None:
+        try:
+            for pulled in pulls:
+                if pulled.base_ref != branch:
+                    continue  # merged into another branch: never part of this Target
+                if max_prs is not None and processed >= max_prs:
+                    stop = STOP_CAP
+                    break
+                stored, susp = incorporate_pr(
+                    conn, repo, branch, pulled, now=now, advance=can_advance
+                )
+                processed += 1
+                rows_n += stored
+                suspicious_n += susp
+        except RateLimited:
+            stop = STOP_RATE_LIMIT
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (403, 429):
+                raise
+            stop = STOP_RATE_LIMIT
+        except KeyboardInterrupt:
+            stop = STOP_INTERRUPTED
+    return SweepResult(processed, rows_n, suspicious_n, requests, watermark(conn), stop)
+
+
+def sweep_increment(
+    conn: sqlite3.Connection,
+    repo: Path,
+    branch: str,
+    *,
+    transport: Transport | None = None,
+    now: str | None = None,
+    max_prs: int | None = DEFAULT_RUN_CAP,
+) -> SweepResult:
+    """The watermark-driven per-increment run (the push-run face): merged
+    PRs above the Watermark, oldest first, capped per run. The next run —
+    push run or full-history sweep — resumes automatically above wherever
+    this one's watermark stopped."""
+    return sweep(
+        conn, repo, branch, watermark(conn), transport=transport, now=now, max_prs=max_prs
+    )
+
+
+def sweep_full(
+    conn: sqlite3.Connection,
+    repo: Path,
+    branch: str,
+    *,
+    transport: Transport | None = None,
+    now: str | None = None,
+    max_prs: int | None = None,
+) -> SweepResult:
+    """The full-history sweep (explicit operator invocation): the same
+    oldest-first walk sharing the Watermark, merely walked further — its
+    listing continues past the watermark bound until the beginning of the
+    PR numbering (or a stop condition), so the whole history is re-swept
+    (replace-not-duplicate keeps it clean). Later push runs continue after
+    the shared watermark."""
+    return sweep(conn, repo, branch, 0, transport=transport, now=now, max_prs=max_prs)
 
 
 def _github_repo(conn: sqlite3.Connection) -> tuple[str, str]:

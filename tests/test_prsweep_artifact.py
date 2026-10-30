@@ -11,7 +11,7 @@ import hashlib
 import re
 import sqlite3
 
-from coding_stats import artifact, gather, gitwalk, orgview, prsweep
+from coding_stats import artifact, gather, gitwalk, orgview, prsweep, recovery
 from coding_stats.db import connect
 from conftest import commit_files, make_db
 
@@ -46,6 +46,11 @@ def _built_db(tmp_path, repo, name="w.db"):
         [prsweep.PrRow("co-authored-by", "Ghost <g@example.org>", "yes", None, True, None, None)],
         OBSERVED_AT,
     )
+    # the recorded watermark beside the rows: everything through PR 8
+    conn.execute(
+        "INSERT INTO pr_watermark (repo_id, last_pr_number)"
+        " VALUES ((SELECT id FROM repositories ORDER BY id LIMIT 1), 8)"
+    )
     conn.commit()
     return conn, h1, h2
 
@@ -61,22 +66,22 @@ def _pr_rows(conn):
     ]
 
 
-def pre_pr_bytes(conn) -> bytes:
-    """Artifact bytes as a pre-#35 mint would have written them: no
-    pr_evidence table in the body, digest re-stamped (the
+def _strip_tables(conn, *tables) -> bytes:
+    """Artifact bytes as a pre-feature mint would have written them: without
+    the named tables' bodies, digest re-stamped (the
     test_ai_attribution_artifact crafting pattern). Crafted content VERIFIES."""
     content = artifact.serialize(conn).decode("utf-8")
     out: list[str] = []
     skipping_ddl = False
     for line in content.splitlines(keepends=True):
-        if line.startswith("CREATE TABLE pr_evidence"):
+        if any(line.startswith(f"CREATE TABLE {t}") for t in tables):
             skipping_ddl = True
             continue
         if skipping_ddl:
             if line.strip() == ");":
                 skipping_ddl = False
             continue
-        if line.startswith("INSERT INTO pr_evidence"):
+        if any(line.startswith(f"INSERT INTO {t} ") for t in tables):
             continue
         out.append(line)
     blank = "".join(out)
@@ -84,6 +89,16 @@ def pre_pr_bytes(conn) -> bytes:
     blanked = blank.replace(f"-- digest: {digest}", "-- digest:", 1)
     restamped = hashlib.sha256(blanked.encode()).hexdigest()
     return blanked.replace("-- digest:", f"-- digest: {restamped}", 1).encode()
+
+
+def pre_pr_bytes(conn) -> bytes:
+    """A pre-#35 artifact body: no PR-channel state at all."""
+    return _strip_tables(conn, "pr_evidence", "pr_watermark")
+
+
+def pre_watermark_bytes(conn) -> bytes:
+    """A pre-#36 artifact body: PR rows but no watermark table."""
+    return _strip_tables(conn, "pr_watermark")
 
 
 def _reseat(content: str, needle: str) -> bytes:
@@ -250,6 +265,11 @@ def test_org_projection_carries_pr_rows(tmp_path):
             conn, 3, [prsweep.PrRow("tool-trailer", f"{name}:m", "yes", cid, False, name, "m")],
             OBSERVED_AT,
         )
+        conn.execute(
+            "INSERT INTO pr_watermark (repo_id, last_pr_number)"
+            " VALUES ((SELECT id FROM repositories ORDER BY id LIMIT 1), ?)",
+            (10 + len(sources),),
+        )
         conn.commit()
         sources.append(artifact.write(conn, tmp_path / f"{name}-store"))
         conn.close()
@@ -260,6 +280,105 @@ def test_org_projection_carries_pr_rows(tmp_path):
     proj = orgview.org(uconn)
     rows = _pr_rows(proj)
     assert {(r[8], r[4]) for r in rows} == {("pr", "alpha:m"), ("pr", "beta:m")}
+    # the recorded watermarks ride the projection per repository too
+    # (the loop stamps 10 for alpha — len(sources)==0 — then 11 for beta)
+    assert [r["last_pr_number"] for r in proj.execute(
+        "SELECT last_pr_number FROM pr_watermark ORDER BY last_pr_number")] == [10, 11]
     if proj is not uconn:
         proj.close()
     uconn.close()
+
+
+# ---------------------------------------------------------------------------
+# the watermark rides the Artifact beside the rows (ticket #36)
+# ---------------------------------------------------------------------------
+
+
+def _watermark_rows(conn):
+    return [
+        (int(r["repo_id"]), int(r["last_pr_number"]))
+        for r in conn.execute("SELECT repo_id, last_pr_number FROM pr_watermark ORDER BY repo_id")
+    ]
+
+
+def test_artifact_round_trips_the_pr_watermark(tmp_path, repo):
+    conn, h1, h2 = _built_db(tmp_path, repo)
+    before = _watermark_rows(conn)
+    assert len(before) == 1 and before[0][1] == 8
+    data = artifact.serialize(conn)
+    text = data.decode("utf-8")
+    assert "CREATE TABLE pr_watermark" in text
+    assert "INSERT INTO pr_watermark" in text
+    assert artifact.verify_bytes(data) is None
+
+    mat = sqlite3.connect(tmp_path / "mat.db")
+    mat.row_factory = sqlite3.Row
+    artifact.restore_into(mat, data)
+    assert _watermark_rows(mat) == before
+    mat.close()
+    conn.close()
+
+
+def test_pre_watermark_artifact_materializes_and_reads_zero(tmp_path, repo):
+    conn, h1, h2 = _built_db(tmp_path, repo)
+    old = pre_watermark_bytes(conn)  # a #35-era mint: rows but no watermark
+    assert artifact.verify_bytes(old) is None  # crafted bytes are valid artifacts
+    conn.close()
+
+    mat = sqlite3.connect(tmp_path / "mat.db")
+    mat.row_factory = sqlite3.Row
+    artifact.restore_into(mat, old)
+    assert _watermark_rows(mat) == []  # nothing recorded: sweeps start over
+    assert len(_pr_rows(mat)) == 3  # the rows still ride
+    mat.close()
+
+
+def test_partial_recompute_restores_the_watermark_and_pr_rows_unchanged(tmp_path, repo):
+    conn, h1, h2 = _built_db(tmp_path, repo)  # rows for PRs 7/8, watermark 8
+    anchor = artifact.serialize(conn)  # the older verifiable Artifact version
+    rows_at_anchor = _pr_rows(conn)
+
+    # recorded state advances past the anchor: PR 9 sweeps in
+    c2 = commit_files(repo, "feat: more", {"c.txt": "3\n"})
+    gitwalk.walk(repo, conn, "main")
+    cid = int(conn.execute("SELECT id FROM commits WHERE sha = ?", (c2,)).fetchone()["id"])
+    prsweep.replace_pr_rows(
+        conn, 9, [prsweep.PrRow("tool-trailer", "newer:row", "yes", cid, False, "claude", None)],
+        OBSERVED_AT,
+    )
+    conn.execute("UPDATE pr_watermark SET last_pr_number = 9")
+    conn.commit()
+
+    restored = recovery.rebuild(tmp_path / "w.db", anchor, conn, repo, "main")
+    # the watermark and PR rows survive unchanged: restored from the anchor
+    # exactly as that version recorded them (never re-derived, and the
+    # pre-recompute DB's carried-over state never clobbers them)
+    assert _pr_rows(restored) == rows_at_anchor
+    assert _watermark_rows(restored) == [(1, 8)]
+    # and the partial recompute's re-walk never touches them either
+    assert gitwalk.walk(repo, restored, "main") == 1  # only the newer commit
+    assert _pr_rows(restored) == rows_at_anchor
+    assert _watermark_rows(restored) == [(1, 8)]
+    restored.close()
+
+
+def test_gather_carries_the_watermark_and_replaces_it_wholesale(tmp_path, repo):
+    conn, h1, h2 = _built_db(tmp_path, repo)  # watermark 8
+    path = artifact.write(conn, tmp_path / "store")
+    conn.close()
+    union = tmp_path / "union.db"
+    assert gather.gather(union, [path]).ingested == 1
+    uconn = sqlite3.connect(union)
+    uconn.row_factory = sqlite3.Row
+    assert [n for _, n in _watermark_rows(uconn)] == [8]
+
+    # a newer artifact of the same key replaces the watermark wholesale
+    conn = connect(tmp_path / "w.db")
+    conn.execute("UPDATE pr_watermark SET last_pr_number = 9")
+    conn.commit()
+    path2 = artifact.write(conn, tmp_path / "store2")
+    conn.close()
+    assert gather.gather(union, [path2]).ingested == 1
+    assert [n for _, n in _watermark_rows(uconn)] == [9]  # replaced, never extended
+    uconn.close()
+

@@ -109,16 +109,33 @@ def main(argv: list[str] | None = None) -> None:
 
     sweep_p = sub.add_parser(
         "pr-sweep",
-        help="channel-pr evidence sweep (ADR-0007 clauses 3-5): record PR-channel"
-        " evidence rows for merged PRs above a lower bound (detection-only, no LLM)",
+        help="channel-pr evidence sweep (ADR-0007 clauses 2-5): watermark-driven"
+        " per-increment backfill of PR-channel evidence rows (detection-only, no LLM)",
     )
     sweep_p.add_argument("--db", default="coding-stats.db")
-    sweep_p.add_argument(
+    bound = sweep_p.add_mutually_exclusive_group()
+    bound.add_argument(
         "--after-pr",
         type=int,
-        required=True,
+        default=None,
         metavar="N",
-        help="record PRs with number > N (N >= 0; full sweep from 0)",
+        help="explicit lower bound: record PRs with number > N (N >= 0; the"
+        " watermark still advances over what is recorded)",
+    )
+    bound.add_argument(
+        "--full",
+        action="store_true",
+        help="full-history sweep (explicit operator invocation): re-sweep every"
+        " merged PR from the beginning of the numbering, oldest first, sharing"
+        " the watermark (later push runs continue after it)",
+    )
+    sweep_p.add_argument(
+        "--max-prs",
+        type=int,
+        default=None,
+        metavar="K",
+        help="stop cleanly after K PRs this run (default: 25 for the watermark"
+        " increment, unlimited for --full / --after-pr)",
     )
 
     mig = sub.add_parser(
@@ -272,14 +289,32 @@ def main(argv: list[str] | None = None) -> None:
         from . import prsweep
 
         assert repo_dir is not None, "run init first"
+        branch = str(settings.get("branch") or "")
         try:
-            res = prsweep.sweep(conn, repo_dir, str(settings.get("branch") or ""), args.after_pr)
+            if args.full:
+                res = prsweep.sweep_full(conn, repo_dir, branch, max_prs=args.max_prs)
+            elif args.after_pr is not None:
+                res = prsweep.sweep(conn, repo_dir, branch, args.after_pr, max_prs=args.max_prs)
+            else:
+                cap = prsweep.DEFAULT_RUN_CAP if args.max_prs is None else args.max_prs
+                res = prsweep.sweep_increment(conn, repo_dir, branch, max_prs=cap)
         except prsweep.SweepError as exc:
             sys.exit(f"error: {exc}")
         print(
             f"pr-sweep: {res.processed} PRs recorded ({res.rows} rows,"
-            f" {res.suspicious} suspicious), {res.requests} API requests"
+            f" {res.suspicious} suspicious), {res.requests} API requests,"
+            f" watermark {res.watermark}"
         )
+        if res.stop is not None:
+            notices = {
+                prsweep.STOP_CAP: "processing cap reached",
+                prsweep.STOP_RATE_LIMIT: "rate limit exhausted",
+                prsweep.STOP_INTERRUPTED: "interrupted",
+            }
+            print(
+                f"::notice::pr-sweep stopped: {notices[res.stop]}; watermark"
+                f" {res.watermark}, the next run resumes above it"
+            )
     elif args.cmd == "classify":
         assert repo_dir is not None, "run init first"
         SESSION_DIR.mkdir(parents=True, exist_ok=True)

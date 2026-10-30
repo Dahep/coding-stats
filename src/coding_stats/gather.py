@@ -390,6 +390,15 @@ def _upsert(conn: sqlite3.Connection, item: _Ingest) -> None:
                 r["suspicious"],
             ),
         )
+    for r in src.execute(
+        "SELECT * FROM pr_watermark ORDER BY repo_id"
+    ):
+        # the Watermark is recorded state like the evidence rows: it rides
+        # the union per repo and is replaced wholesale on re-ingest
+        conn.execute(
+            "INSERT INTO pr_watermark (repo_id, last_pr_number) VALUES (?, ?)",
+            (repo_id, r["last_pr_number"]),
+        )
     for r in src.execute("SELECT * FROM commits_features ORDER BY commit_id, feature_id"):
         conn.execute(
             "INSERT INTO commits_features (commit_id, feature_id, role) VALUES (?, ?, ?)",
@@ -473,6 +482,7 @@ def _purge_repo(conn: sqlite3.Connection, repo_id: int) -> None:
     conn.execute(f"DELETE FROM ai_evidence WHERE commit_id {where}", (repo_id,))
     conn.execute(f"DELETE FROM ai_attribution WHERE commit_id {where}", (repo_id,))
     conn.execute("DELETE FROM pr_evidence WHERE repo_id = ?", (repo_id,))
+    conn.execute("DELETE FROM pr_watermark WHERE repo_id = ?", (repo_id,))
     conn.execute(f"DELETE FROM commits_features WHERE commit_id {where}", (repo_id,))
     conn.execute(
         f"DELETE FROM fix_touches WHERE fix_commit_id {where} OR source_commit_id {where}",
