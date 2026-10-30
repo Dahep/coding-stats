@@ -206,7 +206,17 @@ def _parents(repo: Path, sha: str) -> int:
 
 def patch_id_for(repo: Path, sha: str) -> str | None:
     """git patch-id of the stable diff. Returns None if diff is empty."""
-    diff = diff_for(repo, sha)
+    return _patch_id_of_diff(repo, diff_for(repo, sha))
+
+
+def patch_id_for_range(repo: Path, base: str, tip: str) -> str | None:
+    """git patch-id of the aggregate diff base..tip (None when empty) — the
+    squash-plausibility check of ticket #35: a squash landing carries the
+    whole head range's patch."""
+    return _patch_id_of_diff(repo, _git(repo, "diff", f"{base}..{tip}"))
+
+
+def _patch_id_of_diff(repo: Path, diff: str) -> str | None:
     if not diff.strip():
         return None
     p = subprocess.run(
@@ -219,6 +229,26 @@ def patch_id_for(repo: Path, sha: str) -> str | None:
     )
     token = p.stdout.split()
     return token[0] if token else None
+
+
+def list_range(repo: Path, base: str, tip: str) -> list[str]:
+    """Chronological shas of base..tip (oldest first) — the commits a PR
+    head adds (ticket #35: head-chain detection)."""
+    out = _git(repo, "rev-list", "--reverse", f"{base}..{tip}")
+    return [s for s in out.splitlines() if s]
+
+
+def merge_base(repo: Path, a: str, b: str) -> str | None:
+    """The merge base of two revs; None when histories do not connect."""
+    p = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", a, b],
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode != 0:
+        return None
+    sha = p.stdout.strip()
+    return sha or None
 
 
 def tree_sha(repo: Path, sha: str) -> str:

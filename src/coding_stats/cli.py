@@ -107,6 +107,20 @@ def main(argv: list[str] | None = None) -> None:
         "sources", nargs="+", help="repo checkouts (read .coding-stats/) or artifact file paths"
     )
 
+    sweep_p = sub.add_parser(
+        "pr-sweep",
+        help="channel-pr evidence sweep (ADR-0007 clauses 3-5): record PR-channel"
+        " evidence rows for merged PRs above a lower bound (detection-only, no LLM)",
+    )
+    sweep_p.add_argument("--db", default="coding-stats.db")
+    sweep_p.add_argument(
+        "--after-pr",
+        type=int,
+        required=True,
+        metavar="N",
+        help="record PRs with number > N (N >= 0; full sweep from 0)",
+    )
+
     mig = sub.add_parser(
         "migrate",
         help="one-time migration from the legacy skill-stats layout (ADR-0005)",
@@ -254,6 +268,18 @@ def main(argv: list[str] | None = None) -> None:
         n = gitwalk.walk(repo_dir, conn, settings.get("branch") or None)
         total = conn.execute("SELECT COUNT(*) c FROM commits").fetchone()["c"]
         print(f"walked {n} new commits (total {total})")
+    elif args.cmd == "pr-sweep":
+        from . import prsweep
+
+        assert repo_dir is not None, "run init first"
+        try:
+            res = prsweep.sweep(conn, repo_dir, str(settings.get("branch") or ""), args.after_pr)
+        except prsweep.SweepError as exc:
+            sys.exit(f"error: {exc}")
+        print(
+            f"pr-sweep: {res.processed} PRs recorded ({res.rows} rows,"
+            f" {res.suspicious} suspicious), {res.requests} API requests"
+        )
     elif args.cmd == "classify":
         assert repo_dir is not None, "run init first"
         SESSION_DIR.mkdir(parents=True, exist_ok=True)

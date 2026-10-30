@@ -33,6 +33,10 @@ Claude (name minus its harness word: ``Claude Opus 4.8 (1M context)`` ->
 ``claude-opus-4-8``); everything else stores the model as unknown rather
 than inventing one. The rule engine is pure stdlib+sqlite: no git, no
 network — the walk feeds it facts read straight from the commit objects.
+
+Ticket #35's PR tier reuses this same table — never a second engine: it
+feeds head commits the ordinary ``CommitFacts`` and PR-level signals (body
+footers, PR author identity, head branch name) through ``pr_matches``.
 """
 
 import re
@@ -87,6 +91,19 @@ class Evidence:
     rule: str
     raw: str
     verdict: str  # 'yes' | 'possible'
+
+
+@dataclass(frozen=True)
+class Match:
+    """One rule-table match with the identity (harness/model) its raw string
+    names — the per-row view attribute() summarizes per commit. The PR tier
+    (ticket #35) records rows at exactly this granularity."""
+
+    rule: str
+    raw: str
+    verdict: str  # 'yes' | 'possible'
+    harness: str | None
+    model: str | None
 
 
 @dataclass(frozen=True)
@@ -226,6 +243,15 @@ def _tool_value_harness(value: str) -> tuple[str | None, str | None]:
     return _harness_alias(v), None
 
 
+def _branch_hit(branch: str) -> tuple[str, str] | None:
+    """(harness, raw branch) when a source branch name carries an agent
+    prefix (rule 6's matcher, shared by commit subjects and PR head refs)."""
+    for prefix, harness in _BRANCH_PREFIXES:
+        if branch.lower().startswith(prefix):
+            return harness, branch
+    return None
+
+
 def _branch_prefix_hit(title: str) -> tuple[str, str] | None:
     """(harness, raw branch) when the subject names a source branch with an
     agent prefix. GitHub PR merges carry 'from <owner>/<branch>' (the owner
@@ -244,10 +270,7 @@ def _branch_prefix_hit(title: str) -> tuple[str, str] | None:
         branch = m.group(2)
         if m.group(1):  # remote-tracking spelling: first component is the remote
             branch = branch.split("/", 1)[1] if "/" in branch else branch
-    for prefix, harness in _BRANCH_PREFIXES:
-        if branch.lower().startswith(prefix):
-            return harness, branch
-    return None
+    return _branch_hit(branch)
 
 
 def _hit(rule: str, raw: str, harness: str | None, model: str | None = None) -> _Hit:
@@ -307,22 +330,98 @@ def _hits(facts: CommitFacts) -> list[_Hit]:
     return hits
 
 
-def attribute(facts: CommitFacts) -> Attribution:
-    """The verdict + evidence rows of one commit. Pure and deterministic:
-    the same facts always produce the same Attribution."""
+def _ranked(hits: list[_Hit]) -> list[_Hit]:
     deduped: dict[tuple[str, str], _Hit] = {}
-    for h in _hits(facts):
+    for h in hits:
         deduped.setdefault((h.evidence.rule, h.evidence.raw), h)
-    hits = sorted(deduped.values(), key=lambda h: (RULE_RANK[h.evidence.rule], h.evidence.raw))
-    if any(h.evidence.verdict == VERDICT_YES for h in hits):
+    return sorted(deduped.values(), key=lambda h: (RULE_RANK[h.evidence.rule], h.evidence.raw))
+
+
+def _finalize(hits: list[_Hit]) -> Attribution:
+    ranked = _ranked(hits)
+    if any(h.evidence.verdict == VERDICT_YES for h in ranked):
         verdict = VERDICT_YES
-    elif hits:
+    elif ranked:
         verdict = VERDICT_POSSIBLE
     else:
         verdict = VERDICT_NO_EVIDENCE
-    harness = next((h.harness for h in hits if h.harness is not None), None)
-    model = next((h.model for h in hits if h.model is not None), None)
-    return Attribution(verdict, harness, model, tuple(h.evidence for h in hits))
+    harness = next((h.harness for h in ranked if h.harness is not None), None)
+    model = next((h.model for h in ranked if h.model is not None), None)
+    return Attribution(verdict, harness, model, tuple(h.evidence for h in ranked))
+
+
+def matches(facts: CommitFacts) -> tuple[Match, ...]:
+    """Every rule-table match of one commit's facts, deduped and ranked,
+    each carrying the identity its raw string names. The per-row view behind
+    attribute()'s per-commit summary."""
+    return tuple(
+        Match(h.evidence.rule, h.evidence.raw, h.evidence.verdict, h.harness, h.model)
+        for h in _ranked(_hits(facts))
+    )
+
+
+def attribute(facts: CommitFacts) -> Attribution:
+    """The verdict + evidence rows of one commit. Pure and deterministic:
+    the same facts always produce the same Attribution."""
+    return _finalize(_hits(facts))
+
+
+def pr_matches(
+    body: str,
+    author_login: str | None,
+    author_is_bot: bool,
+    head_branch: str | None,
+) -> tuple[Match, ...]:
+    """PR-level signals (ticket #35) through the SAME rule table — never a
+    second engine. Three sources, all PR-list derived (zero extra API calls):
+
+    * body footers — trailer and signature rules over the PR body text
+      (rules 1/4/5), the raw matched line recorded verbatim;
+    * PR author identity — rule 3's name patterns over the author login
+      ([bot] and (aider) suffixes, Cursor Agent); a GitHub bot login without
+      a pattern still names its own harness;
+    * head branch name — rule 6's prefix matcher, ``possible`` tier at most.
+    """
+    hits: list[_Hit] = []
+    facts = CommitFacts(
+        author_name="",
+        author_email="",
+        committer_name="",
+        committer_email="",
+        title="",
+        message=body or "",
+    )
+    hits.extend(_hits(facts))
+    if head_branch:
+        hit = _branch_hit(head_branch)
+        if hit is not None:
+            harness, raw = hit
+            hits.append(_hit(RULE_BRANCH_PREFIX, raw, harness))
+    if author_login:
+        author_harness = _name_harness(author_login)
+        if author_harness is None and author_is_bot:
+            author_harness = _collapse(author_login).lower() or "bot"
+        if author_harness is not None:
+            hits.append(_hit(RULE_NAME_SUFFIX, author_login, author_harness))
+    return tuple(
+        Match(h.evidence.rule, h.evidence.raw, h.evidence.verdict, h.harness, h.model)
+        for h in _ranked(hits)
+    )
+
+
+def pr_attribution(
+    body: str,
+    author_login: str | None,
+    author_is_bot: bool,
+    head_branch: str | None,
+) -> Attribution:
+    """The PR-level signals' combined verdict + evidence, summarized exactly
+    like a commit's attribution (same tiers, same ranking)."""
+    hits = [
+        _Hit(Evidence(m.rule, m.raw, m.verdict), m.harness, m.model)
+        for m in pr_matches(body, author_login, author_is_bot, head_branch)
+    ]
+    return _finalize(hits)
 
 
 def record(conn: sqlite3.Connection, commit_id: int, facts: CommitFacts) -> Attribution:
