@@ -25,9 +25,9 @@ outputs:
 runs:
   using: composite
   steps:
-    # The engine runs from THIS action checkout, so uv must exist here: the
-    # composite installs its own, exactly like the root update action does
-    # (a report job supplies checkout + this one step, never a uv setup).
+    # The composite's run steps invoke `uv run`, but a report job supplies
+    # checkout + this one `uses:` step, never a uv setup — so the composite
+    # installs its own, exactly like the root update action does.
     - uses: astral-sh/setup-uv@v6
     # The engine version is exactly the action ref the caller pinned: it
     # runs from this repo's checkout — the ROOT one above this action's

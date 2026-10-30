@@ -43,13 +43,28 @@ def test_engine_installed_from_repo_root_above_the_action_path(doc):
 
 
 def test_installs_its_own_uv(doc):
-    """The composite is self-sufficient: it runs astral-sh/setup-uv the way
-    the root update action does. The caller supplies checkout + this one
-    step only — a report job has no uv of its own, and the report@v1 box
-    went red with 'uv: command not found' the first time it ever ran
-    (before that, the #31 restore crash always skipped the job)."""
-    uses = [step["uses"] for step in doc["runs"]["steps"] if "uses" in step]
-    assert any(u.startswith("astral-sh/setup-uv@") for u in uses)
+    """The composite is self-sufficient: it runs astral-sh/setup-uv BEFORE
+    its first `uv run`, pinned identically to the root update action's step
+    (the caller supplies checkout + this one `uses:` step, never a uv setup
+    of its own; run 40998951142 went red with 'uv: command not found' the
+    first time report ever ran — before that, the #31 restore crash always
+    skipped the job via the needs.update gate)."""
+    steps = doc["runs"]["steps"]
+    install = next(
+        i for i, s in enumerate(steps) if s.get("uses", "").startswith("astral-sh/setup-uv@")
+    )
+    first_uv_run = next(i for i, s in enumerate(steps) if "uv run" in s.get("run", ""))
+    assert install < first_uv_run  # a reorder red-runs the gather step again
+    # version parity: the two composites' pins move together
+    setup_pins = [
+        s["uses"]
+        for s in [
+            *steps,
+            *(yaml.safe_load((ROOT / "action.yml").read_text(encoding="utf-8"))["runs"]["steps"]),
+        ]
+        if s.get("uses", "").startswith("astral-sh/setup-uv@")
+    ]
+    assert len(set(setup_pins)) == 1
 
 
 def test_gather_covers_every_coding_stats_ref(doc):
