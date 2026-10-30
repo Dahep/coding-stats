@@ -16,8 +16,25 @@
 # only through env: — never `${{ }}` inside a run: line. Requires only
 # `contents: write` in the caller's workflow: the landing push authenticates
 # with the GITHUB_TOKEN actions/checkout persisted, and no step reads a
-# secret. No LLM key -> the deterministic stages run and the backlog is
-# recorded (Q13): a missing key never fails the run.
+# secret. One exception, the detect-pr opt-in (ADR-0007 clause 1): the
+# detect-pr mode (detect-pr: true, or a non-empty pr-backfill) runs the PR
+# tier; the detect-pr mode needs `pull-requests: read` added to the caller's
+# workflow permissions (the PR list API); the detect-pr: false default never
+# does and runs byte-identically to the git-only pipeline.
+#
+# Private repos (detect-pr mode): head refs `refs/pull/N/head` fetch over
+# the AUTHENTICATED GIT TRANSPORT — never the REST API, never a PAT. The
+# fetch rides exactly the credentials actions/checkout already persisted in
+# the checkout's git config as `http.https://github.com/.extraheader` (an
+# AUTHORIZATION header carrying the run's GITHUB_TOKEN), so deleted squash
+# branches recover head-ref evidence with the checkout token alone. With
+# `persist-credentials: false` on your checkout step, set the same config
+# yourself before this action:
+#   git config --local http.https://github.com/.extraheader \
+#     "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+#
+# No LLM key -> the deterministic stages run and the backlog is recorded
+# (Q13): a missing key never fails the run.
 
 name: "coding-stats update"
 description: >-
@@ -57,6 +74,24 @@ inputs:
     description: "Debug pass-through to update --no-lineage: skip the lineage closure."
     required: false
     default: "false"
+  detect-pr:
+    description: >-
+      Opt-in PR tier (ADR-0007 clause 1, default off): after the
+      deterministic stages the update runs the watermark-driven PR-channel
+      increment — a few merged PRs per push run, oldest first, only PRs above
+      the watermark; detection-only, no LLM calls. The detect-pr mode needs
+      "pull-requests: read" in the caller's workflow permissions; detect-pr:
+      false stays byte-identical to the git-only pipeline.
+    required: false
+    default: "false"
+  pr-backfill:
+    description: >-
+      Explicit full-history PR sweep passthrough (the workflow_dispatch
+      shape: pr-backfill: full): the same watermark machinery walked to the
+      beginning of the PR numbering. Shares the detect-pr mode's permission
+      scope — the "pull-requests: read" detect-pr adds to the caller.
+    required: false
+    default: ""
 
 outputs:
   data-branch:
@@ -112,8 +147,11 @@ runs:
         CODING_STATS_SKIP_CLASSIFY: "${{ inputs.no-classify }}"
         CODING_STATS_SKIP_DETECT: "${{ inputs.no-detect }}"
         CODING_STATS_SKIP_LINEAGE: "${{ inputs.no-lineage }}"
+        CODING_STATS_DETECT_PR: "${{ inputs.detect-pr }}"
+        CODING_STATS_PR_BACKFILL: "${{ inputs.pr-backfill }}"
         OPENCODE_API_KEY: "${{ inputs.opencode-api-key }}"
         OPENROUTER_API_KEY: "${{ inputs.openrouter-api-key }}"
+        GITHUB_TOKEN: "${{ github.token }}"
       run: |
         db="$RUNNER_TEMP/coding-stats/working.db"
         mkdir -p "$RUNNER_TEMP/coding-stats"
@@ -122,6 +160,8 @@ runs:
         if [ "$CODING_STATS_SKIP_CLASSIFY" = "true" ]; then flags+=(--no-classify); fi
         if [ "$CODING_STATS_SKIP_DETECT" = "true" ]; then flags+=(--no-detect); fi
         if [ "$CODING_STATS_SKIP_LINEAGE" = "true" ]; then flags+=(--no-lineage); fi
+        if [ "$CODING_STATS_DETECT_PR" = "true" ]; then flags+=(--detect-pr); fi
+        if [ -n "$CODING_STATS_PR_BACKFILL" ]; then flags+=(--pr-backfill "$CODING_STATS_PR_BACKFILL"); fi
         uv run --project "$GITHUB_ACTION_PATH" coding-stats update --db "$db" "${flags[@]}"
 
     # Landing rules live in `ci land` (engine-tested): no-op pushes nothing,

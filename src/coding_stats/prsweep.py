@@ -84,6 +84,10 @@ from typing import Any
 from . import aiattr, gitwalk, identity
 
 CHANNEL_PR = "pr"
+# The disclosure line of ADR-0007 clause 5, shared verbatim by every surface
+# that carries PR-channel evidence: the update's on-mode notice (ticket #37),
+# the text report, and the HTML report's note.
+DISCLOSURE_LINE = "GitHub-sourced (PR-channel) evidence present"
 DEFAULT_PER_PAGE = 100
 DEFAULT_RUN_CAP = 25  # increment runs ("a few PRs per push run")
 
