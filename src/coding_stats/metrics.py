@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import NamedTuple
 
+from .aiattr import RULE_RANK
 from .orgview import org
 
 
@@ -242,6 +243,76 @@ def feature_repos(conn: sqlite3.Connection) -> dict[str, str]:
             " JOIN repositories rp ON rp.id = f.repo_id"
         )
     }
+
+
+@dataclass
+class AttributionSummary:
+    """AI attribution state across the walked commits (ticket #34): the
+    3-state verdict mix and the harnesses the evidence names."""
+
+    verdict_counts: dict[str, int]  # 'yes'/'possible'/'no-evidence' -> commits
+    harness_counts: list[tuple[str, int]]  # harness -> attributed commits
+
+
+@dataclass
+class AttributionRow:
+    """One attributed commit with its audit evidence (rule id + raw matched
+    string, in the rule table's rank order)."""
+
+    sha: str
+    verdict: str
+    harness: str
+    model: str
+    evidence: list[tuple[str, str, str]]  # (rule, raw, verdict)
+
+
+def attribution_summary(conn: sqlite3.Connection) -> AttributionSummary:
+    """Org-level AI attribution counts (the projection dedups Shared commits)."""
+    conn = org(conn)
+    verdict_counts = {
+        str(r["verdict"]): int(r["n"])
+        for r in conn.execute("SELECT verdict, COUNT(*) n FROM ai_attribution GROUP BY verdict")
+    }
+    harness_counts = [
+        (str(r["harness"]), int(r["n"]))
+        for r in conn.execute(
+            "SELECT harness, COUNT(*) n FROM ai_attribution"
+            " WHERE harness IS NOT NULL AND verdict != 'no-evidence'"
+            " GROUP BY harness ORDER BY n DESC, harness"
+        )
+    ]
+    return AttributionSummary(verdict_counts, harness_counts)
+
+
+def attribution_rows(conn: sqlite3.Connection) -> list[AttributionRow]:
+    """Attributed commits (never the no-evidence ones — they carry no
+    evidence rows) in walk order, each with its evidence rows."""
+    conn = org(conn)
+    out: list[AttributionRow] = []
+    for r in conn.execute(
+        """SELECT c.id cid, c.sha, a.verdict, a.harness, a.model FROM ai_attribution a
+           JOIN commits c ON c.id = a.commit_id
+           WHERE a.verdict != 'no-evidence' ORDER BY c.walk_index"""
+    ):
+        evidence = [
+            (str(e["rule"]), str(e["raw"]), str(e["verdict"]))
+            for e in conn.execute(
+                "SELECT rule, raw, verdict FROM ai_evidence WHERE commit_id = ?"
+                " ORDER BY rule, raw",
+                (r["cid"],),
+            )
+        ]
+        evidence.sort(key=lambda t: (RULE_RANK.get(t[0], 99), t[1]))
+        out.append(
+            AttributionRow(
+                sha=str(r["sha"]),
+                verdict=str(r["verdict"]),
+                harness=str(r["harness"] or ""),
+                model=str(r["model"] or ""),
+                evidence=evidence,
+            )
+        )
+    return out
 
 
 def sampling_complete(conn: sqlite3.Connection) -> bool:

@@ -506,9 +506,40 @@ def _step_3(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX idx_fixes_features_feature ON fixes_features(feature_id)")
 
 
+def _step_4(conn: sqlite3.Connection) -> None:
+    """AI attribution state (ADR-0007 baseline tier, ticket #34).
+
+    Per-commit git-only attribution verdict (yes / possible / no-evidence —
+    the states of CONTEXT.md "AI attribution") plus its auditable evidence
+    rows. Both are pure functions of the Target branch's commit objects:
+    the walk records them per commit and re-derives any missing rows on the
+    next walk (a restored pre-feature artifact carries none), so they ride
+    the Artifact like every other recorded state. ``IF NOT EXISTS`` because
+    artifact.materialize completes a pre-feature artifact's missing known
+    tables before this step runs on the replayed DB."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS ai_attribution (
+               commit_id INTEGER PRIMARY KEY REFERENCES commits(id),
+               verdict TEXT NOT NULL CHECK (verdict IN ('yes', 'possible', 'no-evidence')),
+               harness TEXT,
+               model TEXT
+           )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS ai_evidence (
+               commit_id INTEGER NOT NULL REFERENCES commits(id),
+               rule TEXT NOT NULL,
+               raw TEXT NOT NULL,
+               verdict TEXT NOT NULL CHECK (verdict IN ('yes', 'possible')),
+               PRIMARY KEY (commit_id, rule, raw)
+           )"""
+    )
+
+
 SCHEMA_STEPS: list[Step] = [
     STEP_0_SQL,  # 0: initial schema
     _step_1,  # 1: repository identity, repo-scoped commits, prefixed feature ids
     _step_2,  # 2: features.live_lines + feature_line_samples (Sample rows)
     _step_3,  # 3: union-wide feature key (repository, id) — ADR-0006 clause 4
+    _step_4,  # 4: AI attribution verdict + evidence rows — ADR-0007 baseline
 ]

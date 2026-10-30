@@ -63,6 +63,7 @@ def _project(conn: sqlite3.Connection) -> sqlite3.Connection:
     _copy_repositories(conn, out)
     commit_map = _copy_commits(conn, out)  # dedup shas per repo base
     _copy_verdicts(conn, out, commit_map)
+    _copy_attribution(conn, out, commit_map)
     _copy_features(conn, out, commit_map)
     _copy_links(conn, out, commit_map)
     _repoint_dropped_features(conn, out, commit_map)
@@ -193,6 +194,31 @@ def _copy_verdicts(
                 r["model"],
                 r["classified_at"],
             ),
+        )
+
+
+def _copy_attribution(
+    conn: sqlite3.Connection, out: sqlite3.Connection, commit_map: dict[int, int]
+) -> None:
+    """Winner rows only, like verdicts. A Shared commit is byte-identical
+    across keys, so its AI attribution rows are pure-function identical too:
+    keeping the winner's copy loses nothing."""
+    for r in conn.execute("SELECT * FROM ai_attribution ORDER BY commit_id"):
+        cid = int(r["commit_id"])
+        if commit_map[cid] != cid:
+            continue
+        out.execute(
+            "INSERT INTO ai_attribution (commit_id, verdict, harness, model)"
+            " VALUES (?, ?, ?, ?)",
+            (cid, r["verdict"], r["harness"], r["model"]),
+        )
+    for r in conn.execute("SELECT * FROM ai_evidence ORDER BY commit_id, rule, raw"):
+        cid = int(r["commit_id"])
+        if commit_map[cid] != cid:
+            continue
+        out.execute(
+            "INSERT INTO ai_evidence (commit_id, rule, raw, verdict) VALUES (?, ?, ?, ?)",
+            (cid, r["rule"], r["raw"], r["verdict"]),
         )
 
 

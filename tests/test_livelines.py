@@ -93,7 +93,16 @@ def test_unattributed_lines_are_counted_not_dropped(repo, tmp_path):
     fa = add_feature(conn, "feature a")
     _define(conn, fa, h1)
     # h2 exists in git but not in the DB (outside the walk): its line at the
-    # tip is unattributable and must surface as a count
+    # tip is unattributable and must surface as a count. Dependent rows go
+    # first (FK enforcement): h2's AI attribution state is dropped with it.
+    conn.execute(
+        "DELETE FROM ai_evidence WHERE commit_id = (SELECT id FROM commits WHERE sha = ?)",
+        (h2,),
+    )
+    conn.execute(
+        "DELETE FROM ai_attribution WHERE commit_id = (SELECT id FROM commits WHERE sha = ?)",
+        (h2,),
+    )
     conn.execute("DELETE FROM commits WHERE sha = ?", (h2,))
     conn.commit()
     res = update_live_lines(conn, repo)

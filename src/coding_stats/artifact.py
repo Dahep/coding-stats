@@ -140,6 +140,30 @@ _TABLES: tuple[_Table, ...] = (
         {"run_id": None},  # run provenance is machine-local
     ),
     _Table(
+        "ai_attribution",
+        """CREATE TABLE ai_attribution (
+               commit_id INTEGER PRIMARY KEY,
+               verdict TEXT NOT NULL CHECK (verdict IN ('yes', 'possible', 'no-evidence')),
+               harness TEXT,
+               model TEXT
+           );""",
+        ("commit_id", "verdict", "harness", "model"),
+        "SELECT commit_id, verdict, harness, model FROM ai_attribution ORDER BY commit_id",
+    ),
+    _Table(
+        "ai_evidence",
+        """CREATE TABLE ai_evidence (
+               commit_id INTEGER NOT NULL,
+               rule TEXT NOT NULL,
+               raw TEXT NOT NULL,
+               verdict TEXT NOT NULL CHECK (verdict IN ('yes', 'possible')),
+               PRIMARY KEY (commit_id, rule, raw)
+           );""",
+        ("commit_id", "rule", "raw", "verdict"),
+        "SELECT commit_id, rule, raw, verdict FROM ai_evidence"
+        " ORDER BY commit_id, rule, raw",
+    ),
+    _Table(
         "features",
         """CREATE TABLE features (
                id TEXT NOT NULL,
@@ -391,8 +415,25 @@ def materialize(conn: sqlite3.Connection, data: bytes) -> None:
         raise MaterializeError(f"artifact refused: {exc}") from exc
     finally:
         conn.set_authorizer(None)
+    _complete_shape(conn)
     _check_shape(conn)
     _check_ownership(conn)
+
+
+def _complete_shape(conn: sqlite3.Connection) -> None:
+    """Bring a pre-feature artifact body up to the curated shape: every
+    curated table the replay did not create is created EMPTY by us, outside
+    the guarded replay. Artifacts minted before a table existed (older
+    schema steps) stay replayable — their rows for the new table are simply
+    absent, and pure state (AI attribution) re-derives on the next walk.
+    Skipping is safe here: an empty table can only mean 'no rows', and the
+    shape/ownership guards below still vet every table that IS in the body."""
+    for table in _TABLES:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table.name,)
+        ).fetchone()
+        if not exists:
+            conn.execute(table.ddl)
 
 
 def stamp_schema_steps(conn: sqlite3.Connection, data: bytes) -> None:
@@ -504,6 +545,14 @@ def _check_ownership(conn: sqlite3.Connection) -> None:
         (
             "commit_verdicts",
             f"SELECT COUNT(*) c FROM commit_verdicts WHERE commit_id NOT IN {in_commits}",
+        ),
+        (
+            "ai_attribution",
+            f"SELECT COUNT(*) c FROM ai_attribution WHERE commit_id NOT IN {in_commits}",
+        ),
+        (
+            "ai_evidence",
+            f"SELECT COUNT(*) c FROM ai_evidence WHERE commit_id NOT IN {in_commits}",
         ),
         (
             "commits_features",

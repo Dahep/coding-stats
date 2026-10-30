@@ -45,6 +45,31 @@ matplotlib scripts over SQL queries. Build git-only phase first.
 - **User metrics**: dropped for now (single human, 5 author-strings). Author
 - normalization is out of scope.
 
+## AI attribution (ADR-0007 baseline tier, ticket #34)
+
+- **Detector**: git-only, per walked commit, on the RAW identity strings
+  (before mailmap resolution). Ranked rule table from #34: (1) Co-authored-by
+  trailer, email-keyed known agent identity; (2) author/committer email —
+  known agent domain or GitHub bot noreply (numeric-prefix aware); (3) name
+  suffixes ((aider), [bot], Cursor Agent); (4) body signatures; (5) tool
+  trailers (Assisted-by / Generated-by / Agent-Logs-Url / Claude-Session);
+  (6) merge-subject branch prefixes (claude/, codex/) — `possible` tier at
+  most. Repo-level config artifacts (CLAUDE.md …) are repo-level facts and
+  stay out of the per-commit walk (no working-tree checks inside it).
+  GitHub squash framing matches the raw-trailer rules: trailer lines inside
+  the squash body block and the trailing summary Co-authored-by are commit
+  object text.
+- **Output**: per-commit verdict `yes` / `possible` / `no-evidence` (never
+  "human": absence of a signal is not a statement about authorship) plus
+  evidence rows (rule id + raw matched string) for audit. Harness is
+  normalized from the matched identity; the model is parsed only where the
+  harness names one (Claude, Aider; `Claude Opus 4.8 (1M context)` → `Opus
+  4.8 (1M context)`).
+- **Storage**: `ai_attribution` + `ai_evidence` ride the Artifact like all
+  recorded state (serializer + verify chain); they are pure functions of the
+  Target branch, so the walk re-derives any missing rows (restored
+  pre-feature artifacts carry none) deterministically.
+
 ## Artifact & multi-repo (settled grill 2, ADR-0003)
 
 - **Artifact**: each Target repo commits `.coding-stats/` — the whole

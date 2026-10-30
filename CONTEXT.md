@@ -26,6 +26,14 @@ The mapping of a commit onto a Feature: directly (the commit defines the feature
 The single LLM-assigned class of a commit: Feature, Fix, Refactor, Revert, or Cleanup. Blame evidence feeds it, but exactly one verdict drives which metrics count the commit.
 _Avoid_: commit type, category
 
+**AI attribution**:
+The per-commit attribution state of a Target-branch commit, computed from git data alone: `yes` (a signature rule matched), `possible` (weak signal only), or `no-evidence` (nothing matched — absence of a signal, never a claim about authorship). Matched on the raw identity strings, before any mailmap resolution.
+_Avoid_: human commit, AI commit
+
+**Attribution evidence**:
+One auditable match behind an AI attribution: rule id plus the raw matched string (and its tier), stored per commit and carried in the Artifact. Pure function of the Target branch: re-derived deterministically, never hand-edited.
+_Avoid_: signal, hint
+
 **Refactor**:
 A Commit verdict for a change that restructures existing Feature lines without defect repair intent.
 _Avoid_: clean-up, rewrite
