@@ -79,6 +79,37 @@ def test_migration_moves_the_committed_store_to_the_data_branch(
     conn.close()
 
 
+def test_migration_result_header_carries_the_migrated_step(tmp_path, repo, capsys):
+    """#31: the schema stamp travels into the artifact header. derive-and-land
+    without the stamp would emit schema-step 0 while the content is the fully
+    migrated layout — and a CI restore (materialize + stamp + connect) would
+    then re-run step 1 against a step-n DB and crash on the absent
+    settings.repo."""
+    commit_files(repo, "feature one", {"a.txt": "alpha\n"})
+    legacy = repo / ".coding-stats" / "coding-stats.sql"
+    _committed_store(repo, ['{"k":"new","title":"o","about":"","why":"y"}'])
+    legacy_step = artifact.parse_header(legacy.read_bytes()).schema_step
+
+    main(["migrate", str(repo), "--data-branch"])
+    capsys.readouterr()
+
+    data = (store_dir(repo, "main") / "coding-stats.sql").read_bytes()
+    assert artifact.parse_header(data).schema_step == legacy_step
+    # the exact CI restore path: materialize + stamp + connect must not
+    # re-run step 1 (which demands settings.repo — absent in a pure artifact)
+    assert artifact.verify_bytes(data) is None
+    work = tmp_path / "restore.sql"
+    work.write_bytes(b"")
+    raw = sqlite3.connect(work)
+    raw.row_factory = sqlite3.Row
+    try:
+        artifact.materialize(raw, data)
+        artifact.stamp_schema_steps(raw, data)
+    finally:
+        raw.close()
+    db.connect(work)  # RuntimeError under the bug: header said 0, data said n
+
+
 def subprocess_head(repo) -> str:
     import subprocess
 

@@ -559,11 +559,19 @@ def migrate_to_data_branch(
             f"the committed .coding-stats/ artifact does not verify ({err}); nothing migrated"
         )
     out.append("committed artifact: digest ok")
-    # re-prefix in memory: the ids upgrade to the {repo}@{branch} form
+    # re-prefix in memory: the ids upgrade to the {repo}@{branch} form.
+    # The scratch DB must carry the _schema_step_* bookkeeping BEFORE
+    # serialize: _head derives the header's schema-step from those tables
+    # and an unstamped scratch mints a step-0 artifact whose content is
+    # the migrated layout — every later restore then re-runs the migrations
+    # against a migrated DB and crashes (#31). Same stamp discipline as
+    # _rebuild_from_artifact above.
+    legacy_bytes = legacy.read_bytes()
     rows = sqlite3.connect(":memory:")
     rows.row_factory = sqlite3.Row
     try:
-        artifact.materialize(rows, legacy.read_bytes())
+        artifact.materialize(rows, legacy_bytes)
+        artifact.stamp_schema_steps(rows, legacy_bytes)
         plain = identity.resolved_identity(repo)[1]
         identity.reprefix_features(rows, identity.repo_slug(plain, branch))
         data = artifact.serialize(rows)
