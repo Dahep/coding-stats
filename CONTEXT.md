@@ -31,8 +31,12 @@ The per-commit attribution state of a Target-branch commit, computed from git da
 _Avoid_: human commit, AI commit
 
 **Attribution evidence**:
-One auditable match behind an AI attribution: rule id plus the raw matched string (and its tier), stored per commit and carried in the Artifact. Pure function of the Target branch: re-derived deterministically, never hand-edited.
+One auditable match behind an AI attribution: rule id plus the raw matched string (and its tier), stored per commit and carried in the Artifact. The git-channel rows are pure functions of the Target branch: re-derived deterministically, never hand-edited.
 _Avoid_: signal, hint
+
+**PR-channel evidence**:
+Attribution evidence recorded from merged PRs (PR body footers, PR author identity, head branch names, and head-commit messages read via `refs/pull/N/head`) and attached at the landed Target-branch sha. Recorded once per (PR, commit, rule), never re-derived; channel `pr` — inherited, and outranked by git-only evidence on the same commit. Evidence whose head ref failed its parentage check is recorded as suspicious evidence: audit only, never attribution.
+_Avoid_: PR signal
 
 **Refactor**:
 A Commit verdict for a change that restructures existing Feature lines without defect repair intent.

@@ -220,6 +220,48 @@ def _copy_attribution(
             "INSERT INTO ai_evidence (commit_id, rule, raw, verdict) VALUES (?, ?, ?, ?)",
             (cid, r["rule"], r["raw"], r["verdict"]),
         )
+    _copy_pr_evidence(conn, out, commit_map)
+
+
+def _copy_pr_evidence(
+    conn: sqlite3.Connection, out: sqlite3.Connection, commit_map: dict[int, int]
+) -> None:
+    """Channel-pr rows ride the projection too (ticket #35): commit-attached
+    rows follow the same winner rule as the git rows (a Shared commit keeps
+    one copy); suspicious rows carry no commit and collapse per
+    (repo_id, pr_number, rule, raw). Channel precedence at consumption is
+    the gather/report layer's rule (ticket #38) — the provenance column is
+    what it acts on."""
+    seen_null: set[tuple[int, int, str, str]] = set()
+    for r in conn.execute(
+        "SELECT * FROM pr_evidence ORDER BY repo_id, pr_number, commit_id, rule, raw"
+    ):
+        cid = r["commit_id"]
+        if cid is not None and commit_map[int(cid)] != int(cid):
+            continue
+        if cid is None:
+            key = (int(r["repo_id"]), int(r["pr_number"]), str(r["rule"]), str(r["raw"]))
+            if key in seen_null:
+                continue
+            seen_null.add(key)
+        out.execute(
+            "INSERT INTO pr_evidence (repo_id, pr_number, commit_id, rule, raw, verdict,"
+            " harness, model, channel, observed_at, suspicious)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                r["repo_id"],
+                r["pr_number"],
+                cid,
+                r["rule"],
+                r["raw"],
+                r["verdict"],
+                r["harness"],
+                r["model"],
+                r["channel"],
+                r["observed_at"],
+                r["suspicious"],
+            ),
+        )
 
 
 def _copy_features(

@@ -369,6 +369,27 @@ def _upsert(conn: sqlite3.Connection, item: _Ingest) -> None:
             "INSERT INTO ai_evidence (commit_id, rule, raw, verdict) VALUES (?, ?, ?, ?)",
             (commit_ids[int(r["commit_id"])], r["rule"], r["raw"], r["verdict"]),
         )
+    for r in src.execute(
+        "SELECT * FROM pr_evidence ORDER BY repo_id, pr_number, commit_id, rule, raw"
+    ):
+        conn.execute(
+            "INSERT INTO pr_evidence (repo_id, pr_number, commit_id, rule, raw, verdict,"
+            " harness, model, channel, observed_at, suspicious)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                repo_id,
+                r["pr_number"],
+                commit_ids[int(r["commit_id"])] if r["commit_id"] is not None else None,
+                r["rule"],
+                r["raw"],
+                r["verdict"],
+                r["harness"],
+                r["model"],
+                r["channel"],
+                r["observed_at"],
+                r["suspicious"],
+            ),
+        )
     for r in src.execute("SELECT * FROM commits_features ORDER BY commit_id, feature_id"):
         conn.execute(
             "INSERT INTO commits_features (commit_id, feature_id, role) VALUES (?, ?, ?)",
@@ -451,6 +472,7 @@ def _purge_repo(conn: sqlite3.Connection, repo_id: int) -> None:
     conn.execute(f"DELETE FROM commit_verdicts WHERE commit_id {where}", (repo_id,))
     conn.execute(f"DELETE FROM ai_evidence WHERE commit_id {where}", (repo_id,))
     conn.execute(f"DELETE FROM ai_attribution WHERE commit_id {where}", (repo_id,))
+    conn.execute("DELETE FROM pr_evidence WHERE repo_id = ?", (repo_id,))
     conn.execute(f"DELETE FROM commits_features WHERE commit_id {where}", (repo_id,))
     conn.execute(
         f"DELETE FROM fix_touches WHERE fix_commit_id {where} OR source_commit_id {where}",

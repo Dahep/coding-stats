@@ -536,10 +536,42 @@ def _step_4(conn: sqlite3.Connection) -> None:
     )
 
 
+def _step_5(conn: sqlite3.Connection) -> None:
+    """PR-channel evidence rows (ADR-0007 clauses 3-5, ticket #35).
+
+    The channel-pr tier's RECORDED observations — PR number, rule id, raw
+    matched string, the tier, the identity the raw names, ``observed_at`` and
+    channel — attached at the mapped landed sha. Unlike ``ai_evidence`` these
+    are never re-derived by recompute (they read GitHub data and PR head
+    refs, not just the Target branch); a re-run replaces one PR's rows
+    wholesale via (repo_id, pr_number). ``commit_id`` is NULL exactly for
+    suspicious rows — the head-parentage check failed — which are audit
+    records and never attribution. ``repo_id`` scopes rows whose commit is
+    NULL (suspicious) in multi-repo unions. ``IF NOT EXISTS`` for the same
+    replay reason as step 4."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS pr_evidence (
+               repo_id INTEGER NOT NULL REFERENCES repositories(id),
+               pr_number INTEGER NOT NULL,
+               commit_id INTEGER REFERENCES commits(id),
+               rule TEXT NOT NULL,
+               raw TEXT NOT NULL,
+               verdict TEXT NOT NULL CHECK (verdict IN ('yes', 'possible')),
+               harness TEXT,
+               model TEXT,
+               channel TEXT NOT NULL CHECK (channel = 'pr'),
+               observed_at TEXT NOT NULL,
+               suspicious INTEGER NOT NULL CHECK (suspicious IN (0, 1)),
+               UNIQUE (repo_id, pr_number, commit_id, rule, raw)
+           )"""
+    )
+
+
 SCHEMA_STEPS: list[Step] = [
     STEP_0_SQL,  # 0: initial schema
     _step_1,  # 1: repository identity, repo-scoped commits, prefixed feature ids
     _step_2,  # 2: features.live_lines + feature_line_samples (Sample rows)
     _step_3,  # 3: union-wide feature key (repository, id) — ADR-0006 clause 4
     _step_4,  # 4: AI attribution verdict + evidence rows — ADR-0007 baseline
+    _step_5,  # 5: PR-channel evidence rows — ADR-0007 clauses 3-5 (ticket #35)
 ]

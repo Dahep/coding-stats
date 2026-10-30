@@ -164,6 +164,39 @@ _TABLES: tuple[_Table, ...] = (
         " ORDER BY commit_id, rule, raw",
     ),
     _Table(
+        "pr_evidence",
+        """CREATE TABLE pr_evidence (
+               repo_id INTEGER NOT NULL,
+               pr_number INTEGER NOT NULL,
+               commit_id INTEGER,
+               rule TEXT NOT NULL,
+               raw TEXT NOT NULL,
+               verdict TEXT NOT NULL CHECK (verdict IN ('yes', 'possible')),
+               harness TEXT,
+               model TEXT,
+               channel TEXT NOT NULL CHECK (channel = 'pr'),
+               observed_at TEXT NOT NULL,
+               suspicious INTEGER NOT NULL CHECK (suspicious IN (0, 1)),
+               UNIQUE (repo_id, pr_number, commit_id, rule, raw)
+           );""",
+        (
+            "repo_id",
+            "pr_number",
+            "commit_id",
+            "rule",
+            "raw",
+            "verdict",
+            "harness",
+            "model",
+            "channel",
+            "observed_at",
+            "suspicious",
+        ),
+        """SELECT repo_id, pr_number, commit_id, rule, raw, verdict, harness, model, channel,
+                  observed_at, suspicious
+           FROM pr_evidence ORDER BY repo_id, pr_number, commit_id, rule, raw""",
+    ),
+    _Table(
         "features",
         """CREATE TABLE features (
                id TEXT NOT NULL,
@@ -553,6 +586,11 @@ def _check_ownership(conn: sqlite3.Connection) -> None:
         (
             "ai_evidence",
             f"SELECT COUNT(*) c FROM ai_evidence WHERE commit_id NOT IN {in_commits}",
+        ),
+        (
+            "pr_evidence",
+            f"SELECT COUNT(*) c FROM pr_evidence WHERE repo_id != {rid}"
+            f" OR (commit_id IS NOT NULL AND commit_id NOT IN {in_commits})",
         ),
         (
             "commits_features",
