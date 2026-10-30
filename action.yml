@@ -20,7 +20,10 @@
 # detect-pr mode (detect-pr: true, or a non-empty pr-backfill) runs the PR
 # tier; the detect-pr mode needs `pull-requests: read` added to the caller's
 # workflow permissions (the PR list API); the detect-pr: false default never
-# does and runs byte-identically to the git-only pipeline.
+# does and runs byte-identically to the git-only pipeline. The update step's
+# GITHUB_TOKEN env is scoped to the PR tier the same way: it carries the
+# run's token ONLY when detect-pr is on (or pr-backfill is set) — the PR
+# list API's auth — and is EMPTY in the off mode.
 #
 # Private repos (detect-pr mode): head refs `refs/pull/N/head` fetch over
 # the AUTHENTICATED GIT TRANSPORT — never the REST API, never a PAT. The
@@ -151,7 +154,7 @@ runs:
         CODING_STATS_PR_BACKFILL: "${{ inputs.pr-backfill }}"
         OPENCODE_API_KEY: "${{ inputs.opencode-api-key }}"
         OPENROUTER_API_KEY: "${{ inputs.openrouter-api-key }}"
-        GITHUB_TOKEN: "${{ github.token }}"
+        GITHUB_TOKEN: "${{ (inputs.detect-pr == 'true' || inputs.pr-backfill != '') && github.token || '' }}"
       run: |
         db="$RUNNER_TEMP/coding-stats/working.db"
         mkdir -p "$RUNNER_TEMP/coding-stats"

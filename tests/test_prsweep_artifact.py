@@ -66,14 +66,19 @@ def _pr_rows(conn):
     ]
 
 
-def _strip_tables(conn, *tables) -> bytes:
+def _strip_tables(conn, *tables, step: int | None = None) -> bytes:
     """Artifact bytes as a pre-feature mint would have written them: without
-    the named tables' bodies, digest re-stamped (the
-    test_ai_attribution_artifact crafting pattern). Crafted content VERIFIES."""
+    the named tables' bodies, and with the header schema-step stamped to that
+    mint's own step (shape completion only applies to older steps), digest
+    re-stamped (the test_ai_attribution_artifact crafting pattern). Crafted
+    content VERIFIES."""
     content = artifact.serialize(conn).decode("utf-8")
     out: list[str] = []
     skipping_ddl = False
     for line in content.splitlines(keepends=True):
+        if line.startswith("-- schema-step:") and step is not None:
+            out.append(f"-- schema-step: {step}\n")
+            continue
         if any(line.startswith(f"CREATE TABLE {t}") for t in tables):
             skipping_ddl = True
             continue
@@ -92,13 +97,15 @@ def _strip_tables(conn, *tables) -> bytes:
 
 
 def pre_pr_bytes(conn) -> bytes:
-    """A pre-#35 artifact body: no PR-channel state at all."""
-    return _strip_tables(conn, "pr_evidence", "pr_watermark")
+    """A pre-#35 artifact body: no PR-channel state at all (a #34-era mint:
+    schema step 4)."""
+    return _strip_tables(conn, "pr_evidence", "pr_watermark", step=4)
 
 
 def pre_watermark_bytes(conn) -> bytes:
-    """A pre-#36 artifact body: PR rows but no watermark table."""
-    return _strip_tables(conn, "pr_watermark")
+    """A pre-#36 artifact body: PR rows but no watermark table (a #35-era
+    mint: schema step 5)."""
+    return _strip_tables(conn, "pr_watermark", step=5)
 
 
 def _reseat(content: str, needle: str) -> bytes:

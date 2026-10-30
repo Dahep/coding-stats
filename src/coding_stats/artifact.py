@@ -458,20 +458,45 @@ def materialize(conn: sqlite3.Connection, data: bytes) -> None:
         raise MaterializeError(f"artifact refused: {exc}") from exc
     finally:
         conn.set_authorizer(None)
-    _complete_shape(conn)
+    _complete_shape(conn, _schema_step_of(data))
     _check_shape(conn)
     _check_ownership(conn)
 
 
-def _complete_shape(conn: sqlite3.Connection) -> None:
-    """Bring a pre-feature artifact body up to the curated shape: every
-    curated table the replay did not create is created EMPTY by us, outside
-    the guarded replay. Artifacts minted before a table existed (older
-    schema steps) stay replayable — their rows for the new table are simply
-    absent, and pure state (AI attribution) re-derives on the next walk.
-    Skipping is safe here: an empty table can only mean 'no rows', and the
-    shape/ownership guards below still vet every table that IS in the body."""
+# The tables minted AFTER the core settled (schema steps 4-6): shape
+# completion only ever fills THESE, and only for artifacts whose header
+# schema-step predates the table's own step. Core tables (repositories,
+# commits, commit_verdicts, features, ...) are NEVER resurrected — an
+# artifact missing one is refused by _check_shape.
+_COMPLETE_STEPS: dict[str, int] = {
+    "ai_attribution": 4,
+    "ai_evidence": 4,
+    "pr_evidence": 5,
+    "pr_watermark": 6,
+}
+
+
+def _schema_step_of(data: bytes) -> int:
+    """The artifact header's schema-step stamp (0 when the body carries
+    none)."""
+    m = re.search(rb"^-- schema-step: (\d+)$", data, re.M)
+    return int(m.group(1)) if m else 0
+
+
+def _complete_shape(conn: sqlite3.Connection, step: int) -> None:
+    """Bring a pre-feature artifact body up to the curated shape: of the
+    post-step-3 tables (ai_attribution, ai_evidence, pr_evidence,
+    pr_watermark), every one the replay did not create AND whose schema step
+    is NEWER than the artifact's header stamp is created EMPTY by us, outside
+    the guarded replay. Artifacts minted before a table existed stay
+    replayable — their rows for the new table are simply absent, and pure
+    state (AI attribution) re-derives on the next walk. A mint that already
+    claimed the table's step must carry it (no completion): missing core
+    tables are never resurrected, and _check_shape refuses the artifact."""
     for table in _TABLES:
+        at_step = _COMPLETE_STEPS.get(table.name)
+        if at_step is None or step >= at_step:
+            continue
         exists = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table.name,)
         ).fetchone()
@@ -483,8 +508,7 @@ def stamp_schema_steps(conn: sqlite3.Connection, data: bytes) -> None:
     """Mark the artifact's schema step as applied (db.connect bookkeeping).
     Runs AFTER the guarded replay: bookkeeping tables are ours, not artifact
     data, and the authorizer denies creating them."""
-    m = re.search(rb"^-- schema-step: (\d+)$", data, re.M)
-    step = int(m.group(1)) if m else 0
+    step = _schema_step_of(data)
     for i in range(step + 1):
         conn.execute(f"CREATE TABLE IF NOT EXISTS _schema_step_{i:04d} (ok)")
     conn.commit()

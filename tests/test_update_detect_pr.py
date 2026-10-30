@@ -10,6 +10,7 @@ disclosure line prints whenever the mode is on, and the serialized artifact
 carries the evidence rows and the watermark."""
 
 import sqlite3
+import subprocess
 
 import pytest
 
@@ -177,6 +178,47 @@ def test_pr_backfill_full_resweeps_the_whole_numbering_sharing_the_watermark(
 def test_pr_backfill_rejects_shapes_other_than_full():
     with pytest.raises(SystemExit):
         cli.main(["update", "--db", "unused.db", "--pr-backfill", "half"])
+
+
+@pytest.mark.parametrize(
+    "boom",
+    [
+        ValueError("bad API body"),
+        KeyError("number"),
+        subprocess.SubprocessError("git died"),
+        OSError("network gone"),
+    ],
+)
+def test_sweep_tier_never_fails_the_deterministic_update(
+    tmp_path, repo, monkeypatch, capsys, boom
+):
+    # best-effort like classification (Q13): bad API bodies, git failures and
+    # OS errors degrade to the WARNING path — the deterministic pipeline and
+    # the artifact landing are never failed by the PR tier
+    db_path, _ = _built(tmp_path, repo, [1], monkeypatch)
+
+    def raise_boom(*_a, **_k):
+        raise boom
+
+    monkeypatch.setattr("coding_stats.prsweep.sweep_increment", raise_boom)
+    cli.main(["update", "--db", db_path, "--no-classify", "--detect-pr"])
+    out = capsys.readouterr().out
+    assert "WARNING: pr-sweep unavailable" in out
+    assert "artifact updated" in out
+    assert artifact.verify(store_dir(repo) / "coding-stats.sql") is None
+
+
+def test_sweep_tier_never_swallows_an_interrupt(tmp_path, repo, monkeypatch):
+    # KeyboardInterrupt is the sweep's existing STOP condition — and when it
+    # escapes the sweep the best-effort catch must NOT swallow it
+    db_path, _ = _built(tmp_path, repo, [1], monkeypatch)
+
+    def raise_boom(*_a, **_k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("coding_stats.prsweep.sweep_increment", raise_boom)
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(["update", "--db", db_path, "--no-classify", "--detect-pr"])
 
 
 # ------------------------------------------------ best-effort degrade ----

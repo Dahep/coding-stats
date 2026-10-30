@@ -6,11 +6,15 @@ see — PR body footers, bot authors, and head branch names recovered from
 PR head refs — and records it as evidence rows CHANNELED ``pr``, attached at
 the landed Target-branch sha. The pipeline per sweep run from a lower bound:
 
-1. **List** closed PRs with number > the bound via one ``GET
-   /repos/{owner}/{repo}/pulls`` per 100 closed PRs (ascending processing
+1. **List** PRs with number > the bound via one ``GET
+   /repos/{owner}/{repo}/pulls?state=all`` per 100 PRs (ascending processing
    order). Bodies, titles and authors come from the LIST response: ZERO
    per-PR API calls and no commit-list endpoints anywhere — a 10k-PR repo
-   costs ~100 requests total. Closed-unmerged PRs are listed and skipped.
+   costs ~100 requests total. Mergedness is the wire's ``merged_at``
+   timestamp-or-null (there is no ``merged`` boolean on the wire); merged
+   ones are processed, closed-unmerged PRs are listed and skipped, and
+   still-open PR numbers clamp the Watermark below them (out-of-order merges:
+   the PR is above the watermark and gets processed when it merges later).
 2. **Fetch** ``refs/pull/N/head`` over the git protocol (zero API budget),
    lazily — only for squash/rebase-merged PRs whose shas were rewritten on
    the Target branch. Plain-merge PRs are skipped entirely by the fetch:
@@ -24,11 +28,13 @@ the landed Target-branch sha. The pipeline per sweep run from a lower bound:
    patch-id matching for rebase rewrites.
 4. **Head-parentage check** before trusting a fetched ref: the squash
    landing must carry the head range's aggregate patch-id and every
-   content-carrying rebase head commit must map to a walked twin. When the
-   ref is not plausibly the PR's merge head (mapping fails, post-merge
-   force-push, or the ref is gone) the PR's rows are recorded
+   content-carrying rebase head commit must map to a walked twin. Only a
+   genuinely-mapped-but-parentage-failed head (mapping fails, post-merge
+   force-push) or a genuinely-unmappable one (the ref is gone) is recorded
    SUSPICIOUS-MARKED with no commit attached — audit only, never
-   attribution.
+   attribution. A PR whose landing is not in the walked set (merged after
+   the last walk) is never recorded and never claimed: the run stops at it,
+   waiting for the walk to catch up.
 5. **Record** rows — (PR number, rule id, raw matched string, observed_at,
    channel pr) plus the tier and the identity the raw names — at the mapped
    sha. Rows are RECORDED, never re-derived by recompute (they are not pure
@@ -50,10 +56,16 @@ NEVER merge date (PR numbers are total and append-only; dates reorder):
   replaced, never extended).
 * Closed-unmerged PRs and PRs merged into another base branch are never
   incorporated and never advance the watermark: their numbers sit below
-  whatever watermark the next merged PR produces.
+  whatever watermark the next merged PR produces. A still-open PR number,
+  though, CLAMPS the watermark below it (out-of-order merges: the number is
+  processed once the PR merges later).
 * **Stop conditions** end a run cleanly with a visible notice — never a
-  failure exit: rate-limit exhaustion (``RateLimited``), the per-run
-  processing cap, or an interruption. The next run resumes automatically.
+  failure exit: genuine rate-limit exhaustion (``RateLimited`` — 429, or a
+  403 with the rate budget at zero; a permissions 403 is a distinct stop
+  naming ``pull-requests: read``, never "rate limit exhausted"), the per-run
+  processing cap, an interruption, a PR whose landing is not walked yet
+  (``WalkStale`` — waiting for the walk to catch up), or a transient git
+  fetch failure (``FetchUnavailable``). The next run resumes automatically.
 * **Full-history sweep** (``sweep_full``, explicit operator invocation):
   the same oldest-first walk sharing the watermark, merely walked further —
   its listing walk continues past the watermark bound until the beginning
@@ -94,6 +106,11 @@ DEFAULT_RUN_CAP = 25  # increment runs ("a few PRs per push run")
 STOP_CAP = "cap"
 STOP_RATE_LIMIT = "rate-limit"
 STOP_INTERRUPTED = "interrupted"
+STOP_WALK_STALE = "walk-stale"
+STOP_FETCH = "fetch-failed"
+STOP_FORBIDDEN = "forbidden"
+
+REQUEST_TIMEOUT = 30  # seconds: a hung API never hangs the sweep
 
 Transport = Callable[[str], Any]  # url -> parsed JSON body
 
@@ -107,9 +124,18 @@ class RateLimited(RuntimeError):
     failure — the run ends cleanly and the next one resumes."""
 
 
+class WalkStale(RuntimeError):
+    """A merged PR's landing is not in the walked set (it merged after the
+    last walk): a resumable stop — the run stops AT that PR, recording
+    nothing and never claiming past it, and the next run (after a newer
+    walk) redoes it (replace-per-PR)."""
+
+
 @dataclass(frozen=True)
 class PullRequest:
-    """The PR-list fields the sweep reads (one list response row)."""
+    """The PR-list fields the sweep reads (one list response row — GitHub's
+    Pull Request Simple schema). ``merged`` is PARSED from the wire's
+    ``merged_at`` timestamp-or-null (the wire carries no ``merged`` boolean)."""
 
     number: int
     title: str
@@ -119,6 +145,8 @@ class PullRequest:
     head_ref: str | None
     base_ref: str | None
     merged: bool
+    is_open: bool  # state == "open" (the watermark clamp for out-of-order merges)
+    landing_sha: str | None  # the wire's merge_commit_sha (walk-coverage check)
 
 
 @dataclass(frozen=True)
@@ -129,7 +157,7 @@ class PrRow:
     rule: str
     raw: str
     verdict: str  # 'yes' | 'possible'
-    commit_id: int | None  # mapped landed sha; None for suspicious rows
+    commit_id: int | None  # mapped landed sha; None when unattached (suspicious or unmapped)
     suspicious: bool
     harness: str | None
     model: str | None
@@ -145,12 +173,30 @@ class SweepResult:
     stop: str | None = None  # None = ran to its end; else a stop condition
 
 
+def _http_stop(exc: urllib.error.HTTPError) -> str | None:
+    """Classify an API HTTP failure into a stop condition — one classifier for
+    403 AND 429 on every surface. Rate-limit exhaustion ONLY when it
+    genuinely is one (429 is throttling by definition, or a 403 carrying
+    ``X-RateLimit-Remaining: 0``); a permissions 403/401 ("Resource not
+    accessible by integration") is a distinct stop naming the permission,
+    never laundered into "rate limit exhausted". None = re-raise as a
+    failure."""
+    if exc.code == 429 or (
+        exc.code == 403 and exc.headers.get("X-RateLimit-Remaining") == "0"
+    ):
+        return STOP_RATE_LIMIT
+    if exc.code in (401, 403):
+        return STOP_FORBIDDEN
+    return None
+
+
 def default_transport(url: str) -> Any:
     """The stdlib GitHub API transport (zero runtime dependencies). Auth via
     GITHUB_TOKEN when present (``pull-requests: read`` is enough); unauthen‐
-    cated works for public repos within the smaller rate budget. Rate-limit
-    responses raise ``RateLimited`` — the run's clean-stop signal, never a
-    failure exit."""
+    cated works for public repos within the smaller rate budget. GENUINE
+    rate-limit responses raise ``RateLimited`` — the run's clean-stop signal,
+    never a failure exit; a permissions 403 is re-raised (the sweep turns it
+    into the forbidden stop). Every request carries a timeout."""
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "coding-stats",
@@ -161,17 +207,21 @@ def default_transport(url: str) -> Any:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        if exc.code == 429 or (
-            exc.code == 403 and exc.headers.get("X-RateLimit-Remaining") == "0"
-        ):
+        if _http_stop(exc) == STOP_RATE_LIMIT:
             raise RateLimited(f"GitHub API rate limit exhausted (HTTP {exc.code})") from exc
         raise
 
 
 def _parse_pr(item: dict[str, Any]) -> PullRequest:
+    """One LIST row -> the sweep's fields. The wire format is GitHub's Pull
+    Request Simple schema: mergedness is the ``merged_at`` timestamp-or-null
+    (there is NO ``merged`` boolean on the wire — ``merged: true`` in docs and
+    ticket bodies is the intent, not the wire format), the landing sha is
+    ``merge_commit_sha``, and ``state`` separates still-open PRs from closed
+    ones."""
     user = item.get("user") or {}
     head = item.get("head") or {}
     base = item.get("base") or {}
@@ -184,26 +234,44 @@ def _parse_pr(item: dict[str, Any]) -> PullRequest:
         author_is_bot=user.get("type") == "Bot",
         head_ref=str(head["ref"]) if head.get("ref") else None,
         base_ref=str(base["ref"]) if base.get("ref") else None,
-        merged=bool(item.get("merged")),
+        merged=item.get("merged_at") is not None,
+        is_open=item.get("state") == "open",
+        landing_sha=str(item["merge_commit_sha"]) if item.get("merge_commit_sha") else None,
     )
 
 
-def list_merged_pulls(
+@dataclass(frozen=True)
+class Listing:
+    """One LIST walk's result: the merged PRs above the bound (ascending) and
+    the watermark clamp for out-of-order merges."""
+
+    merged: list[PullRequest]  # number > bound, ascending, merged ones only
+    requests: int  # API requests spent (list pages only)
+    open_floor: int | None  # lowest still-open PR number seen (None: none seen)
+
+
+def list_pulls(
     owner: str, repo: str, after: int, transport: Transport | None = None
-) -> tuple[list[PullRequest], int]:
-    """Closed PRs with number > ``after``, ascending, merged ones only
-    (ticket #35 step 1). Cost: one GET per 100 closed PRs — the LIST response
-    carries bodies/titles/authors, so there are ZERO per-PR API calls.
-    Pages arrive newest-first and paging stops at the bound (the numbering
-    sequence is total and append-only)."""
+) -> Listing:
+    """The LIST query (ticket #35 step 1): ``state=all``, one GET per 100 PRs
+    (ascending processing order). Bodies, titles and authors come from the
+    LIST response: ZERO per-PR API calls and no commit-list endpoints anywhere
+    — a 10k-PR repo costs ~100 requests total. Merged PRs with number >
+    ``after`` are kept (mergedness = the wire's ``merged_at``); closed-unmerged
+    PRs are listed and skipped. Still-open PR numbers are returned as
+    ``open_floor``: out-of-order merges — an open PR numbered below merged ones
+    — must stay ABOVE the watermark (it is clamped below them), or the PR is
+    lost when it merges later. Pages arrive newest-first and paging stops at
+    the bound (the numbering sequence is total and append-only)."""
     call = transport or default_transport
     kept: dict[int, PullRequest] = {}
+    open_floor: int | None = None
     requests = 0
     page = 1
     while True:
         url = (
             f"https://api.github.com/repos/{owner}/{repo}/pulls"
-            f"?state=closed&sort=created&direction=desc"
+            f"?state=all&sort=created&direction=desc"
             f"&per_page={DEFAULT_PER_PAGE}&page={page}"
         )
         items = call(url)
@@ -214,28 +282,47 @@ def list_merged_pulls(
         for item in items:
             parsed = _parse_pr(item)
             numbers.append(parsed.number)
+            if parsed.is_open:
+                open_floor = parsed.number if open_floor is None else min(open_floor, parsed.number)
             if parsed.number > after and parsed.merged:
                 kept[parsed.number] = parsed
         if len(items) < DEFAULT_PER_PAGE or max(numbers) <= after:
             break
         page += 1
-    return [kept[n] for n in sorted(kept)], requests
+    return Listing([kept[n] for n in sorted(kept)], requests, open_floor)
+
+
+class FetchUnavailable(RuntimeError):
+    """The git fetch of a PR head ref failed TRANSIENTLY (network, auth,
+    remote config): a resumable stop — never recorded as a vanished ref."""
 
 
 def fetch_head_ref(repo: Path, pr_number: int) -> str | None:
     """Fetch GitHub's ``refs/pull/N/head`` over the git protocol (zero API
-    budget) and return its tip sha. None when the ref is gone or unfetchable
-    — the sweep then records suspicious rows, never attribution. The ref is
-    force-updated locally: a post-merge force-push shows up as content that
-    no longer maps onto what landed."""
+    budget) and return its tip sha. None ONLY when the ref is genuinely gone
+    (GitHub answers "couldn't find remote ref" — abandoned heads,
+    force-pushed-then-deleted): the sweep then records suspicious rows, never
+    attribution. Transient failures (unreachable remote, auth, config) raise
+    ``FetchUnavailable`` — the run stops cleanly instead; a transient error
+    is never recorded as suspicious. The ref is force-updated locally: a
+    post-merge force-push shows up as content that no longer maps onto what
+    landed. Never interactive: ``GIT_TERMINAL_PROMPT=0`` and a closed stdin,
+    so a fetch can never hang asking for credentials."""
     refspec = f"+refs/pull/{pr_number}/head:refs/pull/{pr_number}/head"
     fetch = subprocess.run(
         ["git", "-C", str(repo), "fetch", "--no-tags", "-q", "origin", refspec],
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
     )
     if fetch.returncode != 0:
-        return None
+        if "couldn't find remote ref" in fetch.stderr:
+            return None  # genuinely gone
+        raise FetchUnavailable(
+            f"git fetch refs/pull/{pr_number}/head failed:"
+            f" {fetch.stderr.strip() or fetch.returncode}"
+        )
     out = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"refs/pull/{pr_number}/head"],
         capture_output=True,
@@ -389,19 +476,21 @@ def incorporate_pr(
     pr: PullRequest,
     *,
     now: str | None = None,
-    advance: bool = True,
+    advance_to: int | None = None,
 ) -> tuple[int, int]:
     """The per-PR step of the run machinery (ticket #36): record one PR's
     evidence rows (replace-not-duplicate) and — when the run may claim
-    contiguous coverage — advance the Watermark to its number, BOTH in one
-    transaction. Interruption at any point leaves the previously
-    incorporated prefix intact; the interrupted PR is at worst redone
-    (replaced) by the next run. Returns (stored rows, suspicious)."""
+    contiguous coverage — advance the Watermark to ``advance_to`` (normally
+    the PR's number, clamped below the lowest still-open PR number when
+    out-of-order merges leave one), BOTH in one transaction. Interruption at
+    any point leaves the previously incorporated prefix intact; the
+    interrupted PR is at worst redone (replaced) by the next run. Returns
+    (stored rows, suspicious)."""
     observed_at = now or datetime.now(UTC).isoformat(timespec="seconds")
     rows = _pr_rows(conn, repo, branch, pr)
     stored = replace_pr_rows(conn, pr.number, rows, observed_at)
-    if advance:
-        advance_watermark(conn, pr.number)
+    if advance_to is not None:
+        advance_watermark(conn, advance_to)
     conn.commit()  # rows + watermark land atomically, per PR (never per page)
     return stored, sum(1 for r in rows if r.suspicious)
 
@@ -419,8 +508,10 @@ def sweep(
     """One channel-pr sweep run over merged PRs with number > ``after_pr``,
     oldest first (ticket #35's numbered behavior on #36's machinery).
     Run after the walk: the mapping reads the walked commits, and a PR whose
-    landing is not walked yet is recorded suspicious and healed by a re-run
-    (replace-per-PR) once the walk has caught up.
+    landing is not walked yet stops the run AT that PR (``STOP_WALK_STALE`` —
+    waiting for the walk): nothing is recorded for it, the watermark never
+    claims past it, and the next run after a newer walk redoes it
+    (replace-per-PR).
 
     The Watermark advances per incorporated PR — but only while the run
     claims CONTIGUOUS coverage: a bound above the watermark leaves the range
@@ -433,18 +524,28 @@ def sweep(
     above the watermark."""
     if after_pr < 0:
         raise SweepError(f"--after-pr must be >= 0 (got {after_pr})")
+    if not branch:
+        # an empty Target branch would silently skip every PR through the
+        # base-ref mismatch — error loudly instead
+        raise SweepError(
+            "pr-sweep needs a Target branch: none configured (settings.branch"
+            " is empty — run init --branch <target>)"
+        )
     owner, name = _github_repo(conn)
     pulls: list[PullRequest] = []
     requests = 0
+    open_floor: int | None = None
     stop: str | None = None
     try:
-        pulls, requests = list_merged_pulls(owner, name, after_pr, transport)
+        listing = list_pulls(owner, name, after_pr, transport)
+        pulls, requests, open_floor = listing.merged, listing.requests, listing.open_floor
     except RateLimited:
         stop = STOP_RATE_LIMIT  # incomplete listing: nothing may be processed
     except urllib.error.HTTPError as exc:
-        if exc.code not in (403, 429):
+        verdict = _http_stop(exc)  # genuine rate limit vs permissions failure
+        if verdict is None:
             raise
-        stop = STOP_RATE_LIMIT  # 403/429 from the API: the budget is gone
+        stop = verdict
     except KeyboardInterrupt:
         stop = STOP_INTERRUPTED
     # contiguous coverage only: a bound above the watermark leaves a gap the
@@ -460,18 +561,31 @@ def sweep(
                 if max_prs is not None and processed >= max_prs:
                     stop = STOP_CAP
                     break
+                advance_to: int | None = None
+                if can_advance:
+                    # out-of-order merges: the watermark never claims past a
+                    # still-open PR number — when it merges later it must sit
+                    # above the watermark
+                    advance_to = pulled.number
+                    if open_floor is not None:
+                        advance_to = min(advance_to, open_floor - 1)
                 stored, susp = incorporate_pr(
-                    conn, repo, branch, pulled, now=now, advance=can_advance
+                    conn, repo, branch, pulled, now=now, advance_to=advance_to
                 )
                 processed += 1
                 rows_n += stored
                 suspicious_n += susp
+        except WalkStale:
+            stop = STOP_WALK_STALE  # at that PR: waiting for the walk to catch up
+        except FetchUnavailable:
+            stop = STOP_FETCH  # transient git failure: retried by the next run
         except RateLimited:
             stop = STOP_RATE_LIMIT
         except urllib.error.HTTPError as exc:
-            if exc.code not in (403, 429):
+            verdict = _http_stop(exc)
+            if verdict is None:
                 raise
-            stop = STOP_RATE_LIMIT
+            stop = verdict
         except KeyboardInterrupt:
             stop = STOP_INTERRUPTED
     return SweepResult(processed, rows_n, suspicious_n, requests, watermark(conn), stop)
@@ -569,12 +683,47 @@ def _locate_landing(conn: sqlite3.Connection, number: int) -> tuple[str, _Walked
     return None
 
 
+def _walked_sha(conn: sqlite3.Connection, sha: str) -> bool:
+    """Whether the walk already carries this landed sha (its landing is in
+    the walked set)."""
+    return (
+        conn.execute("SELECT 1 FROM commits WHERE sha = ?", (sha,)).fetchone() is not None
+    )
+
+
+def _contentless_landing(repo: Path, sha: str) -> bool:
+    """True when the repo holds this landing but the walk can NEVER record
+    it: its diff strips to nothing (empty or store-only), so walk() skips it
+    entirely. Such a landing is genuinely contentless — the mapping resolves
+    it as unmapped instead of waiting for a walk that will never carry it."""
+    try:
+        diff = gitwalk.diff_for(repo, sha)
+    except subprocess.CalledProcessError:
+        return False  # the repo does not know this sha: the walk is behind
+    return not gitwalk.prepare_diff(diff).diff.strip()
+
+
 def _pr_rows(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest) -> list[PrRow]:
     """Steps 2-5 for one PR: fetch lazily, detect on head commits + PR-level
     signals, check head parentage, map, and assemble the row set (deduped
-    per (commit, rule, raw), git-recorded matches never doubled)."""
+    per (commit, rule, raw), git-recorded matches never doubled).
+
+    A PR whose landing is NOT in the walked set raises ``WalkStale`` instead
+    of producing rows: the run stops at it (waiting for the walk), never
+    records suspicious rows for it and never claims past it — the evidence
+    is not lost, the next run after a newer walk redoes it."""
     signals = aiattr.pr_matches(pr.body or "", pr.author_login, pr.author_is_bot, pr.head_ref)
     landed = _locate_landing(conn, pr.number)
+    if (
+        landed is None
+        and pr.landing_sha is not None
+        and not _walked_sha(conn, pr.landing_sha)
+        and not _contentless_landing(repo, pr.landing_sha)
+    ):
+        raise WalkStale(
+            f"PR {pr.number}: its landing {pr.landing_sha[:12]} is not in the walked set"
+            " (merged after the last walk) — waiting for the walk to catch up"
+        )
     if landed is not None:
         kind, walk = landed
         if kind == "merge":
@@ -589,7 +738,11 @@ def _pr_rows(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest)
             return _assemble(conn, None, [], signals, suspicious=True)
         base = gitwalk.merge_base(repo, tip, branch)
         aggregate = gitwalk.patch_id_for_range(repo, base, tip) if base else None
-        if not base or aggregate != walk.subject_patch_id:
+        if not base or (
+            walk.subject_patch_id is not None
+            and aggregate is not None
+            and aggregate != walk.subject_patch_id
+        ):
             # not plausibly the PR's merge head (post-merge force-push or a
             # squash subject that named the wrong commit)
             return _assemble(
@@ -598,6 +751,17 @@ def _pr_rows(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest)
                 _detect_heads(repo, _safe_range(repo, base, tip)),
                 signals,
                 suspicious=True,
+            )
+        if aggregate is None or walk.subject_patch_id is None:
+            # empty diffs carry no patch-id: None on None is NOT a match —
+            # no false trust. Genuinely unmapped per the squash strategy, but
+            # not suspicious: recorded unattached, never attributed
+            return _assemble(
+                conn,
+                None,
+                _detect_heads(repo, _safe_range(repo, base, tip)),
+                signals,
+                suspicious=False,
             )
         hits = _detect_heads(repo, gitwalk.list_range(repo, base, tip), attach_all=walk.commit_id)
         return _assemble(conn, walk.commit_id, hits, signals, suspicious=False)
@@ -613,16 +777,38 @@ def _pr_rows(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest)
     head = gitwalk.list_range(repo, base, tip)
     twins: dict[str, _Walked] = {}
     mapping_failed = False
+    has_content = False
     for hc in head:
         pid = gitwalk.patch_id_for(repo, hc)
         if pid is None:
             continue  # empty-diff or merge head commit: nothing to map
+        has_content = True
         twin = _twin_by_patch_id(conn, pid)
         if twin is None:
             mapping_failed = True
         else:
             twins[hc] = twin
-    if mapping_failed or not twins:
+    if not twins:
+        if not has_content:
+            # the head carries no patchable content (empty diffs): nothing to
+            # map — genuinely unmapped, not suspicious, never a false trust
+            return _assemble(
+                conn, None, _detect_heads(repo, head), signals, suspicious=False
+            )
+        if pr.landing_sha is not None:
+            # the landing is walked (checked above) yet nothing maps: a
+            # genuinely unmappable head (post-merge force-push) — suspicious
+            return _assemble(
+                conn, None, _detect_heads(repo, head), signals, suspicious=True
+            )
+        # nothing names the PR and nothing maps: its landing cannot be shown
+        # to be walked — wait for the walk rather than lose the evidence
+        raise WalkStale(
+            f"PR {pr.number}: no walked commit maps its head (its landing is"
+            " not in the walked set) — waiting for the walk to catch up"
+        )
+    if mapping_failed:
+        # some head commits map but not all: mapped-but-parentage-failed
         return _assemble(
             conn, None, _detect_heads(repo, head), signals, suspicious=True
         )

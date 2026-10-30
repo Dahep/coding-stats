@@ -42,7 +42,8 @@ observations and never re-derived.
    reusing the same watermark.
 2. **Watermark-driven per-increment runs.** The Watermark is the last
    *incorporated* PR number, recorded in the Artifact next to the evidence
-   rows (schema step 5) and surviving partial recompute and gather exactly
+   rows (the `pr_watermark` table, schema step 6) and surviving partial
+   recompute and gather exactly
    as they do. Runs walk merged PRs above the Watermark **oldest first**
    (ascending PR number — numbers are total and append-only; merge dates
    reorder), and the Watermark advances **after each PR's evidence is
@@ -59,9 +60,12 @@ observations and never re-derived.
    Watermark bound to the beginning of the numbering (or a stop condition),
    sharing the Watermark: later push runs continue after it.
 3. **PR listing and head-ref retrieval.** One `GET
-   /repos/{owner}/{repo}/pulls?state=closed&per_page=100` per 100 closed
-   PRs, ascending processing order, keeping `merged: true` only (closed
-   unmerged and other-base PRs are listed and skipped). Bodies, titles and
+   /repos/{owner}/{repo}/pulls?state=all&per_page=100` per 100 PRs,
+   ascending processing order, keeping merged ones only — mergedness is the
+   wire's `merged_at` timestamp-or-null (`merged: true` in prose is the
+   intent, never the wire format) (closed-unmerged PRs are listed and
+   skipped; still-open PR numbers clamp the Watermark below them, so an
+   out-of-order merge stays above it). Bodies, titles and
    authors come from the LIST response: ZERO per-PR API calls and no
    commit-list endpoints anywhere — a 10k-PR repo costs ~100 requests
    against the `pull-requests: read` budget. `refs/pull/N/head` is fetched
