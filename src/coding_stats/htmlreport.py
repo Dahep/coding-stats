@@ -13,6 +13,8 @@ from datetime import date
 from pathlib import Path
 
 from .metrics import (
+    attribution_by_feature,
+    attribution_by_repo,
     attribution_rows,
     attribution_summary,
     feature_ranking,
@@ -667,6 +669,9 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
             else _esc(sha[:7])
         )
 
+    def channel_label(channel: str) -> str:
+        return "GitHub-sourced (PR-channel)" if channel == "pr" else "git"
+
     attr_trs = []
     for r in attr_rows:
         ev = "".join(
@@ -677,11 +682,12 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
         attr_trs.append(
             f"<tr><td>{sha_link(r.sha)}</td><td>{_esc(r.verdict)}</td>"
             f"<td>{_esc(r.harness or '—')}</td><td>{_esc(r.model or '—')}</td>"
-            f"<td>{ev}</td></tr>"
+            f"<td>{_esc(channel_label(r.channel))}</td><td>{ev}</td></tr>"
         )
     attr_table = (
         "<table><thead><tr><th>Commit</th><th>Verdict</th><th>Harness</th>"
-        "<th>Model</th><th>Evidence (rule · raw matched string)</th></tr></thead><tbody>"
+        "<th>Model</th><th>Channel</th><th>Evidence (rule · raw matched string)</th>"
+        "</tr></thead><tbody>"
         + "".join(attr_trs)
         + "</tbody></table>"
         if attr_trs
@@ -694,17 +700,82 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
         if attr.harness_counts
         else ""
     )
+    model_note = (
+        " Models seen (where known): "
+        + " · ".join(f"{_esc(m)} {n}" for m, n in attr.model_counts)
+        + "."
+        if attr.model_counts
+        else ""
+    )
+    channel_note = (
+        "<div class='note'>Channel breakdown: "
+        + " · ".join(
+            f"{_esc(channel_label(ch))} {n}" for ch, n in sorted(attr.channel_counts.items())
+        )
+        + ".</div>"
+        if attr.channel_counts
+        else ""
+    )
+    disclosure = (
+        "<div class='note'>GitHub-sourced (PR-channel) evidence present.</div>"
+        if attr.github_sourced
+        else ""
+    )
+    repo_share_rows = "".join(
+        f"<tr><td>{_esc(a.slug)}</td><td class='num'>{a.commits}</td>"
+        f"<td class='num'>{a.yes}</td><td class='num'>{a.possible}</td>"
+        f"<td class='num'>{a.no_evidence}</td>"
+        f"<td class='num'>{100.0 * a.ai_share:.0f}%</td></tr>"
+        for a in attribution_by_repo(conn)
+    )
+    feature_share_rows = "".join(
+        f"<tr><td>#{_esc(f.fid)} {_esc(f.title)}</td><td class='num'>{f.commits}</td>"
+        f"<td class='num'>{f.yes}</td><td class='num'>{f.possible}</td>"
+        f"<td class='num'>{f.no_evidence}</td>"
+        f"<td class='num'>{100.0 * f.ai_share:.0f}%</td></tr>"
+        for f in attribution_by_feature(conn)
+    )
+    share_cols = (
+        "<th class='num'>Commits</th><th class='num'>yes</th>"
+        "<th class='num'>possible</th><th class='num'>no-evidence</th>"
+        "<th class='num'>AI share</th>"
+    )
+    share_tables = (
+        (
+            "<h2 style='margin-top:18px;font-size:14px'>AI share per repository"
+            " (lower bound)</h2>"
+            f"<table><thead><tr><th>Repo</th>{share_cols}</tr></thead><tbody>"
+            + repo_share_rows
+            + "</tbody></table>"
+            "<h2 style='margin-top:18px;font-size:14px'>AI share per feature"
+            " (lower bound)</h2>"
+            f"<table><thead><tr><th>Feature</th>{share_cols}</tr></thead><tbody>"
+            + feature_share_rows
+            + "</tbody></table>"
+        )
+        # org mode only: the single-repo report keeps zero visual diff
+        if multi and (repo_share_rows or feature_share_rows)
+        else ""
+    )
     attr_section = f"""<section>
-<h2>AI attribution (git-only)</h2>
-<div class="note">Per-commit attribution computed from git data alone: commit
-trailers, raw identity strings (before any mailmap resolution), body
+<h2>AI attribution (lower bounds)</h2>
+<div class="note">Per-commit attribution computed from git data (commit
+trailers, raw identity strings before any mailmap resolution, body
 signatures and tool trailers — plus merge-subject branch prefixes as weak
-(<code>possible</code>) signals. <code>no-evidence</code> means no attribution
+<code>possible</code> signals) and from GitHub-sourced PR-channel evidence
+where the PR tier has run. <code>no-evidence</code> means no attribution
 signal matched the commit: an absence of evidence, never a statement about
 authorship. Every attribution is auditable through its evidence rows
-(rule id + the raw matched string).{harness_note}</div>
+(rule id + the raw matched string). Every number here is a lower bound:
+shares are counted over walked commits and never normalized upward to PR
+counts. A commit reached through several branches keeps one attribution,
+resolved by channel precedence (git-only evidence outranks inherited
+PR-channel evidence).{harness_note}{model_note}</div>
+{disclosure}
+{channel_note}
 {attr_donut}
 {attr_table}
+{share_tables}
 </section>"""
 
     churn_rows = [

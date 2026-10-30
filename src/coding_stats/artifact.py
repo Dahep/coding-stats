@@ -555,14 +555,16 @@ def _artifact_authorizer() -> Callable[[int, str | None, str | None, str | None,
 def _check_shape(conn: sqlite3.Connection) -> None:
     """Post-replay drift guard: the replay must have created every curated
     table with exactly its curated columns (an attacker's CREATE TABLE name is
-    checked by the authorizer; its column list, here)."""
+    checked by the authorizer; its column list, here). Positional reads: the
+    guards run on whatever connection the caller replays into, with no
+    row_factory requirement."""
     created = {
         str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
     for name, cols in KNOWN_TABLES.items():
         if name not in created:
             raise MaterializeError(f"artifact refused: missing table {name}")
-        actual = [str(r["name"]) for r in conn.execute(f"PRAGMA table_info({name})")]
+        actual = [str(r[1]) for r in conn.execute(f"PRAGMA table_info({name})")]
         if actual != list(cols):
             raise MaterializeError(
                 f"artifact refused: table {name} has columns {actual}, expected {list(cols)}"
@@ -579,7 +581,7 @@ def _check_ownership(conn: sqlite3.Connection) -> None:
         raise MaterializeError(
             f"artifact refused: {len(repos)} repositories rows (expected exactly 1)"
         )
-    rid = int(repos[0]["id"])
+    rid = int(repos[0][0])
     in_commits = "(SELECT id FROM commits)"
     in_features = "(SELECT id FROM features)"
     foreign = [
@@ -633,7 +635,7 @@ def _check_ownership(conn: sqlite3.Connection) -> None:
         ),
     ]
     for table, sql in foreign:
-        n = int(conn.execute(sql).fetchone()["c"])
+        n = int(conn.execute(sql).fetchone()[0])
         if n:
             raise MaterializeError(
                 f"artifact refused: {table} has {n} row(s) outside the artifact's repository"

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import NamedTuple
 
-from .aiattr import RULE_RANK
+from . import aiattr, prsweep
 from .orgview import org
 
 
@@ -247,72 +247,245 @@ def feature_repos(conn: sqlite3.Connection) -> dict[str, str]:
 
 @dataclass
 class AttributionSummary:
-    """AI attribution state across the walked commits (ticket #34): the
-    3-state verdict mix and the harnesses the evidence names."""
+    """AI attribution state across the walked commits (ticket #34/#38): the
+    3-state verdict mix, the identities the evidence names, the channel each
+    commit's attribution resolved through, and the AI share. Every number is
+    a LOWER BOUND: the share counts over walked commits and is never
+    normalized upward to PR counts."""
 
     verdict_counts: dict[str, int]  # 'yes'/'possible'/'no-evidence' -> commits
     harness_counts: list[tuple[str, int]]  # harness -> attributed commits
+    model_counts: list[tuple[str, int]]  # model -> attributed commits (where known)
+    channel_counts: dict[str, int]  # 'git'/'pr' -> commits attributed through it
+    github_sourced: bool  # contributing PR-channel evidence present (disclosure)
+    ai_share: float  # yes / walked commits — a LOWER BOUND (0.0 with no commits)
 
 
 @dataclass
 class AttributionRow:
     """One attributed commit with its audit evidence (rule id + raw matched
-    string, in the rule table's rank order)."""
+    string, in the rule table's rank order) and the channel its attribution
+    resolved through ('git' | 'pr')."""
 
     sha: str
     verdict: str
     harness: str
     model: str
     evidence: list[tuple[str, str, str]]  # (rule, raw, verdict)
+    channel: str = ""
+
+
+@dataclass
+class RepoAttribution:
+    """AI-attribution state of one repository's walked commits (the org
+    report's AI-share-per-repo table, a lower bound per row)."""
+
+    slug: str
+    commits: int
+    yes: int
+    possible: int
+    no_evidence: int
+    ai_share: float  # yes / commits — a LOWER BOUND (0.0 with no commits)
+
+
+@dataclass
+class FeatureAttribution:
+    """AI-attribution state of one feature's linked commits (the org
+    report's AI-share-per-feature table, a lower bound per row). Scope: the
+    commits the feature is linked to (defines or touches); a commit claimed
+    by two features counts in both."""
+
+    fid: str
+    title: str
+    repo: str  # repository slug
+    commits: int
+    yes: int
+    possible: int
+    no_evidence: int
+    ai_share: float  # yes / commits — a LOWER BOUND (0.0 with no commits)
+
+
+@dataclass
+class _Resolved:
+    """One commit's union-level attribution: the channel-precedence
+    resolution of its contributing evidence rows (prsweep.effective_*)."""
+
+    cid: int
+    sha: str
+    slug: str
+    verdict: str
+    harness: str | None
+    model: str | None
+    channel: str  # '' | 'git' | 'pr'
+    evidence: list[tuple[str, str, str]]
+
+
+def _resolved(conn: sqlite3.Connection) -> list[_Resolved]:
+    """Every walked commit's attribution, resolved ONCE per commit from the
+    union of its evidence rows — the channel-precedence rule of
+    prsweep.effective_attribution reused verbatim at the union level (never
+    duplicated): the verdict is the strongest contributing tier, identity
+    claims resolve git-first, suspicious rows contribute nothing. The
+    channel is the strongest channel that contributed evidence ('git' when
+    the walk recorded any, else 'pr'); no contributing evidence reads as
+    '' and the verdict as ``no-evidence``."""
+    conn = org(conn)
+    out: list[_Resolved] = []
+    for r in conn.execute(
+        """SELECT c.id cid, c.sha sha, rp.slug slug FROM commits c
+           JOIN repositories rp ON rp.id = c.repo_id
+           ORDER BY c.walk_index, c.sha"""
+    ):
+        cid = int(r["cid"])
+        attr = prsweep.effective_attribution(conn, cid)
+        tagged = prsweep.effective_evidence(conn, cid)
+        seen: set[tuple[str, str, str]] = set()
+        evidence: list[tuple[str, str, str]] = []
+        for _ch, rule, raw, verdict in tagged:
+            key = (rule, raw, verdict)
+            if key not in seen:
+                seen.add(key)
+                evidence.append(key)
+        channels = [ch for ch, _rule, _raw, _v in tagged]
+        channel = "git" if "git" in channels else (prsweep.CHANNEL_PR if channels else "")
+        out.append(
+            _Resolved(
+                cid, str(r["sha"]), str(r["slug"]), attr.verdict, attr.harness, attr.model,
+                channel, evidence,
+            )
+        )
+    return out
 
 
 def attribution_summary(conn: sqlite3.Connection) -> AttributionSummary:
-    """Org-level AI attribution counts (the projection dedups Shared commits)."""
+    """Org-level AI attribution counts (the projection dedups Shared commits
+    to ONE attribution each). ``no-evidence`` is absence of a signal — never
+    a claim about authorship — and every count is a lower bound over walked
+    commits, never normalized upward to PR counts."""
     conn = org(conn)
-    verdict_counts = {
-        str(r["verdict"]): int(r["n"])
-        for r in conn.execute("SELECT verdict, COUNT(*) n FROM ai_attribution GROUP BY verdict")
-    }
-    harness_counts = [
-        (str(r["harness"]), int(r["n"]))
-        for r in conn.execute(
-            "SELECT harness, COUNT(*) n FROM ai_attribution"
-            " WHERE harness IS NOT NULL AND verdict != 'no-evidence'"
-            " GROUP BY harness ORDER BY n DESC, harness"
-        )
-    ]
-    return AttributionSummary(verdict_counts, harness_counts)
+    rows = _resolved(conn)
+    verdict_counts: dict[str, int] = {}
+    harness_counts: dict[str, int] = {}
+    model_counts: dict[str, int] = {}
+    channel_counts: dict[str, int] = {}
+    yes = 0
+    for r in rows:
+        verdict_counts[r.verdict] = verdict_counts.get(r.verdict, 0) + 1
+        if r.verdict == aiattr.VERDICT_YES:
+            yes += 1
+        if r.verdict != aiattr.VERDICT_NO_EVIDENCE:
+            if r.harness:
+                harness_counts[r.harness] = harness_counts.get(r.harness, 0) + 1
+            if r.model:
+                model_counts[r.model] = model_counts.get(r.model, 0) + 1
+        if r.channel:
+            channel_counts[r.channel] = channel_counts.get(r.channel, 0) + 1
+    github_sourced = (
+        conn.execute("SELECT 1 FROM pr_evidence WHERE suspicious = 0 LIMIT 1").fetchone()
+        is not None
+    )
+    return AttributionSummary(
+        verdict_counts=verdict_counts,
+        harness_counts=sorted(harness_counts.items(), key=lambda kv: (-kv[1], kv[0])),
+        model_counts=sorted(model_counts.items(), key=lambda kv: (-kv[1], kv[0])),
+        channel_counts=channel_counts,
+        github_sourced=github_sourced,
+        ai_share=(yes / len(rows)) if rows else 0.0,
+    )
 
 
 def attribution_rows(conn: sqlite3.Connection) -> list[AttributionRow]:
     """Attributed commits (never the no-evidence ones — they carry no
-    evidence rows) in walk order, each with its evidence rows."""
-    conn = org(conn)
+    evidence rows) in walk order, each with its channel-resolved evidence
+    rows (git channel first)."""
     out: list[AttributionRow] = []
-    for r in conn.execute(
-        """SELECT c.id cid, c.sha, a.verdict, a.harness, a.model FROM ai_attribution a
-           JOIN commits c ON c.id = a.commit_id
-           WHERE a.verdict != 'no-evidence' ORDER BY c.walk_index"""
-    ):
-        evidence = [
-            (str(e["rule"]), str(e["raw"]), str(e["verdict"]))
-            for e in conn.execute(
-                "SELECT rule, raw, verdict FROM ai_evidence WHERE commit_id = ?"
-                " ORDER BY rule, raw",
-                (r["cid"],),
-            )
-        ]
-        evidence.sort(key=lambda t: (RULE_RANK.get(t[0], 99), t[1]))
+    for r in _resolved(conn):
+        if r.verdict == aiattr.VERDICT_NO_EVIDENCE:
+            continue
         out.append(
             AttributionRow(
-                sha=str(r["sha"]),
-                verdict=str(r["verdict"]),
-                harness=str(r["harness"] or ""),
-                model=str(r["model"] or ""),
-                evidence=evidence,
+                sha=r.sha,
+                verdict=r.verdict,
+                harness=r.harness or "",
+                model=r.model or "",
+                evidence=r.evidence,
+                channel=r.channel,
             )
         )
     return out
+
+
+def attribution_by_repo(conn: sqlite3.Connection) -> list[RepoAttribution]:
+    """Per-repository AI-attribution state over each repo's walked commits —
+    the org report's AI-share-per-repo table (a lower bound per row). A key
+    whose commits all deduped under another key reads as all-zero: Shared
+    commits count ONCE, under the dedup's winner."""
+    conn = org(conn)
+    by_slug: dict[str, list[_Resolved]] = {}
+    for r in _resolved(conn):
+        by_slug.setdefault(r.slug, []).append(r)
+    out: list[RepoAttribution] = []
+    for row in conn.execute("SELECT slug FROM repositories ORDER BY slug"):
+        slug = str(row["slug"])
+        commits, yes, possible, no_evidence = _tally(by_slug.get(slug, []))
+        out.append(
+            RepoAttribution(
+                slug=slug,
+                commits=commits,
+                yes=yes,
+                possible=possible,
+                no_evidence=no_evidence,
+                ai_share=(yes / commits) if commits else 0.0,
+            )
+        )
+    return out
+
+
+def attribution_by_feature(conn: sqlite3.Connection) -> list[FeatureAttribution]:
+    """Per-feature AI-attribution state over the feature's linked commits
+    (defines or touches) — the org report's AI-share-per-feature table (a
+    lower bound per row). A commit claimed by two features counts in both."""
+    conn = org(conn)
+    by_id = {r.cid: r for r in _resolved(conn)}
+    out: list[FeatureAttribution] = []
+    for f in conn.execute(
+        """SELECT f.id fid, f.title title, rp.slug slug FROM features f
+           JOIN repositories rp ON rp.id = f.repo_id ORDER BY f.id"""
+    ):
+        fid = str(f["fid"])
+        linked = sorted(
+            {
+                int(r["commit_id"])
+                for r in conn.execute(
+                    "SELECT DISTINCT commit_id FROM commits_features WHERE feature_id = ?",
+                    (fid,),
+                )
+            }
+        )
+        commits, yes, possible, no_evidence = _tally(
+            [by_id[cid] for cid in linked if cid in by_id]
+        )
+        out.append(
+            FeatureAttribution(
+                fid=fid,
+                title=str(f["title"]),
+                repo=str(f["slug"]),
+                commits=commits,
+                yes=yes,
+                possible=possible,
+                no_evidence=no_evidence,
+                ai_share=(yes / commits) if commits else 0.0,
+            )
+        )
+    return out
+
+
+def _tally(rows: list[_Resolved]) -> tuple[int, int, int, int]:
+    """(commits, yes, possible, no-evidence) over one scope's resolved
+    commits — the three states always sum to the commit count."""
+    yes = sum(1 for r in rows if r.verdict == aiattr.VERDICT_YES)
+    possible = sum(1 for r in rows if r.verdict == aiattr.VERDICT_POSSIBLE)
+    return len(rows), yes, possible, len(rows) - yes - possible
 
 
 def sampling_complete(conn: sqlite3.Connection) -> bool:

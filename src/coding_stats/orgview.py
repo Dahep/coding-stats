@@ -209,53 +209,101 @@ def _copy_watermarks(conn: sqlite3.Connection, out: sqlite3.Connection) -> None:
         )
 
 
+_VERDICT_STRENGTH = {"yes": 0, "possible": 1, "no-evidence": 2}
+
+
 def _copy_attribution(
     conn: sqlite3.Connection, out: sqlite3.Connection, commit_map: dict[int, int]
 ) -> None:
-    """Winner rows only, like verdicts. A Shared commit is byte-identical
-    across keys, so its AI attribution rows are pure-function identical too:
-    keeping the winner's copy loses nothing."""
-    for r in conn.execute("SELECT * FROM ai_attribution ORDER BY commit_id"):
-        cid = int(r["commit_id"])
-        if commit_map[cid] != cid:
-            continue
-        out.execute(
-            "INSERT INTO ai_attribution (commit_id, verdict, harness, model)"
-            " VALUES (?, ?, ?, ?)",
-            (cid, r["verdict"], r["harness"], r["model"]),
-        )
-    for r in conn.execute("SELECT * FROM ai_evidence ORDER BY commit_id, rule, raw"):
-        cid = int(r["commit_id"])
-        if commit_map[cid] != cid:
-            continue
-        out.execute(
-            "INSERT INTO ai_evidence (commit_id, rule, raw, verdict) VALUES (?, ?, ?, ?)",
-            (cid, r["rule"], r["raw"], r["verdict"]),
-        )
+    """The attribution rows of every copy of a Shared commit are UNIONED onto
+    its projected row (ticket #38) — one commit keeps ONE attribution,
+    resolved later by channel precedence (prsweep's effective_* semantics):
+
+    * git evidence rows from any copy all land on the winner (identical in
+      practice — pure functions of the commit — and deduped on (rule, raw),
+      winner copy first);
+    * the copies' git-summary claims (ai_attribution) merge into one row:
+      the strongest verdict wins, and harness/model fill winner-first then
+      copies in ingest order (git claims never lose to a silent copy);
+    * PR-channel rows follow in _copy_pr_evidence, all copies merged too.
+    """
+    copies: dict[int, list[int]] = {}
+    for cid, wid in commit_map.items():
+        copies.setdefault(wid, []).append(cid)
+    for wid, cids in copies.items():
+        cids.sort(key=lambda c: (0 if c == wid else 1, c))  # winner first, then ingest order
+        _merge_git_attribution(conn, out, cids)
     _copy_pr_evidence(conn, out, commit_map)
+
+
+def _merge_git_attribution(
+    conn: sqlite3.Connection, out: sqlite3.Connection, cids: list[int]
+) -> None:
+    """One ai_attribution row + the unioned ai_evidence rows for the copies
+    of one Shared commit (ids in winner-first order; all rows land on the
+    first id)."""
+    winner = cids[0]
+    for cid in cids:
+        for r in conn.execute(
+            "SELECT rule, raw, verdict FROM ai_evidence WHERE commit_id = ? ORDER BY rule, raw",
+            (cid,),
+        ):
+            out.execute(
+                "INSERT OR IGNORE INTO ai_evidence (commit_id, rule, raw, verdict)"
+                " VALUES (?, ?, ?, ?)",
+                (winner, r["rule"], r["raw"], r["verdict"]),
+            )
+    summaries = [
+        r
+        for cid in cids
+        for r in conn.execute(
+            "SELECT verdict, harness, model FROM ai_attribution WHERE commit_id = ?",
+            (cid,),
+        )
+    ]
+    if not summaries:
+        return
+    verdict = min(summaries, key=lambda r: _VERDICT_STRENGTH[str(r["verdict"])])["verdict"]
+    harness = next((r["harness"] for r in summaries if r["harness"] is not None), None)
+    model = next((r["model"] for r in summaries if r["model"] is not None), None)
+    out.execute(
+        "INSERT OR REPLACE INTO ai_attribution (commit_id, verdict, harness, model)"
+        " VALUES (?, ?, ?, ?)",
+        (winner, verdict, harness, model),
+    )
 
 
 def _copy_pr_evidence(
     conn: sqlite3.Connection, out: sqlite3.Connection, commit_map: dict[int, int]
 ) -> None:
     """Channel-pr rows ride the projection too (ticket #35): commit-attached
-    rows follow the same winner rule as the git rows (a Shared commit keeps
-    one copy); suspicious rows carry no commit and collapse per
+    rows of EVERY copy of a Shared commit re-point onto its projected row —
+    recorded state is not per-copy-pure and dropping a copy's PR rows would
+    drop real observations — deduped per (commit, pr_number, rule, raw) so
+    the same PR's row recorded by several branches' sweeps counts once.
+    Suspicious rows carry no commit and collapse per
     (repo_id, pr_number, rule, raw). Channel precedence at consumption is
-    the gather/report layer's rule (ticket #38) — the provenance column is
-    what it acts on."""
+    the gather/report layer's rule (prsweep.effective_*) — the provenance
+    column is what it acts on."""
     seen_null: set[tuple[int, int, str, str]] = set()
+    seen_mapped: set[tuple[int, int, str, str]] = set()
     for r in conn.execute(
         "SELECT * FROM pr_evidence ORDER BY repo_id, pr_number, commit_id, rule, raw"
     ):
         cid = r["commit_id"]
-        if cid is not None and commit_map[int(cid)] != int(cid):
-            continue
+        key_prefix: tuple[int, int, str, str]
         if cid is None:
-            key = (int(r["repo_id"]), int(r["pr_number"]), str(r["rule"]), str(r["raw"]))
-            if key in seen_null:
+            mapped = None
+            key_prefix = (int(r["repo_id"]), int(r["pr_number"]), str(r["rule"]), str(r["raw"]))
+            if key_prefix in seen_null:
                 continue
-            seen_null.add(key)
+            seen_null.add(key_prefix)
+        else:
+            mapped = commit_map[int(cid)]
+            key_prefix = (mapped, int(r["pr_number"]), str(r["rule"]), str(r["raw"]))
+            if key_prefix in seen_mapped:
+                continue
+            seen_mapped.add(key_prefix)
         out.execute(
             "INSERT INTO pr_evidence (repo_id, pr_number, commit_id, rule, raw, verdict,"
             " harness, model, channel, observed_at, suspicious)"
@@ -263,7 +311,7 @@ def _copy_pr_evidence(
             (
                 r["repo_id"],
                 r["pr_number"],
-                cid,
+                mapped,
                 r["rule"],
                 r["raw"],
                 r["verdict"],
