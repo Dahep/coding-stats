@@ -184,7 +184,10 @@ workflow is a drift edit like any other.
   never move it. Rate-limit exhaustion, the run cap, or an interruption end
   the run with a `::notice::`, never a failure: the next run resumes.
 - **Permissions** — `pull-requests: read` ONLY when `detect-pr: true`; the
-  off default requests nothing beyond `contents: write`.
+  off default requests nothing beyond `contents: write`, and the update
+  step's `GITHUB_TOKEN` env is scoped the same way: the run's token reaches
+  the engine only when the PR tier is on (`detect-pr: true` or a
+  `pr-backfill`) — the off default passes no token at all.
 - **Private repos, no PAT** — head refs `refs/pull/N/head` fetch over the
   authenticated git transport, never the REST API: `git fetch` rides the
   `http.https://github.com/.extraheader` AUTHORIZATION config that

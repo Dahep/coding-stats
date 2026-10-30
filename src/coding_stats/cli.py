@@ -8,6 +8,7 @@ skill-stats layout to coding-stats (ADR-0005)."""
 import argparse
 import json
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -141,8 +142,8 @@ def main(argv: list[str] | None = None) -> None:
         type=int,
         default=None,
         metavar="N",
-        help="explicit lower bound: record PRs with number > N (N >= 0; the"
-        " watermark still advances over what is recorded)",
+        help="explicit lower bound: record PRs with number > N (N >= 0;"
+        " records without advancing the watermark above the gap below the bound)",
     )
     bound.add_argument(
         "--full",
@@ -393,11 +394,22 @@ def _report_sweep(res: prsweep.SweepResult) -> None:
             prsweep.STOP_CAP: "processing cap reached",
             prsweep.STOP_RATE_LIMIT: "rate limit exhausted",
             prsweep.STOP_INTERRUPTED: "interrupted",
+            prsweep.STOP_WALK_STALE: "waiting for the walk to catch up",
+            prsweep.STOP_FETCH: "a PR head fetch failed (transient git failure)",
         }
-        print(
-            f"::notice::pr-sweep stopped: {notices[res.stop]}; watermark"
-            f" {res.watermark}, the next run resumes above it"
-        )
+        if res.stop == prsweep.STOP_FORBIDDEN:
+            # a permissions failure is NOT a rate limit and does not "resume":
+            # the notice names the permission that is missing
+            print(
+                f"::notice::pr-sweep stopped: the GitHub token cannot read pull"
+                f" requests (403 Resource not accessible by integration) — grant"
+                f" `pull-requests: read`; watermark {res.watermark} kept"
+            )
+        else:
+            print(
+                f"::notice::pr-sweep stopped: {notices[res.stop]}; watermark"
+                f" {res.watermark}, the next run resumes above it"
+            )
 
 
 def _run_update(
@@ -578,10 +590,14 @@ def _run_update(
                 res = prsweep.sweep_full(conn, repo_dir, branch)
             else:
                 res = prsweep.sweep_increment(conn, repo_dir, branch)
-        except (OSError, RuntimeError) as exc:
+        except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as exc:
             # best-effort like classification (Q13): an unavailable PR tier
             # never fails the deterministic pipeline; the watermark is
-            # untouched and a later update resumes above it
+            # untouched and a later update resumes above it. ValueError/
+            # KeyError cover malformed API bodies, SubprocessError covers git
+            # failures. KeyboardInterrupt is deliberately NOT caught — an
+            # interrupt is the sweep's own stop condition (and otherwise
+            # stays the operator's).
             print(
                 f"WARNING: pr-sweep unavailable ({exc}); no PR-channel evidence"
                 " recorded this run — a later update resumes above the watermark"

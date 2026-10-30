@@ -15,6 +15,7 @@ numbering — and later push runs continue after it.
 
 import io
 import urllib.error
+from pathlib import Path
 
 import pytest
 
@@ -200,6 +201,58 @@ def test_closed_unmerged_and_other_base_never_advance_the_watermark(tmp_path, re
 
 
 # ---------------------------------------------------------------------------
+# out-of-order merges: a still-open PR number clamps the watermark below it
+# ---------------------------------------------------------------------------
+
+
+def test_open_pr_number_clamps_the_watermark_below_it(tmp_path, repo):
+    # PR 5 is still open while PR 7 has already merged: the watermark must
+    # stay BELOW 5 — when PR 5 merges later its number is still above the
+    # watermark and it is processed (out-of-order merges lose nothing)
+    conn, _ = primed_db(tmp_path, repo, [7])
+    t = FakeTransport(
+        [
+            pr(7, body="Generated with Codex.\n", head="claude/f7"),
+            pr(5, body="Generated with Codex.\n", head="claude/f5", state="open"),
+        ]
+    )
+    res = prsweep.sweep_increment(conn, repo, "main", transport=t, now=OBSERVED_AT)
+    assert res.processed == 1  # PR 7 only; PR 5 (open) is skipped entirely
+    assert res.watermark == 4 == prsweep.watermark(conn)  # clamped below 5
+    assert row_numbers(conn) == {7}
+
+    # later run: PR 5 has merged — it sits above the watermark and lands
+    land_prs(repo, [5])
+    gitwalk.walk(repo, conn, "main")
+    t2 = FakeTransport(
+        [
+            pr(7, body="Generated with Codex.\n", head="claude/f7"),
+            pr(5, body="Generated with Codex.\n", head="claude/f5"),
+        ]
+    )
+    res2 = prsweep.sweep_increment(conn, repo, "main", transport=t2, now=OBSERVED_AT)
+    assert res2.processed == 2  # 5 then 7, oldest first (7 replaced, not duplicated)
+    assert row_numbers(conn) == {5, 7}
+    assert prsweep.watermark(conn) == 7
+    assert_no_duplicate_rows(conn)
+
+
+def test_closed_unmerged_pr_numbers_are_passed_not_clamped(tmp_path, repo):
+    # only STILL-OPEN numbers clamp: a closed-unmerged PR can never merge
+    # later, so the watermark passes its number freely
+    conn, _ = primed_db(tmp_path, repo, [2])
+    t = FakeTransport(
+        [
+            pr(2, body="Generated with Codex.\n", head="claude/f2"),
+            pr(1, body="Generated with Codex.\n", head="claude/f1", merged=False),
+        ]
+    )
+    res = prsweep.sweep_increment(conn, repo, "main", transport=t, now=OBSERVED_AT)
+    assert res.processed == 1
+    assert res.watermark == 2 == prsweep.watermark(conn)  # past closed PR 1
+
+
+# ---------------------------------------------------------------------------
 # rate-limit exhaustion: clean stop notice, automatic resume (acceptance 4)
 # ---------------------------------------------------------------------------
 
@@ -224,13 +277,50 @@ def test_rate_limit_ends_the_run_cleanly_and_the_next_run_resumes(tmp_path, repo
     assert_no_duplicate_rows(conn)
 
 
-def test_default_transport_translates_rate_limit_http_errors(monkeypatch):
+def test_permissions_403_is_a_forbidden_stop_never_a_rate_limit(tmp_path, repo):
+    # "Resource not accessible by integration" is a PERMISSION failure, not
+    # rate-limit exhaustion: it must never surface as "rate limit exhausted
+    # ... the next run resumes" — it is a distinct stop naming the permission
+    conn, _ = primed_db(tmp_path, repo, [1, 2])
+
+    def denied(url):
+        raise urllib.error.HTTPError(
+            url, 403, "Resource not accessible by integration", {}, None
+        )
+
+    res = prsweep.sweep_increment(conn, repo, "main", transport=denied, now=OBSERVED_AT)
+    assert res.stop == prsweep.STOP_FORBIDDEN  # distinct stop, never rate-limit
+    assert res.stop != STOP_RATE_LIMIT
+    assert res.processed == 0 and res.watermark == 0 == prsweep.watermark(conn)
+
+
+def test_cli_forbidden_notice_names_the_permission_not_the_rate_limit(
+    tmp_path, repo, monkeypatch, capsys
+):
+    db = cli_db(tmp_path, repo, [1])
+
+    def denied(url):
+        raise urllib.error.HTTPError(
+            url, 403, "Resource not accessible by integration", {}, None
+        )
+
+    monkeypatch.setattr(prsweep, "default_transport", denied)
+    cli.main(["pr-sweep", "--db", str(db)])  # a clean stop, never a failure exit
+    out = capsys.readouterr().out
+    assert "::notice::" in out
+    assert "pull-requests: read" in out  # the notice names the permission
+    assert "rate limit exhausted" not in out
+    assert "next run resumes" not in out
+
+
+def test_default_transport_only_raises_rate_limited_for_genuine_rate_limits(monkeypatch):
     def failing(code, headers):
-        def go(req):
+        def go(req, **kw):
             raise urllib.error.HTTPError(req.full_url, code, "limited", headers, io.BytesIO(b""))
 
         return go
 
+    # genuine exhaustion: 403 with the rate budget at zero, and 429
     monkeypatch.setattr(
         urllib.request, "urlopen", failing(403, {"X-RateLimit-Remaining": "0"})
     )
@@ -239,10 +329,56 @@ def test_default_transport_translates_rate_limit_http_errors(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", failing(429, {}))
     with pytest.raises(prsweep.RateLimited):
         prsweep.default_transport("https://api.github.com/x")
-    # an ordinary failure is never laundered into a clean stop
-    monkeypatch.setattr(urllib.request, "urlopen", failing(404, {"X-RateLimit-Remaining": "9"}))
+    # a permissions 403 is NOT laundered into a clean rate-limit stop
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        failing(403, {"X-RateLimit-Remaining": "99"}),
+    )
     with pytest.raises(urllib.error.HTTPError):
         prsweep.default_transport("https://api.github.com/x")
+
+
+def test_default_transport_uses_a_request_timeout(monkeypatch):
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b"[]"
+
+    seen: dict = {}
+
+    def go(req, **kw):
+        seen.update(kw)
+        return Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", go)
+    assert prsweep.default_transport("https://api.github.com/x") == []
+    assert seen.get("timeout") == 30  # bounded: a hung API never hangs the sweep
+
+
+def test_head_fetch_never_prompts_interactively(monkeypatch):
+    # GIT_TERMINAL_PROMPT=0 + closed stdin: a sweep fetch can never hang
+    # asking for credentials (and nothing interactive is accepted)
+    import subprocess as sp
+
+    seen = []
+
+    def fake_run(cmd, **kw):
+        seen.append((cmd, kw))
+        return sp.CompletedProcess(cmd, 1, "", "fatal: nope")
+
+    monkeypatch.setattr(sp, "run", fake_run)
+    with pytest.raises(prsweep.FetchUnavailable):  # transient, not "vanished"
+        prsweep.fetch_head_ref(Path("/tmp/opencode/none"), 5)
+    (cmd, kw) = seen[0]
+    assert cmd[3] == "fetch"
+    assert kw.get("env", {}).get("GIT_TERMINAL_PROMPT") == "0"
+    assert kw.get("stdin") is sp.DEVNULL
 
 
 # ---------------------------------------------------------------------------

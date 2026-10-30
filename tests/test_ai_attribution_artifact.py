@@ -42,12 +42,16 @@ def _rows(conn):
 
 def pre_attribution_bytes(conn) -> bytes:
     """Artifact bytes as a pre-feature mint would have written them: no
-    ai_attribution/ai_evidence in the body, digest re-stamped. Mirrors the
-    test_migration_legacy old-format trick: crafted content must VERIFY."""
+    ai_attribution/ai_evidence in the body, header schema-step 3 (the table's
+    step 4 is newer — shape completion applies), digest re-stamped. Mirrors
+    the test_migration_legacy old-format trick: crafted content must VERIFY."""
     content = artifact.serialize(conn).decode("utf-8")
     out: list[str] = []
     skipping_ddl = False
     for line in content.splitlines(keepends=True):
+        if line.startswith("-- schema-step:"):
+            out.append("-- schema-step: 3\n")  # the pre-#34 mint's own stamp
+            continue
         if line.startswith("CREATE TABLE ai_attribution") or line.startswith(
             "CREATE TABLE ai_evidence"
         ):

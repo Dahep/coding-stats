@@ -87,8 +87,11 @@ def test_pr_tier_env_reaches_the_update_step():
     assert env["CODING_STATS_DETECT_PR"] == "${{ inputs.detect-pr }}"
     assert env["CODING_STATS_PR_BACKFILL"] == "${{ inputs.pr-backfill }}"
     # the PR-tier list API authenticates with the run's own token (env
-    # mapping position — never interpolated into a run line, never a PAT)
-    assert env["GITHUB_TOKEN"] == "${{ github.token }}"
+    # mapping position — never interpolated into a run line, never a PAT) —
+    # and only WHEN the PR tier is on: off mode receives no token at all
+    assert env["GITHUB_TOKEN"] == (
+        "${{ (inputs.detect-pr == 'true' || inputs.pr-backfill != '') && github.token || '' }}"
+    )
 
 
 # ---------------------------------------- engine from the action checkout ---

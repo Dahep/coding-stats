@@ -23,17 +23,25 @@ OBSERVED_AT = "2026-10-30T00:00:00+00:00"
 
 
 def pr(number, **kw):
-    """One PR as the list endpoint returns it (the fields the sweep reads)."""
-    item = {
+    """One PR as the LIST endpoint returns it (the Pull Request Simple
+    schema's fields the sweep reads). The wire shape is the real one: mergedness
+    is the ``merged_at`` timestamp-or-null — there is NO ``merged`` boolean on
+    the wire (``merged: true`` in GitHub's docs and ticket bodies is the intent,
+    not the wire format). ``merge_commit_sha`` is the landing sha the
+    walk-coverage check reads; ``state`` separates still-open PRs (the watermark
+    clamp) from closed ones."""
+    merged = kw.get("merged", kw.get("state", "closed") != "open")
+    return {
         "number": number,
         "title": kw.get("title", f"PR {number}"),
         "body": kw.get("body", ""),
-        "merged": kw.get("merged", True),
+        "state": kw.get("state", "closed"),
+        "merged_at": "2026-10-29T12:00:00+00:00" if merged else None,
+        "merge_commit_sha": kw.get("merge_commit_sha"),
         "user": {"login": kw.get("login", "daniel"), "type": kw.get("utype", "User")},
         "head": {"ref": kw.get("head", "feature/x")},
         "base": {"ref": kw.get("base", "main")},
     }
-    return item
 
 
 class FakeTransport:
@@ -171,6 +179,31 @@ def test_pr_signals_bot_author_without_suffix_pattern_still_names_harness():
 
 
 # ---------------------------------------------------------------------------
+# real list schema: mergedness comes from merged_at, never a `merged` boolean
+# ---------------------------------------------------------------------------
+
+
+def test_list_row_without_merged_key_is_classified_by_merged_at():
+    # the REAL list schema: no `merged` boolean on the wire — mergedness is
+    # the merged_at timestamp-or-null (`merged: true` in docs/ticket bodies is
+    # the intent, not the wire format)
+    merged_row = pr(5)
+    assert "merged" not in merged_row
+    assert merged_row["merged_at"]
+    assert prsweep._parse_pr(merged_row).merged
+
+    unmerged_row = pr(6, merged=False)
+    assert "merged" not in unmerged_row
+    assert unmerged_row["merged_at"] is None
+    assert not prsweep._parse_pr(unmerged_row).merged
+
+    # a bare list row with merged_at and nothing else merges-classifies
+    parsed = prsweep._parse_pr({"number": 7, "merged_at": "2026-10-29T12:00:00+00:00"})
+    assert parsed.merged and parsed.number == 7
+    assert not prsweep._parse_pr({"number": 8, "merged_at": None}).merged
+
+
+# ---------------------------------------------------------------------------
 # listing: pages only, zero per-PR calls
 # ---------------------------------------------------------------------------
 
@@ -178,18 +211,20 @@ def test_pr_signals_bot_author_without_suffix_pattern_still_names_harness():
 def test_list_pages_cost_is_one_batch_of_list_requests():
     pulls = [pr(n, merged=(n % 2 == 0)) for n in range(250, 0, -1)]
     t = FakeTransport(pulls)
-    got, requests = prsweep.list_merged_pulls("dahep", "coding-stats", 0, transport=t)
-    assert requests == 3 == -(-250 // 100)  # ceil(n/100): list pages only
-    assert all("pulls?" in u and "repos/dahep/coding-stats/pulls" in u for u in t.urls)
-    assert [p.number for p in got] == list(range(2, 251, 2))  # merged, ascending
+    listing = prsweep.list_pulls("dahep", "coding-stats", 0, transport=t)
+    assert listing.requests == 3 == -(-250 // 100)  # ceil(n/100): list pages only
+    assert all(
+        "pulls?" in u and "repos/dahep/coding-stats/pulls" in u and "state=all" in u for u in t.urls
+    )
+    assert [p.number for p in listing.merged] == list(range(2, 251, 2))  # merged, ascending
 
 
 def test_list_stops_paging_at_the_bound():
     pulls = [pr(n) for n in range(250, 0, -1)]
     t = FakeTransport(pulls)
-    got, requests = prsweep.list_merged_pulls("dahep", "coding-stats", 240, transport=t)
-    assert [p.number for p in got] == [241, 242, 243, 244, 245, 246, 247, 248, 249, 250]
-    assert requests == 2  # second page is entirely <= the bound: stop
+    listing = prsweep.list_pulls("dahep", "coding-stats", 240, transport=t)
+    assert [p.number for p in listing.merged] == [241, 242, 243, 244, 245, 246, 247, 248, 249, 250]
+    assert listing.requests == 2  # second page is entirely <= the bound: stop
 
 
 def test_sweep_costs_list_pages_only_over_many_prs(tmp_path, repo):
@@ -436,15 +471,54 @@ def test_force_pushed_head_is_suspicious_marked_never_attribution(tmp_path, repo
     assert eff.evidence == ()
 
 
+def test_walked_landing_with_unmappable_head_is_suspicious_not_a_wait(tmp_path, repo, fetch_log):
+    # the landing sha IS walked (nothing waits for the walk) yet the fetched
+    # head maps onto nothing — a post-merge force-push: a genuinely
+    # unmappable head records suspicious rows, never a walk-stale stall
+    start_remote(tmp_path, repo)
+    run(repo, "checkout", "-b", "claude/fp")
+    h1 = commit_files(repo, f"feat: pushed\n\n{TRAILER_LINE}\n", {"h.txt": "h\n"})
+    push_head_ref(repo, h1, 9)
+    run(repo, "checkout", "main")
+    run(repo, "branch", "-D", "claude/fp")
+    squash = commit_files(repo, "feat: landed, subject edited", {"h.txt": "h\n"})  # no (#9)
+    # post-merge force-push: the ref now carries content that never landed
+    run(repo, "checkout", "-b", "claude/other")
+    never = commit_files(repo, "feat: never landed", {"z.txt": "z\n"})
+    run(repo, "push", "-q", "-f", "origin", f"{never}:refs/pull/9/head")  # force-push the ref
+    run(repo, "checkout", "main")
+    run(repo, "branch", "-D", "claude/other")
+
+    conn = make_db(tmp_path / "w.db", repo)
+    gitwalk.walk(repo, conn, "main")
+    githubize(conn)
+    t = FakeTransport(
+        [
+            pr(
+                9,
+                body="Generated with Codex.\n",
+                head="claude/fp",
+                merge_commit_sha=squash,
+            )
+        ]
+    )
+    res = prsweep.sweep(conn, repo, "main", 0, transport=t, now=OBSERVED_AT)
+    assert res.stop is None  # not a wait: the landing IS in the walked set
+    assert res.processed == 1 and res.suspicious > 0
+    rows = pr_rows(conn, 9)
+    assert rows and all(r[0] is None and r[7] == 1 for r in rows)  # suspicious, unattached
+
+
 def test_vanished_head_ref_is_recorded_suspicious_not_attributed(tmp_path, repo, fetch_log):
-    commit_files(repo, "init", {"a.txt": "a\n"})
+    start_remote(tmp_path, repo)  # origin exists; the PR head ref is GONE
     squash = commit_files(repo, "feat: landed (#2)", {"s.txt": "s\n"})
     conn = make_db(tmp_path / "w.db", repo)
     gitwalk.walk(repo, conn, "main")
     githubize(conn)
     t = FakeTransport([pr(2, body="Generated with Codex.\n")])
     res = prsweep.sweep(conn, repo, "main", 0, transport=t, now=OBSERVED_AT)
-    assert fetch_log == [2]  # attempted, over git only
+    assert fetch_log == [2]  # attempted, over git only — and the ref is genuinely gone
+    assert res.stop is None  # a gone ref is not a stop: it records suspicious rows
     assert res.suspicious > 0
     rows = pr_rows(conn, 2)
     assert rows and all(r[0] is None and r[7] == 1 for r in rows)
@@ -590,6 +664,72 @@ def test_after_pr_bound_and_skipped_prs_never_fetch(tmp_path, repo, fetch_log):
     assert fetch_log == [3]  # bound/below, unmerged, and other-base never fetched
     assert {r[1] for r in pr_rows(conn)} == {3}
     assert pr_rows(conn, 3) and all(r[0] == shas[3] for r in pr_rows(conn, 3))
+
+
+def test_squash_plausibility_never_trusts_none_on_none(tmp_path, repo, fetch_log):
+    # empty diffs carry no patch-id: None == None is NOT a parentage match.
+    # The rows are genuinely unmapped — recorded unattached, NOT suspicious,
+    # and never trusted onto the landing
+    start_remote(tmp_path, repo)
+    run(repo, "checkout", "-b", "claude/empty")
+    run(repo, "commit", "--allow-empty", "-m", "feat: core\n\nGenerated with Codex.\n")
+    h = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    push_head_ref(repo, h, 5)  # an empty-diff head
+    run(repo, "checkout", "main")
+    run(repo, "branch", "-D", "claude/empty")
+    run(repo, "commit", "--allow-empty", "-m", "feat: work (#5)")  # an empty landing
+    landing = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    conn = make_db(tmp_path / "w.db", repo)
+    gitwalk.walk(repo, conn, "main")
+    githubize(conn)
+    t = FakeTransport(
+        [
+            pr(
+                5,
+                body="Generated with Codex.\n",
+                head="claude/empty",
+                merge_commit_sha=landing,
+            )
+        ]
+    )
+    res = prsweep.sweep(conn, repo, "main", 0, transport=t, now=OBSERVED_AT)
+    assert res.stop is None and res.processed == 1
+    assert res.suspicious == 0  # an empty diff is not evidence of tampering
+    rows = pr_rows(conn, 5)
+    assert rows and all(r[0] is None for r in rows)  # genuinely unmapped: unattached
+    assert all(r[7] == 0 for r in rows)  # and NOT suspicious
+    # no false trust: nothing is attached to any walked commit
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) c FROM pr_evidence WHERE commit_id IS NOT NULL"
+        ).fetchone()["c"]
+        == 0
+    )
+
+
+# ---------------------------------------------------------------------------
+# an empty Target branch errors loudly — never silently skips every PR
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_against_an_empty_branch_errors_loudly(tmp_path, repo):
+    commit_files(repo, "init", {"a.txt": "a\n"})
+    db = tmp_path / "cli.db"
+    cli.main(["init", str(repo), "--db", str(db)])
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE settings SET value = '\"\"' WHERE key = 'branch'")
+    conn.commit()
+    conn.close()
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["pr-sweep", "--db", str(db)])
+    assert "error" in str(exc.value) and "branch" in str(exc.value).lower()
 
 
 # ---------------------------------------------------------------------------

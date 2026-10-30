@@ -109,6 +109,44 @@ def test_recovery_rebuild_refuses_hostile_anchor(tmp_path):
     old.close()
 
 
+def _drop_tables(data: bytes, *tables: str) -> bytes:
+    """Artifact bytes with the named tables' bodies removed, digest
+    re-stamped — crafted content VERIFIES (the test_ai_attribution_artifact
+    crafting pattern)."""
+    text = data.decode("utf-8")
+    out: list[str] = []
+    skipping = False
+    for line in text.splitlines(keepends=True):
+        if any(line.startswith(f"CREATE TABLE {t} ") for t in tables):
+            skipping = True
+            continue
+        if skipping:
+            if line.strip() == ");":
+                skipping = False
+            continue
+        if any(line.startswith(f"INSERT INTO {t} ") for t in tables):
+            continue
+        out.append(line)
+    return _rechecksum("".join(out).encode("utf-8"))
+
+
+@pytest.mark.parametrize("table", ["commits", "features", "commit_verdicts"])
+def test_materialize_refuses_an_artifact_missing_a_core_table(tmp_path, table):
+    # shape completion is for post-step-3 tables only: a CORE table is never
+    # resurrected empty — an artifact missing one is REFUSED
+    repo = _updated_repo(tmp_path)
+    art = store_dir(repo) / "coding-stats.sql"
+    assert artifact.verify(art) is None
+    mutilated = _drop_tables(art.read_bytes(), table)
+    assert artifact.verify_bytes(mutilated) is None  # the digest is not the guard
+    conn = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(artifact.MaterializeError, match=f"missing table {table}"):
+            artifact.materialize(conn, mutilated)
+    finally:
+        conn.close()
+
+
 def test_benign_artifact_materializes_with_curated_shape(tmp_path):
     repo = _updated_repo(tmp_path)
     art = store_dir(repo) / "coding-stats.sql"
