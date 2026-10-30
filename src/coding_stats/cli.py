@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import ci, datastore, db, gitwalk, identity
+from . import ci, datastore, db, gitwalk, identity, prsweep
 from .classify import DEFAULT_MODEL, SESSION_DIR, Session, classify_pending
 from .lineage import close_lineage
 from .targets import annotate_all
@@ -82,6 +82,22 @@ def main(argv: list[str] | None = None) -> None:
     up.add_argument("--no-detect", action="store_true", help="skip blame-based fix detection")
     up.add_argument("--no-lineage", action="store_true", help="skip lineage closure")
     up.add_argument("--no-serialize", action="store_true", help="skip artifact write")
+    up.add_argument(
+        "--detect-pr",
+        action="store_true",
+        help="opt-in PR tier (ADR-0007 clause 1): run the watermark-driven"
+        " PR-channel increment after the deterministic stages, before"
+        " serialization (detection-only, no LLM calls)",
+    )
+    up.add_argument(
+        "--pr-backfill",
+        choices=("full",),
+        default=None,
+        metavar="full",
+        help="explicit full-history PR sweep (the workflow_dispatch passthrough"
+        " `pr-backfill: full`): the same watermark machinery walked to the"
+        " beginning of the PR numbering",
+    )
 
     ci_grp = sub.add_parser("ci", help="CI scaffold: workflow rendering + artifact landing")
     ci_sub = ci_grp.add_subparsers(dest="ci_cmd", required=True)
@@ -93,6 +109,12 @@ def main(argv: list[str] | None = None) -> None:
     ci_init.add_argument("--branch", default=None, help="Target branch (default: current)")
     ci_init.add_argument(
         "--no-report", action="store_true", help="write only the update workflow (no report job)"
+    )
+    ci_init.add_argument(
+        "--detect-pr",
+        action="store_true",
+        help="render the ADR-0007 clause 1 opt-in: detect-pr: \"true\" on the"
+        " action plus pull-requests: read on the update job",
     )
     ci_init.add_argument("--upgrade", action="store_true", help="overwrite a drifted workflow")
     ci_land = ci_sub.add_parser(
@@ -212,6 +234,7 @@ def main(argv: list[str] | None = None) -> None:
                     branch,
                     report=not args.no_report,
                     upgrade=args.upgrade,
+                    detect_pr=args.detect_pr,
                 ):
                     print(msg)
             except ci.DriftError as exc:
@@ -286,8 +309,6 @@ def main(argv: list[str] | None = None) -> None:
         total = conn.execute("SELECT COUNT(*) c FROM commits").fetchone()["c"]
         print(f"walked {n} new commits (total {total})")
     elif args.cmd == "pr-sweep":
-        from . import prsweep
-
         assert repo_dir is not None, "run init first"
         branch = str(settings.get("branch") or "")
         try:
@@ -300,21 +321,7 @@ def main(argv: list[str] | None = None) -> None:
                 res = prsweep.sweep_increment(conn, repo_dir, branch, max_prs=cap)
         except prsweep.SweepError as exc:
             sys.exit(f"error: {exc}")
-        print(
-            f"pr-sweep: {res.processed} PRs recorded ({res.rows} rows,"
-            f" {res.suspicious} suspicious), {res.requests} API requests,"
-            f" watermark {res.watermark}"
-        )
-        if res.stop is not None:
-            notices = {
-                prsweep.STOP_CAP: "processing cap reached",
-                prsweep.STOP_RATE_LIMIT: "rate limit exhausted",
-                prsweep.STOP_INTERRUPTED: "interrupted",
-            }
-            print(
-                f"::notice::pr-sweep stopped: {notices[res.stop]}; watermark"
-                f" {res.watermark}, the next run resumes above it"
-            )
+        _report_sweep(res)
     elif args.cmd == "classify":
         assert repo_dir is not None, "run init first"
         SESSION_DIR.mkdir(parents=True, exist_ok=True)
@@ -373,6 +380,26 @@ def _pending_count(conn: sqlite3.Connection) -> int:
     )
 
 
+def _report_sweep(res: prsweep.SweepResult) -> None:
+    """The pr-sweep outcome, printed once per run — shared by the `pr-sweep`
+    verb and the update verb's PR tier so both faces report identically."""
+    print(
+        f"pr-sweep: {res.processed} PRs recorded ({res.rows} rows,"
+        f" {res.suspicious} suspicious), {res.requests} API requests,"
+        f" watermark {res.watermark}"
+    )
+    if res.stop is not None:
+        notices = {
+            prsweep.STOP_CAP: "processing cap reached",
+            prsweep.STOP_RATE_LIMIT: "rate limit exhausted",
+            prsweep.STOP_INTERRUPTED: "interrupted",
+        }
+        print(
+            f"::notice::pr-sweep stopped: {notices[res.stop]}; watermark"
+            f" {res.watermark}, the next run resumes above it"
+        )
+
+
 def _run_update(
     conn: sqlite3.Connection, db_path: Path, args: argparse.Namespace, legacy_store: bool = False
 ) -> sqlite3.Connection:
@@ -396,7 +423,14 @@ def _run_update(
     version — found in the Data branch's history now; full recompute when
     none verifies). A fresh/throwaway working DB (CI runs are stateless — the
     artifact is the store) adopts the git repo at the current directory and
-    seeds itself from a verified artifact."""
+    seeds itself from a verified artifact.
+
+    ADR-0007 clause 1 (ticket #37): the opt-in PR tier — ``--detect-pr``
+    runs the watermark-driven PR-channel increment after the deterministic
+    stages and before serialization (so the evidence rows and the watermark
+    ride the artifact), ``--pr-backfill full`` is the explicit full-history
+    face sharing the same watermark. Detection-only: no LLM calls. The off
+    default runs exactly this pipeline, unchanged."""
     import os as _os
 
     from . import artifact, livelines, recovery
@@ -533,6 +567,28 @@ def _run_update(
         f"live lines at {live.at_sha[:12] or '(none)'}: unattributed"
         f" {live.unattributed_lines}, {live.samples_written} samples written"
     )
+
+    # ADR-0007 clause 1 (ticket #37): the opt-in PR tier runs as the last
+    # stage before serialization, so its evidence rows and the watermark
+    # ride the same artifact the landing pushes — and the off default never
+    # enters it at all (no API call, no disclosure).
+    if args.detect_pr or args.pr_backfill:
+        try:
+            if args.pr_backfill == "full":
+                res = prsweep.sweep_full(conn, repo_dir, branch)
+            else:
+                res = prsweep.sweep_increment(conn, repo_dir, branch)
+        except (OSError, RuntimeError) as exc:
+            # best-effort like classification (Q13): an unavailable PR tier
+            # never fails the deterministic pipeline; the watermark is
+            # untouched and a later update resumes above it
+            print(
+                f"WARNING: pr-sweep unavailable ({exc}); no PR-channel evidence"
+                " recorded this run — a later update resumes above the watermark"
+            )
+        else:
+            _report_sweep(res)
+        print(f"::notice::{prsweep.DISCLOSURE_LINE}")
 
     if not args.no_serialize:
         path = artifact.write(conn, store_dir)
