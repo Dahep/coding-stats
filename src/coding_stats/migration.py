@@ -458,8 +458,7 @@ def _rebuild_from_artifact(db_path: Path, data: bytes, repo: Path) -> None:
     raw = sqlite3.connect(tmp_path)
     raw.row_factory = sqlite3.Row
     try:
-        artifact.materialize(raw, data)
-        artifact.stamp_schema_steps(raw, data)
+        artifact.restore_into(raw, data)
     finally:
         raw.close()
     conn = db.connect(tmp_path)
@@ -535,8 +534,11 @@ def migrate_to_data_branch(
     (a committed .coding-stats/ store on the Target branch) onto its orphan
     Data branch. Verifies first (refusing damage), re-prefixes the ids, and
     pushes ONLY refs/heads/coding-stats/<target>; the Target branch itself
-    never receives a commit. Idempotent: a Data branch already holding a
-    verifying, branch-carrying artifact reports 'already migrated'."""
+    never receives a commit. The scratch seed goes through
+    artifact.restore_into, so the landed header's schema-step stamp always
+    reflects the legacy store's step, never an unstamped-DB 0 (#31).
+    Idempotent: a Data branch already holding a verifying, branch-carrying
+    artifact reports 'already migrated'."""
     from . import ci, datastore, gitwalk, identity  # late imports (module cycle)
 
     branch = target or gitwalk.current_branch(repo)
@@ -553,25 +555,21 @@ def migrate_to_data_branch(
 
     if not legacy.exists():
         return ["nothing to migrate (no committed .coding-stats/ on this Target)"]
-    err = artifact.verify(legacy)
+    legacy_bytes = legacy.read_bytes()
+    err = artifact.verify_bytes(legacy_bytes)
     if err is not None:
         raise MigrationError(
             f"the committed .coding-stats/ artifact does not verify ({err}); nothing migrated"
         )
     out.append("committed artifact: digest ok")
-    # re-prefix in memory: the ids upgrade to the {repo}@{branch} form.
-    # The scratch DB must carry the _schema_step_* bookkeeping BEFORE
-    # serialize: _head derives the header's schema-step from those tables
-    # and an unstamped scratch mints a step-0 artifact whose content is
-    # the migrated layout — every later restore then re-runs the migrations
-    # against a migrated DB and crashes (#31). Same stamp discipline as
-    # _rebuild_from_artifact above.
-    legacy_bytes = legacy.read_bytes()
+    # re-prefix in memory: the ids upgrade to the {repo}@{branch} form. The
+    # scratch DB is seeded through artifact.restore_into: serialize's header
+    # stamp reads the _schema_step_* bookkeeping, so an unstamped seed would
+    # mint a step-0 artifact whose content is the migrated layout (#31).
     rows = sqlite3.connect(":memory:")
     rows.row_factory = sqlite3.Row
     try:
-        artifact.materialize(rows, legacy_bytes)
-        artifact.stamp_schema_steps(rows, legacy_bytes)
+        artifact.restore_into(rows, legacy_bytes)
         plain = identity.resolved_identity(repo)[1]
         identity.reprefix_features(rows, identity.repo_slug(plain, branch))
         data = artifact.serialize(rows)

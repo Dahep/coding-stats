@@ -96,19 +96,19 @@ def test_migration_result_header_carries_the_migrated_step(tmp_path, repo, capsy
 
     data = (store_dir(repo, "main") / "coding-stats.sql").read_bytes()
     assert artifact.parse_header(data).schema_step == legacy_step
-    # the exact CI restore path: materialize + stamp + connect must not
-    # re-run step 1 (which demands settings.repo — absent in a pure artifact)
+    # the artifact-seed half of recovery.rebuild's restore path: the seeded
+    # DB + connect must not re-run step 1 (which demands settings.repo —
+    # absent in a pure artifact)
     assert artifact.verify_bytes(data) is None
     work = tmp_path / "restore.sql"
     work.write_bytes(b"")
     raw = sqlite3.connect(work)
     raw.row_factory = sqlite3.Row
     try:
-        artifact.materialize(raw, data)
-        artifact.stamp_schema_steps(raw, data)
+        artifact.restore_into(raw, data)
     finally:
         raw.close()
-    db.connect(work)  # RuntimeError under the bug: header said 0, data said n
+    db.connect(work).close()  # RuntimeError under the bug: header said 0, data said n
 
 
 def subprocess_head(repo) -> str:
