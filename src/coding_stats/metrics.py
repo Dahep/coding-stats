@@ -492,6 +492,77 @@ def _tally(rows: list[_Resolved]) -> tuple[int, int, int, int]:
     return len(rows), yes, possible, len(rows) - yes - possible
 
 
+@dataclass
+class ModelFeatureMetrics:
+    """The feature metrics of one attributed AI model, as LOWER BOUNDS: the
+    model's yes-attributed commits, the features they define, the churn those
+    commits carry, and the fix commits reaching those features (each fix
+    counted once per model row it reaches). Evidence-based counts over walked
+    data, never normalized upward; a commit with no matched harness/model
+    contributes nowhere, and `no-evidence` never renders as a model."""
+
+    harness: str
+    model: str  # "" when the evidence names the harness but not a model
+    commits: int
+    features: int
+    churn: int
+    fixes: int
+    fixes_per_feature: float
+
+
+def attribution_by_model(conn: sqlite3.Connection) -> list[ModelFeatureMetrics]:
+    """Features / churn / fixes per attributed AI model — the report's
+    by-model table (a lower bound per row). Over each (harness, model)
+    group's yes-attributed commits: features are the DISTINCT ids those
+    commits define (role 'defines'), churn is the sum of the commits'
+    ``churn_lines``, fixes are the DISTINCT ``fixes_features`` fix commits
+    reaching those features. Grouped by resolved identity — git-only
+    evidence outranks PR-channel claims exactly as
+    ``aiattr.effective_attribution`` resolves them."""
+    conn = org(conn)
+    groups: dict[tuple[str, str], list[_Resolved]] = {}
+    for r in _resolved(conn):
+        if r.verdict == aiattr.VERDICT_YES and (r.harness or r.model):
+            groups.setdefault((r.harness or "?", r.model or ""), []).append(r)
+    if not groups:
+        return []
+
+    churn_by_cid = {
+        int(r["id"]): int(r["churn_lines"])
+        for r in conn.execute("SELECT id, churn_lines FROM commits WHERE churn_lines IS NOT NULL")
+    }
+    defines: dict[int, set[str]] = {}
+    for r in conn.execute(
+        "SELECT commit_id, feature_id FROM commits_features WHERE role = 'defines'"
+    ):
+        defines.setdefault(int(r["commit_id"]), set()).add(str(r["feature_id"]))
+    fix_features: dict[str, set[str]] = {}
+    for r in conn.execute("SELECT DISTINCT fix_commit_id, feature_id FROM fixes_features"):
+        fix_features.setdefault(str(r["fix_commit_id"]), set()).add(str(r["feature_id"]))
+
+    out: list[ModelFeatureMetrics] = []
+    for (harness, model), group in sorted(groups.items()):
+        cids = [r.cid for r in group]
+        features: set[str] = set()
+        for cid in cids:
+            features |= defines.get(cid, set())
+        fixes = {f for f, lfids in fix_features.items() if lfids & features}
+        n = len(features)
+        out.append(
+            ModelFeatureMetrics(
+                harness=harness,
+                model=model,
+                commits=len(cids),
+                features=n,
+                churn=sum(churn_by_cid.get(cid, 0) for cid in cids),
+                fixes=len(fixes),
+                fixes_per_feature=(len(fixes) / n) if n else 0.0,
+            )
+        )
+    out.sort(key=lambda m: (-m.features, -m.churn, m.harness, m.model))
+    return out
+
+
 def sampling_complete(conn: sqlite3.Connection) -> bool:
     """Whether sample history is complete enough to render gaps as zeros. A
     union DB is only as complete as its LEAST complete constituent

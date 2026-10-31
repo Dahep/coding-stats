@@ -15,6 +15,7 @@ from pathlib import Path
 from .aiattr import DISCLOSURE_LINE, channel_label
 from .metrics import (
     attribution_by_feature,
+    attribution_by_model,
     attribution_by_repo,
     attribution_rows,
     attribution_summary,
@@ -755,6 +756,31 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
         if multi and (repo_share_rows or feature_share_rows)
         else ""
     )
+    model_rows = attribution_by_model(conn)
+    model_metric_rows = "".join(
+        f"<tr><td>{_esc(m.harness)}</td><td>{_esc(m.model or '&mdash;')}</td>"
+        f"<td class='num'>{m.commits}</td><td class='num'>{m.features}</td>"
+        f"<td class='num'>{m.churn}</td><td class='num'>{m.fixes}</td>"
+        f"<td class='num'>{m.fixes_per_feature:.1f}</td></tr>"
+        for m in model_rows
+    )
+    model_metric_tables = (
+        "<h2 style='margin-top:18px;font-size:14px'>Features, churn and fixes"
+        " per AI model (lower bounds)</h2>"
+        "<div class='note'>Per attributed model: the model's yes-attributed"
+        " commits, the features they define, the churn their diffs carry and"
+        " the fix commits reaching those features — each counted once per"
+        " model it reaches. Every cell is a lower bound from recorded"
+        " evidence, never normalized upward.</div>"
+        "<table><thead><tr><th>Harness</th><th>Model</th>"
+        "<th class='num'>yes-commits</th><th class='num'>Features</th>"
+        "<th class='num'>Churn (lines)</th><th class='num'>Fixes</th>"
+        "<th class='num'>Fixes/feature</th></tr></thead><tbody>"
+        + model_metric_rows
+        + "</tbody></table>"
+        if model_metric_rows
+        else ""
+    )
     attr_section = f"""<section>
 <h2>AI attribution (lower bounds)</h2>
 <div class="note">Per-commit attribution computed from git data (commit
@@ -774,6 +800,7 @@ PR-channel evidence).{harness_note}{model_note}</div>
 {attr_donut}
 {attr_table}
 {share_tables}
+{model_metric_tables}
 </section>"""
 
     churn_rows = [
