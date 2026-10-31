@@ -15,17 +15,25 @@ from . import gitwalk, identity
 Step = str | Callable[[sqlite3.Connection], None]
 
 
-STEP_0_SQL = """
+RUNS_DDL = """CREATE TABLE IF NOT EXISTS runs (
+    id INTEGER PRIMARY KEY,
+    config_json TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    notes TEXT
+)"""
+"""The machine-local run journal. ADR-0006 keeps ``runs`` out of the
+artifact (recorded state only), yet every working DB shape references it
+(``features.created_run_id REFERENCES runs(id)``) — a seeded or migrated DB
+that carries the markers but not this table fails its next
+``features`` DML under FK enforcement. ``db.connect`` re-creates it
+whenever the step markers happened without the DDL."""
+
+STEP_0_SQL = f"""
     PRAGMA journal_mode = WAL;
     PRAGMA foreign_keys = ON;
 
-    CREATE TABLE runs (
-        id INTEGER PRIMARY KEY,
-        config_json TEXT NOT NULL,
-        started_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        notes TEXT
-    );
+    {RUNS_DDL};
 
     -- settings as JSON key/value
     CREATE TABLE settings (

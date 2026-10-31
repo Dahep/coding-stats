@@ -111,6 +111,51 @@ def test_migration_result_header_carries_the_migrated_step(tmp_path, repo, capsy
     db.connect(work).close()  # RuntimeError under the bug: header said 0, data said n
 
 
+def test_restored_working_db_classifies_again(tmp_path, repo, capsys):
+    """The migrated store must survive its next classify. regression: the
+    ADR-0006 layout excludes the machine-local ``runs`` table from the
+    artifact, yet ``features.created_run_id REFERENCES runs(id)`` rides the
+    curated DDL — a DB restored from the artifact (restore_into + connect)
+    carried the step markers without ``runs`` and every later
+    ``INSERT INTO features`` died on the FK check with
+    ``no such table: main.runs`` (the dotfiles update crashed there
+    mid-flight). The same statement now prepares and writes on a restored
+    DB; the working shape stays intact for a fresh DB (step 0 already made
+    runs) and for the artifact itself (runs is machine-local, never
+    carried)."""
+    commit_files(repo, "feature one", {"a.txt": "alpha\n"})
+    _committed_store(repo, ['{"k":"new","title":"o","about":"","why":"y"}'])
+    main(["migrate", str(repo), "--data-branch"])
+    capsys.readouterr()
+    data = (store_dir(repo, "main") / "coding-stats.sql").read_bytes()
+
+    work = tmp_path / "w.db"
+    raw = sqlite3.connect(work)
+    try:
+        artifact.restore_into(raw, data)
+    finally:
+        raw.close()
+
+    conn = db.connect(work)
+    try:
+        repo_id = int(conn.execute("SELECT id FROM repositories").fetchone()["id"])
+        conn.execute(
+            "INSERT INTO features (id, title, about, created_at, repo_id)"
+            " VALUES ('repo@main-9', 'fresh feature', '', '2026-01-01T00:00:00Z', ?)",
+            (repo_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    reopened = db.connect(work)
+    try:
+        assert reopened.execute("SELECT COUNT(*) c FROM features").fetchone()["c"] == 2
+        # the fresh path keeps step 0's own DDL (runs is not new here)
+        assert reopened.execute("SELECT COUNT(*) c FROM runs").fetchone()["c"] == 0
+    finally:
+        reopened.close()
+
+
 def subprocess_head(repo) -> str:
     import subprocess
 
