@@ -9,54 +9,27 @@ re-derived, replaced per PR on re-runs. Git-only evidence on the same commit
 outranks inherited PR evidence; suspicious rows are never attribution.
 """
 
-import re
 import subprocess
 
 import pytest
 
 from coding_stats import aiattr, cli, gitwalk, prsweep
-from conftest import commit_files, make_db, run
-
-TRAILER_VALUE = "Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
-TRAILER_LINE = f"Co-authored-by: {TRAILER_VALUE}"
-OBSERVED_AT = "2026-10-30T00:00:00+00:00"
-
-
-def pr(number, **kw):
-    """One PR as the LIST endpoint returns it (the Pull Request Simple
-    schema's fields the sweep reads). The wire shape is the real one: mergedness
-    is the ``merged_at`` timestamp-or-null — there is NO ``merged`` boolean on
-    the wire (``merged: true`` in GitHub's docs and ticket bodies is the intent,
-    not the wire format). ``merge_commit_sha`` is the landing sha the
-    walk-coverage check reads; ``merged_at`` doubles as the resume marker's
-    merge date (``merged_at=`` overrides it per row)."""
-    merged = kw.get("merged", kw.get("state", "closed") != "open")
-    return {
-        "number": number,
-        "title": kw.get("title", f"PR {number}"),
-        "body": kw.get("body", ""),
-        "state": kw.get("state", "closed"),
-        "merged_at": kw.get("merged_at", "2026-10-29T12:00:00+00:00") if merged else None,
-        "merge_commit_sha": kw.get("merge_commit_sha"),
-        "user": {"login": kw.get("login", "daniel"), "type": kw.get("utype", "User")},
-        "head": {"ref": kw.get("head", "feature/x")},
-        "base": {"ref": kw.get("base", "main")},
-    }
-
-
-class FakeTransport:
-    """Injected API transport: serves list pages, counts every request."""
-
-    def __init__(self, pulls):
-        self.pulls = pulls  # in API order (descending number)
-        self.urls = []
-
-    def __call__(self, url):
-        self.urls.append(url)
-        m = re.search(r"[?&]page=(\d+)", url)
-        page = int(m.group(1)) if m else 1
-        start = (page - 1) * 100
-        return self.pulls[start : start + 100]
+from conftest import (
+    OBSERVED_AT,
+    TRAILER_LINE,
+    TRAILER_VALUE,
+    FakeTransport,
+    commit_files,
+    commit_id,
+    githubize,
+    make_db,
+    pr,
+    pr_rows,
+    push_head_ref,
+    rows_at,
+    run,
+    start_remote,
+)
 
 
 @pytest.fixture()
@@ -71,61 +44,6 @@ def fetch_log(monkeypatch):
 
     monkeypatch.setattr(prsweep, "fetch_head_ref", spy)
     return calls
-
-
-def githubize(conn):
-    """Register a GitHub identity for the DB's repo (the API side derives
-    owner/name from the repositories row's clone URL)."""
-    conn.execute(
-        "UPDATE repositories SET clone_url = 'https://github.com/dahep/coding-stats',"
-        " repo_key = 'https://github.com/dahep/coding-stats@main'"
-    )
-    conn.commit()
-
-
-def push_head_ref(repo, sha, n):
-    """The GitHub-side PR head ref, on the bare 'origin' remote."""
-    run(repo, "push", "-q", "origin", f"{sha}:refs/pull/{n}/head")
-
-
-def start_remote(tmp_path, repo):
-    """Initial commit plus a bare 'origin' remote (PR head refs live there)."""
-    from conftest import bare_remote, with_remote
-
-    commit_files(repo, "init", {"a.txt": "a\n"})
-    with_remote(repo, bare_remote(tmp_path))
-
-
-def pr_rows(conn, pr_number=None):
-    out = []
-    sql = (
-        "SELECT c.sha, e.pr_number, e.rule, e.raw, e.verdict, e.channel, e.observed_at,"
-        " e.suspicious, e.harness, e.model FROM pr_evidence e"
-        " LEFT JOIN commits c ON c.id = e.commit_id"
-    )
-    args: tuple = ()
-    if pr_number is not None:
-        sql += " WHERE e.pr_number = ?"
-        args = (pr_number,)
-    sql += " ORDER BY e.pr_number, e.rule, e.raw"
-    for r in conn.execute(sql, args):
-        out.append(tuple(r))
-    return out
-
-
-def rows_at(conn, sha):
-    return {
-        (r["rule"], r["raw"], r["verdict"], r["channel"], r["suspicious"])
-        for r in conn.execute(
-            "SELECT e.rule, e.raw, e.verdict, e.channel, e.suspicious FROM pr_evidence e"
-            " JOIN commits c ON c.id = e.commit_id WHERE c.sha = ?",
-            (sha,),
-        )
-    }
-
-
-def commit_id(conn, sha):
-    return int(conn.execute("SELECT id FROM commits WHERE sha = ?", (sha,)).fetchone()["id"])
 
 
 # ---------------------------------------------------------------------------

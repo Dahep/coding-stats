@@ -14,62 +14,34 @@ the next run resumes automatically. Closed-unmerged and other-base PRs are
 never incorporated and never advance the watermark. Keyed by merge date,
 ties by PR number: out-of-order merges are never lost (the 2026-10-30
 ruling replaces the PR-number key of ticket #36).
+
+This suite owns the run-machinery scenarios (interrupt/resume, disjoint
+increments, clean stops, the shared full-history watermark, the contiguous-
+claim invariant, replace-not-duplicate on resume); the merge-date marker's
+own semantics live in test_pr_watermark.py. Builders live in conftest.py.
 """
 
-import sqlite3
 import urllib.error
 
 import pytest
 
 from coding_stats import cli, gitwalk, prsweep
 from coding_stats.db import connect
-from conftest import commit_files, make_db, run
-from test_prsweep import (
+from conftest import (
+    OBSERVED_AT,
     FakeTransport,
+    cli_sweep_db,
+    commit_files,
     commit_id,
     githubize,
+    land_squash_prs,
+    make_db,
     pr,
+    pr_list_rows,
     pr_rows,
-    push_head_ref,
-    start_remote,
+    primed_sweep_db,
+    run,
 )
-
-OBSERVED_AT = "2026-10-30T00:00:00+00:00"
-TRAILER_VALUE = "Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
-TRAILER_LINE = f"Co-authored-by: {TRAILER_VALUE}"
-
-
-def make_squash_prs(repo, ks):
-    """One squash-merged PR per number in ks, oldest first: a trailer-carrying
-    head pushed to refs/pull/N/head, then the (#N) landing on main (the same
-    patch — the head-parentage check passes)."""
-    shas = {}
-    for k in ks:
-        run(repo, "checkout", "-b", f"claude/f{k}")
-        h = commit_files(repo, f"feat: core {k}\n\n{TRAILER_LINE}\n", {f"f{k}.txt": f"{k}\n"})
-        push_head_ref(repo, h, k)
-        run(repo, "checkout", "main")
-        run(repo, "branch", "-D", f"claude/f{k}")
-        shas[k] = commit_files(repo, f"feat: work {k} (#{k})", {f"f{k}.txt": f"{k}\n"})
-    return shas
-
-
-def pulls(*ks):
-    """The list endpoint's rows for the given PR numbers (API order: desc)."""
-    return [
-        pr(k, body="Generated with Codex.\n", head=f"claude/f{k}") for k in sorted(ks, reverse=True)
-    ]
-
-
-def built(tmp_path, repo, ks):
-    """Walked + GitHub-identified DB over ks squash PRs (1 remote fetch per
-    PR, list pages served by the injected transport)."""
-    start_remote(tmp_path, repo)
-    shas = make_squash_prs(repo, ks)
-    conn = make_db(tmp_path / "w.db", repo)
-    gitwalk.walk(repo, conn, "main")
-    githubize(conn)
-    return conn, shas
 
 
 def rows_per_pr(conn):
@@ -113,12 +85,12 @@ class PrSpy:
 def test_interrupted_run_resumes_at_the_first_pr_above_the_watermark(
     tmp_path, repo, monkeypatch
 ):
-    conn, shas = built(tmp_path, repo, [1, 2, 3, 4, 5])
+    conn, shas = primed_sweep_db(tmp_path, repo, [1, 2, 3, 4, 5])
     spy = PrSpy(monkeypatch)
     spy.abort_after = 2  # the third PR's processing dies mid-flight
 
     res = prsweep.sweep_increment(
-        conn, repo, "main", transport=FakeTransport(pulls(1, 2, 3, 4, 5)), now=OBSERVED_AT
+        conn, repo, "main", transport=FakeTransport(pr_list_rows(1, 2, 3, 4, 5)), now=OBSERVED_AT
     )
     assert res.stop == prsweep.STOP_INTERRUPTED  # clean stop, never a failure
     assert res.processed == 2 and spy.log == [1, 2]
@@ -128,7 +100,7 @@ def test_interrupted_run_resumes_at_the_first_pr_above_the_watermark(
     spy.abort_after = None
     spy.log.clear()
     res2 = prsweep.sweep_increment(
-        conn, repo, "main", transport=FakeTransport(pulls(1, 2, 3, 4, 5)), now=OBSERVED_AT
+        conn, repo, "main", transport=FakeTransport(pr_list_rows(1, 2, 3, 4, 5)), now=OBSERVED_AT
     )
     assert res2.stop is None and res2.processed == 3
     assert spy.log == [3, 4, 5]  # resumes at the first PR past the marker
@@ -143,18 +115,18 @@ def test_interrupted_run_resumes_at_the_first_pr_above_the_watermark(
 
 
 def test_two_consecutive_increments_process_disjoint_pr_ranges(tmp_path, repo, monkeypatch):
-    conn, shas = built(tmp_path, repo, [1, 2, 3])
+    conn, shas = primed_sweep_db(tmp_path, repo, [1, 2, 3])
     spy = PrSpy(monkeypatch)
     res1 = prsweep.sweep_increment(
-        conn, repo, "main", transport=FakeTransport(pulls(1, 2, 3)), now=OBSERVED_AT
+        conn, repo, "main", transport=FakeTransport(pr_list_rows(1, 2, 3)), now=OBSERVED_AT
     )
     assert spy.log == [1, 2, 3] and res1.watermark == 3
 
-    make_squash_prs(repo, [4, 5])  # two new PRs land between the runs
+    land_squash_prs(repo, [4, 5])  # two new PRs land between the runs
     gitwalk.walk(repo, conn, "main")  # every update run walks before the sweep
     spy.log.clear()
     res2 = prsweep.sweep_increment(
-        conn, repo, "main", transport=FakeTransport(pulls(1, 2, 3, 4, 5)), now=OBSERVED_AT
+        conn, repo, "main", transport=FakeTransport(pr_list_rows(1, 2, 3, 4, 5)), now=OBSERVED_AT
     )
     assert spy.log == [4, 5]  # disjoint from the first run's range
     assert min(spy.log) > res1.watermark  # second starts above the first's watermark
@@ -169,14 +141,14 @@ def test_two_consecutive_increments_process_disjoint_pr_ranges(tmp_path, repo, m
 
 
 def test_rate_limit_stops_cleanly_and_the_next_run_resumes(tmp_path, repo, monkeypatch):
-    conn, shas = built(tmp_path, repo, [1, 2, 3])
+    conn, shas = primed_sweep_db(tmp_path, repo, [1, 2, 3])
     spy = PrSpy(monkeypatch)
     res0 = prsweep.sweep_increment(
-        conn, repo, "main", transport=FakeTransport(pulls(1, 2, 3)), now=OBSERVED_AT
+        conn, repo, "main", transport=FakeTransport(pr_list_rows(1, 2, 3)), now=OBSERVED_AT
     )
     assert res0.watermark == 3
 
-    make_squash_prs(repo, [4, 5])  # new PRs arrive; the API budget is gone
+    land_squash_prs(repo, [4, 5])  # new PRs arrive; the API budget is gone
     gitwalk.walk(repo, conn, "main")
 
     def limited(url):
@@ -191,7 +163,7 @@ def test_rate_limit_stops_cleanly_and_the_next_run_resumes(tmp_path, repo, monke
 
     spy.log.clear()
     res2 = prsweep.sweep_increment(
-        conn, repo, "main", transport=FakeTransport(pulls(1, 2, 3, 4, 5)), now=OBSERVED_AT
+        conn, repo, "main", transport=FakeTransport(pr_list_rows(1, 2, 3, 4, 5)), now=OBSERVED_AT
     )
     assert res2.stop is None and spy.log == [4, 5] and res2.watermark == 5
 
@@ -205,9 +177,9 @@ def test_pr_merged_after_the_walk_stops_the_run_at_that_pr(tmp_path, repo, monke
     # PR 3 merged AFTER the last walk: its landing sha is not in `commits`,
     # so the run stops there cleanly — never records suspicious rows and
     # never claims past it; the next run (after a newer walk) redoes it
-    conn, shas = built(tmp_path, repo, [1, 2])
+    conn, shas = primed_sweep_db(tmp_path, repo, [1, 2])
     spy = PrSpy(monkeypatch)
-    shas3 = make_squash_prs(repo, [3])  # merged after the walk — nothing walked yet
+    shas3 = land_squash_prs(repo, [3])  # merged after the walk — nothing walked yet
     # rows an earlier failed attempt left behind: the redo must REPLACE them
     prsweep.replace_pr_rows(
         conn,
@@ -244,11 +216,11 @@ def test_unmapped_pr_without_a_landing_sha_waits_for_the_walk_too(tmp_path, repo
     # an API body with no merge_commit_sha: nothing maps onto the walked set,
     # so the watermark must not claim past it either — a conservative wait,
     # never suspicious rows
-    conn, shas = built(tmp_path, repo, [1])
+    conn, shas = primed_sweep_db(tmp_path, repo, [1])
     spy = PrSpy(monkeypatch)
-    make_squash_prs(repo, [2])  # merged after the walk
+    land_squash_prs(repo, [2])  # merged after the walk
     res = prsweep.sweep_increment(
-        conn, repo, "main", transport=FakeTransport(pulls(2)), now=OBSERVED_AT
+        conn, repo, "main", transport=FakeTransport(pr_list_rows(2)), now=OBSERVED_AT
     )
     assert res.stop == prsweep.STOP_WALK_STALE
     assert res.processed == 0 and spy.log == []
@@ -262,16 +234,16 @@ def test_transient_head_fetch_failure_stops_cleanly_without_suspicious_rows(
     # a broken/unreachable remote is a TRANSIENT failure: the run stops
     # cleanly at that PR — it must never be recorded as a vanished-ref
     # suspicious set nor claimed by the watermark
-    conn, shas = built(tmp_path, repo, [1, 2])
+    conn, shas = primed_sweep_db(tmp_path, repo, [1, 2])
     spy = PrSpy(monkeypatch)
     res0 = prsweep.sweep_increment(
-        conn, repo, "main", transport=FakeTransport(pulls(1)), now=OBSERVED_AT
+        conn, repo, "main", transport=FakeTransport(pr_list_rows(1)), now=OBSERVED_AT
     )
     assert res0.processed == 1 and prsweep.watermark(conn) == 1
 
     run(repo, "remote", "set-url", "origin", str(tmp_path / "gone.git"))  # unreachable
     res = prsweep.sweep_increment(
-        conn, repo, "main", transport=FakeTransport(pulls(1, 2)), now=OBSERVED_AT
+        conn, repo, "main", transport=FakeTransport(pr_list_rows(1, 2)), now=OBSERVED_AT
     )
     assert res.stop == prsweep.STOP_FETCH  # distinct stop: transient fetch failure
     assert res.processed == 0 and prsweep.watermark(conn) == 1  # never past 2
@@ -280,7 +252,7 @@ def test_transient_head_fetch_failure_stops_cleanly_without_suspicious_rows(
     run(repo, "remote", "set-url", "origin", str(tmp_path / "remote.git"))  # back
     spy.log.clear()
     res2 = prsweep.sweep_increment(
-        conn, repo, "main", transport=FakeTransport(pulls(1, 2)), now=OBSERVED_AT
+        conn, repo, "main", transport=FakeTransport(pr_list_rows(1, 2)), now=OBSERVED_AT
     )
     assert res2.stop is None and spy.log == [2] and prsweep.watermark(conn) == 2
 
@@ -291,16 +263,18 @@ def test_transient_head_fetch_failure_stops_cleanly_without_suspicious_rows(
 
 
 def test_per_run_cap_stops_cleanly_and_the_next_run_continues(tmp_path, repo, monkeypatch):
-    conn, shas = built(tmp_path, repo, [1, 2, 3, 4, 5])
+    conn, shas = primed_sweep_db(tmp_path, repo, [1, 2, 3, 4, 5])
     spy = PrSpy(monkeypatch)
     res = prsweep.sweep_increment(
         conn,
         repo,
         "main",
-        transport=FakeTransport(pulls(1, 2, 3, 4, 5)),
+        transport=FakeTransport(pr_list_rows(1, 2, 3, 4, 5)),
         now=OBSERVED_AT,
         max_prs=2,
     )
+    # one listing page covers all five PRs, yet the watermark moved per PR
+    assert res.requests == 1
     assert res.stop == prsweep.STOP_CAP and spy.log == [1, 2] and res.watermark == 2
 
     spy.log.clear()
@@ -308,7 +282,7 @@ def test_per_run_cap_stops_cleanly_and_the_next_run_continues(tmp_path, repo, mo
         conn,
         repo,
         "main",
-        transport=FakeTransport(pulls(1, 2, 3, 4, 5)),
+        transport=FakeTransport(pr_list_rows(1, 2, 3, 4, 5)),
         now=OBSERVED_AT,
         max_prs=2,
     )
@@ -319,7 +293,7 @@ def test_per_run_cap_stops_cleanly_and_the_next_run_continues(tmp_path, repo, mo
         conn,
         repo,
         "main",
-        transport=FakeTransport(pulls(1, 2, 3, 4, 5)),
+        transport=FakeTransport(pr_list_rows(1, 2, 3, 4, 5)),
         now=OBSERVED_AT,
         max_prs=2,
     )
@@ -334,13 +308,13 @@ def test_per_run_cap_stops_cleanly_and_the_next_run_continues(tmp_path, repo, mo
 def test_full_history_mode_shares_the_watermark_and_increments_continue_after_it(
     tmp_path, repo, monkeypatch
 ):
-    conn, shas = built(tmp_path, repo, [1, 2, 3])
+    conn, shas = primed_sweep_db(tmp_path, repo, [1, 2, 3])
     spy = PrSpy(monkeypatch)
     prsweep.sweep_increment(
         conn,
         repo,
         "main",
-        transport=FakeTransport(pulls(1, 2, 3)),
+        transport=FakeTransport(pr_list_rows(1, 2, 3)),
         now=OBSERVED_AT,
         max_prs=2,
     )
@@ -348,18 +322,18 @@ def test_full_history_mode_shares_the_watermark_and_increments_continue_after_it
 
     spy.log.clear()
     full = prsweep.sweep_full(
-        conn, repo, "main", transport=FakeTransport(pulls(1, 2, 3)), now=OBSERVED_AT
+        conn, repo, "main", transport=FakeTransport(pr_list_rows(1, 2, 3)), now=OBSERVED_AT
     )
     assert spy.log == [1, 2, 3]  # the whole numbering sequence, oldest-first
     assert full.stop is None and full.watermark == 3
     # the re-walk replaces rows in place: nothing duplicated
     assert rows_per_pr(conn) == {1: 3, 2: 3, 3: 3} and duplicate_rows(conn) == []
 
-    make_squash_prs(repo, [4])  # later push runs continue after it
+    land_squash_prs(repo, [4])  # later push runs continue after it
     gitwalk.walk(repo, conn, "main")
     spy.log.clear()
     res = prsweep.sweep_increment(
-        conn, repo, "main", transport=FakeTransport(pulls(1, 2, 3, 4)), now=OBSERVED_AT
+        conn, repo, "main", transport=FakeTransport(pr_list_rows(1, 2, 3, 4)), now=OBSERVED_AT
     )
     assert spy.log == [4] and res.watermark == 4
 
@@ -370,7 +344,7 @@ def test_full_history_mode_shares_the_watermark_and_increments_continue_after_it
 
 
 def test_unmerged_and_other_base_prs_are_never_incorporated(tmp_path, repo, monkeypatch):
-    conn, shas = built(tmp_path, repo, [1, 3])  # PR 2 closed-unmerged, PR 4 other-base
+    conn, shas = primed_sweep_db(tmp_path, repo, [1, 3])  # PR 2 closed-unmerged, PR 4 other-base
     spy = PrSpy(monkeypatch)
     res = prsweep.sweep_full(
         conn,
@@ -400,17 +374,17 @@ def test_unmerged_and_other_base_prs_are_never_incorporated(tmp_path, repo, monk
 def test_explicit_bound_above_the_watermark_records_but_never_advances_it(
     tmp_path, repo, monkeypatch
 ):
-    conn, shas = built(tmp_path, repo, [1, 2, 3])
+    conn, shas = primed_sweep_db(tmp_path, repo, [1, 2, 3])
     spy = PrSpy(monkeypatch)
     res = prsweep.sweep(
-        conn, repo, "main", 2, transport=FakeTransport(pulls(1, 2, 3)), now=OBSERVED_AT
+        conn, repo, "main", 2, transport=FakeTransport(pr_list_rows(1, 2, 3)), now=OBSERVED_AT
     )
     assert spy.log == [3]
     assert res.watermark == 0  # the gap is never claimed: zero skipped stays true
 
     spy.log.clear()
     res2 = prsweep.sweep_increment(
-        conn, repo, "main", transport=FakeTransport(pulls(1, 2, 3)), now=OBSERVED_AT
+        conn, repo, "main", transport=FakeTransport(pr_list_rows(1, 2, 3)), now=OBSERVED_AT
     )
     assert spy.log == [1, 2, 3]  # earlier records are re-replaced, never duplicated
     assert res2.watermark == 3
@@ -418,10 +392,10 @@ def test_explicit_bound_above_the_watermark_records_but_never_advances_it(
 
 
 def test_half_recorded_pr_is_replaced_not_extended_on_resume(tmp_path, repo, monkeypatch):
-    conn, shas = built(tmp_path, repo, [1, 2])
+    conn, shas = primed_sweep_db(tmp_path, repo, [1, 2])
     spy = PrSpy(monkeypatch)
     prsweep.sweep_increment(
-        conn, repo, "main", transport=FakeTransport(pulls(1)), now=OBSERVED_AT
+        conn, repo, "main", transport=FakeTransport(pr_list_rows(1)), now=OBSERVED_AT
     )
     assert prsweep.watermark(conn) == 1
 
@@ -435,10 +409,11 @@ def test_half_recorded_pr_is_replaced_not_extended_on_resume(tmp_path, repo, mon
         "2026-10-29T00:00:00+00:00",
     )
     conn.commit()
+    assert prsweep.watermark(conn) == 1  # rows-only record: still unadvanced
 
     spy.log.clear()
     res = prsweep.sweep_increment(
-        conn, repo, "main", transport=FakeTransport(pulls(1, 2)), now=OBSERVED_AT
+        conn, repo, "main", transport=FakeTransport(pr_list_rows(1, 2)), now=OBSERVED_AT
     )
     assert spy.log == [2]
     rows2 = pr_rows(conn, 2)
@@ -527,52 +502,29 @@ def test_the_increment_window_reaches_low_numbers_that_merged_late(tmp_path, rep
 # ---------------------------------------------------------------------------
 
 
-def cli_setup(tmp_path, repo, ks):
-    start_remote(tmp_path, repo)
-    make_squash_prs(repo, ks)
-    db = tmp_path / "cli.db"
-    cli.main(["init", str(repo), "--db", str(db)])
-    cli.main(["walk", "--db", str(db)])
-    conn = sqlite3.connect(db)
-    conn.row_factory = sqlite3.Row
-    githubize(conn)
-    conn.close()
-    return db
-
-
 def test_cli_pr_sweep_default_is_the_increment_face(tmp_path, repo, monkeypatch, capsys):
-    db = cli_setup(tmp_path, repo, [1, 2, 3])
+    db = cli_sweep_db(tmp_path, repo, [1, 2, 3])
     monkeypatch.setattr(
-        prsweep, "default_transport", lambda url: FakeTransport(pulls(1, 2, 3))(url)
+        prsweep, "default_transport", lambda url: FakeTransport(pr_list_rows(1, 2, 3))(url)
     )
     cli.main(["pr-sweep", "--db", str(db)])
     out = capsys.readouterr().out
     assert "pr-sweep" in out and "3 PRs" in out and "watermark 3" in out
 
-    make_squash_prs(repo, [4, 5])  # new PRs land; the default face resumes
+    land_squash_prs(repo, [4, 5])  # new PRs land; the default face resumes
     cli.main(["walk", "--db", str(db)])  # every run walks before the sweep
     monkeypatch.setattr(
-        prsweep, "default_transport", lambda url: FakeTransport(pulls(1, 2, 3, 4, 5))(url)
+        prsweep, "default_transport", lambda url: FakeTransport(pr_list_rows(1, 2, 3, 4, 5))(url)
     )
     cli.main(["pr-sweep", "--db", str(db)])
     out = capsys.readouterr().out
     assert "2 PRs" in out and "watermark 5" in out
 
 
-def test_cli_pr_sweep_full_flag_walks_the_whole_history(tmp_path, repo, monkeypatch, capsys):
-    db = cli_setup(tmp_path, repo, [1, 2, 3])
-    monkeypatch.setattr(
-        prsweep, "default_transport", lambda url: FakeTransport(pulls(1, 2, 3))(url)
-    )
-    cli.main(["pr-sweep", "--db", str(db), "--full"])
-    out = capsys.readouterr().out
-    assert "3 PRs" in out and "watermark 3" in out
-
-
 def test_cli_pr_sweep_stop_notice_is_never_a_failure(tmp_path, repo, monkeypatch, capsys):
-    db = cli_setup(tmp_path, repo, [1, 2, 3])
+    db = cli_sweep_db(tmp_path, repo, [1, 2, 3])
     monkeypatch.setattr(
-        prsweep, "default_transport", lambda url: FakeTransport(pulls(1, 2, 3))(url)
+        prsweep, "default_transport", lambda url: FakeTransport(pr_list_rows(1, 2, 3))(url)
     )
     cli.main(["pr-sweep", "--db", str(db), "--max-prs", "2"])  # clean stop, exit 0
     out = capsys.readouterr().out
