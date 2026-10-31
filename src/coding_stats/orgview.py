@@ -29,6 +29,7 @@ Single-repo DBs pass through unchanged (org rules never fire).
 import sqlite3
 
 from . import identity
+from .aiattr import strongest
 
 _PROJECTED_MARK = "_org_projected"
 
@@ -211,15 +212,12 @@ def _copy_watermarks(conn: sqlite3.Connection, out: sqlite3.Connection) -> None:
         )
 
 
-_VERDICT_STRENGTH = {"yes": 0, "possible": 1, "no-evidence": 2}
-
-
 def _copy_attribution(
     conn: sqlite3.Connection, out: sqlite3.Connection, commit_map: dict[int, int]
 ) -> None:
     """The attribution rows of every copy of a Shared commit are UNIONED onto
     its projected row (ticket #38) — one commit keeps ONE attribution,
-    resolved later by channel precedence (prsweep's effective_* semantics):
+    resolved later by channel precedence (aiattr's effective_* semantics):
 
     * git evidence rows from any copy all land on the winner (identical in
       practice — pure functions of the commit — and deduped on (rule, raw),
@@ -265,7 +263,7 @@ def _merge_git_attribution(
     ]
     if not summaries:
         return
-    verdict = min(summaries, key=lambda r: _VERDICT_STRENGTH[str(r["verdict"])])["verdict"]
+    verdict = strongest(str(r["verdict"]) for r in summaries)  # aiattr's ladder, one source
     harness = next((r["harness"] for r in summaries if r["harness"] is not None), None)
     model = next((r["model"] for r in summaries if r["model"] is not None), None)
     out.execute(
@@ -285,7 +283,7 @@ def _copy_pr_evidence(
     the same PR's row recorded by several branches' sweeps counts once.
     Suspicious rows carry no commit and collapse per
     (repo_id, pr_number, rule, raw). Channel precedence at consumption is
-    the gather/report layer's rule (prsweep.effective_*) — the provenance
+    the gather/report layer's rule (aiattr.effective_*) — the provenance
     column is what it acts on."""
     seen_null: set[tuple[int, int, str, str]] = set()
     seen_mapped: set[tuple[int, int, str, str]] = set()

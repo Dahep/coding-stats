@@ -93,7 +93,7 @@ sat below the number watermark forever):
 Channel precedence (consumption): git-only evidence on the same commit
 outranks inherited PR evidence. The storage encodes it — where the walk
 already recorded the identical match at the same commit, the PR row is not
-stored a second time ("recorded once, not twice"), and ``effective_*``
+stored a second time ("recorded once, not twice"), and ``aiattr.effective_*``
 resolves identity claims git-first with suspicious rows excluded from every
 resolution. No LLM calls anywhere: the PR tier is detection-only.
 """
@@ -113,11 +113,14 @@ from typing import Any
 
 from . import aiattr, gitwalk, identity
 
-CHANNEL_PR = "pr"
-# The disclosure line of ADR-0007 clause 5, shared verbatim by every surface
-# that carries PR-channel evidence: the update's on-mode notice (ticket #37),
-# the text report, and the HTML report's note.
-DISCLOSURE_LINE = "GitHub-sourced (PR-channel) evidence present"
+# shared resolution vocabulary, owned by the aiattr leaf and re-exported
+# here for prsweep's own callers (back-compat)
+from .aiattr import CHANNEL_GIT as CHANNEL_GIT
+from .aiattr import CHANNEL_PR as CHANNEL_PR
+from .aiattr import DISCLOSURE_LINE as DISCLOSURE_LINE
+from .aiattr import effective_attribution as effective_attribution
+from .aiattr import effective_evidence as effective_evidence
+
 DEFAULT_PER_PAGE = 100
 DEFAULT_RUN_CAP = 25  # increment runs ("a few PRs per push run")
 
@@ -210,6 +213,18 @@ def _http_stop(exc: urllib.error.HTTPError) -> str | None:
     if exc.code in (401, 403):
         return STOP_FORBIDDEN
     return None
+
+
+def _stop_reason(exc: BaseException) -> str | None:
+    """ONE classifier for the stop-condition triple the listing and
+    processing phases share: genuine rate-limit exhaustion (``RateLimited``,
+    or an HTTP failure ``_http_stop`` classifies as one), a distinct
+    forbidden stop, or an interruption. None = not a stop condition — the
+    caller re-raises (an unclassified HTTP failure is a failure, never a
+    clean stop)."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return _http_stop(exc)
+    return STOP_RATE_LIMIT if isinstance(exc, RateLimited) else STOP_INTERRUPTED
 
 
 def default_transport(url: str) -> Any:
@@ -412,74 +427,6 @@ def replace_pr_rows(
     return stored
 
 
-def effective_evidence(conn: sqlite3.Connection, commit_id: int) -> list[tuple[str, str, str, str]]:
-    """(channel, rule, raw, verdict) contributing rows of one commit, the
-    git channel first (it outranks inherited PR evidence). Suspicious PR
-    rows never contribute — they are audit records, not attribution."""
-    out: list[tuple[str, str, str, str]] = []
-    for channel, sql, args in (
-        (
-            "git",
-            "SELECT rule, raw, verdict FROM ai_evidence WHERE commit_id = ?",
-            (commit_id,),
-        ),
-        (
-            CHANNEL_PR,
-            "SELECT rule, raw, verdict FROM pr_evidence WHERE commit_id = ? AND suspicious = 0",
-            (commit_id,),
-        ),
-    ):
-        for r in conn.execute(sql, args):
-            out.append((channel, str(r["rule"]), str(r["raw"]), str(r["verdict"])))
-    out.sort(key=lambda t: (0 if t[0] == "git" else 1, aiattr.RULE_RANK.get(t[1], 99), t[2]))
-    return out
-
-
-def effective_attribution(conn: sqlite3.Connection, commit_id: int) -> aiattr.Attribution:
-    """The channel-precedence resolution of one commit (the consumption
-    side of "git-only evidence on the same commit outranks inherited PR
-    evidence"):
-
-    * the verdict is the strongest tier of the contributing rows — a
-      signature matched anywhere (git commit text or a mapped head commit)
-      is still a signature match;
-    * the identity claims (harness/model) resolve git-first: the walk's own
-      summary, then PR rows only where the git evidence is silent;
-    * suspicious rows contribute nothing, ever.
-    """
-    evs = effective_evidence(conn, commit_id)
-    rows = tuple(aiattr.Evidence(rule, raw, verdict) for _, rule, raw, verdict in evs)
-    if any(e.verdict == aiattr.VERDICT_YES for e in rows):
-        verdict = aiattr.VERDICT_YES
-    elif rows:
-        verdict = aiattr.VERDICT_POSSIBLE
-    else:
-        verdict = aiattr.VERDICT_NO_EVIDENCE
-    harness: str | None = None
-    model: str | None = None
-    git = conn.execute(
-        "SELECT harness, model FROM ai_attribution WHERE commit_id = ?", (commit_id,)
-    ).fetchone()
-    if git is not None:
-        harness = str(git["harness"]) if git["harness"] is not None else None
-        model = str(git["model"]) if git["model"] is not None else None
-    if harness is None or model is None:
-        prs = conn.execute(
-            "SELECT rule, raw, harness, model FROM pr_evidence"
-            " WHERE commit_id = ? AND suspicious = 0",
-            (commit_id,),
-        ).fetchall()
-        prs.sort(key=lambda r: (aiattr.RULE_RANK.get(str(r["rule"]), 99), str(r["raw"])))
-        for r in prs:
-            if harness is None and r["harness"] is not None:
-                harness = str(r["harness"])
-            if model is None and r["model"] is not None:
-                model = str(r["model"])
-            if harness is not None and model is not None:
-                break
-    return aiattr.Attribution(verdict, harness, model, rows)
-
-
 def watermark(conn: sqlite3.Connection) -> int:
     """The Watermark's PR number: the number of the last incorporated PR (0
     when nothing is incorporated yet) — audit trail plus the ``--after-pr``
@@ -599,15 +546,10 @@ def _run(
     try:
         listing = list_pulls(owner, name, 0 if resume else after_pr, transport)
         pulls, requests = listing.merged, listing.requests
-    except RateLimited:
-        stop = STOP_RATE_LIMIT  # incomplete listing: nothing may be processed
-    except urllib.error.HTTPError as exc:
-        verdict = _http_stop(exc)  # genuine rate limit vs permissions failure
-        if verdict is None:
-            raise
-        stop = verdict
-    except KeyboardInterrupt:
-        stop = STOP_INTERRUPTED
+    except (RateLimited, urllib.error.HTTPError, KeyboardInterrupt) as exc:
+        stop = _stop_reason(exc)  # incomplete listing: nothing may be processed
+        if stop is None:
+            raise  # an unclassified HTTP failure: a failure, never a clean stop
     if resume:
         marker = resume_key(conn)
         pulls = [p for p in pulls if _is_newer(p.merged_at, p.number, marker)]
@@ -633,15 +575,10 @@ def _run(
             stop = STOP_WALK_STALE  # at that PR: waiting for the walk to catch up
         except FetchUnavailable:
             stop = STOP_FETCH  # transient git failure: retried by the next run
-        except RateLimited:
-            stop = STOP_RATE_LIMIT
-        except urllib.error.HTTPError as exc:
-            verdict = _http_stop(exc)
-            if verdict is None:
+        except (RateLimited, urllib.error.HTTPError, KeyboardInterrupt) as exc:
+            stop = _stop_reason(exc)
+            if stop is None:
                 raise
-            stop = verdict
-        except KeyboardInterrupt:
-            stop = STOP_INTERRUPTED
     return SweepResult(processed, rows_n, suspicious_n, requests, watermark(conn), stop)
 
 
@@ -736,15 +673,17 @@ class _Walked:
     walk_index: int
 
 
+def _walked_row(r: sqlite3.Row) -> _Walked:
+    """One ``_Walked`` from a commits row — the shared row shape of the
+    subject and patch-id lookups."""
+    return _Walked(
+        int(r["id"]), str(r["sha"]), str(r["title"]), r["subject_patch_id"], int(r["walk_index"])
+    )
+
+
 def _walked_by_title(conn: sqlite3.Connection, pattern: str) -> list[_Walked]:
     return [
-        _Walked(
-            int(r["id"]),
-            str(r["sha"]),
-            str(r["title"]),
-            r["subject_patch_id"],
-            int(r["walk_index"]),
-        )
+        _walked_row(r)
         for r in conn.execute(
             "SELECT id, sha, title, subject_patch_id, walk_index FROM commits"
             " WHERE title LIKE ? ORDER BY walk_index",
@@ -926,10 +865,7 @@ def _twin_by_patch_id(conn: sqlite3.Connection, patch_id: str) -> _Walked | None
     ).fetchone()
     if row is None:
         return None
-    return _Walked(
-        int(row["id"]), str(row["sha"]), str(row["title"]), row["subject_patch_id"],
-        int(row["walk_index"]),
-    )
+    return _walked_row(row)
 
 
 def _detect_heads(

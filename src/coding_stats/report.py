@@ -3,11 +3,8 @@
 import sqlite3
 from pathlib import Path
 
+from .aiattr import DISCLOSURE_LINE, channel_label
 from .metrics import attribution_summary, feature_repos, repo_count, snapshot
-
-
-def _channel_label(channel: str) -> str:
-    return "GitHub-sourced (PR-channel)" if channel == "pr" else "git"
 
 
 def text_report(conn: sqlite3.Connection, top: int = 15) -> str:
@@ -29,7 +26,7 @@ def text_report(conn: sqlite3.Connection, top: int = 15) -> str:
             [
                 "  channels: "
                 + ", ".join(
-                    f"{_channel_label(c)} {n}" for c, n in sorted(attr.channel_counts.items())
+                    f"{channel_label(c)} {n}" for c, n in sorted(attr.channel_counts.items())
                 )
             ]
             if attr.channel_counts
@@ -45,7 +42,7 @@ def text_report(conn: sqlite3.Connection, top: int = 15) -> str:
             if attr.model_counts
             else []
         ),
-        *(["GitHub-sourced (PR-channel) evidence present"] if attr.github_sourced else []),
+        *([DISCLOSURE_LINE] if attr.github_sourced else []),
         f"Features: {snap.total_features}",
         f"Fixes:    {snap.total_fixes}",
         f"Features / year: {snap.features_per_year:.1f}",
