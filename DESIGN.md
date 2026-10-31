@@ -113,12 +113,15 @@ matplotlib scripts over SQL queries. Build git-only phase first.
 - **Channel precedence**: git-only evidence on the same commit outranks
   inherited PR evidence. Stored: where the walk already recorded the
   identical match at the same commit, the PR row is not stored — recorded
-  once, not twice. Consumed (`prsweep.effective_evidence` /
-  `effective_attribution`): the verdict is the strongest tier of the
-  contributing rows; the identity claims (harness/model) resolve git-first,
-  PR rows fill only what the git evidence leaves silent; suspicious rows
-  never contribute. The `channel` column is the provenance the
-  gather/report layer (ticket #38) acts on.
+  once, not twice. Consumed (`aiattr.effective_evidence` /
+  `effective_attribution` — the resolvers live in the aiattr leaf, which
+  also owns the channel constants, the disclosure line and the one verdict
+  ladder; prsweep re-exports them, and metrics resolves through aiattr
+  only): the verdict is the strongest tier of the contributing rows; the
+  identity claims (harness/model) resolve git-first, PR rows fill only what
+  the git evidence leaves silent; suspicious rows never contribute. The
+  `channel` column is the provenance the gather/report layer (ticket #38)
+  acts on.
 
 ## Artifact & multi-repo (settled grill 2, ADR-0003)
 

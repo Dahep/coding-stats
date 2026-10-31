@@ -37,15 +37,42 @@ network — the walk feeds it facts read straight from the commit objects.
 Ticket #35's PR tier reuses this same table — never a second engine: it
 feeds head commits the ordinary ``CommitFacts`` and PR-level signals (body
 footers, PR author identity, head branch name) through ``pr_matches``.
+
+This leaf also owns the shared resolution vocabulary: the channel
+constants, the disclosure line, and the ONE verdict ladder
+(``VERDICT_STRENGTH``/``strongest``) plus the consumption resolvers
+(``effective_evidence``/``effective_attribution``) every layer resolves
+through — pure DB readers, no git, no network.
 """
 
 import re
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 VERDICT_YES = "yes"
 VERDICT_POSSIBLE = "possible"
 VERDICT_NO_EVIDENCE = "no-evidence"
+
+# The canonical verdict ladder (yes > possible > no-evidence), ONE strength
+# notion for every consumer: the walk's per-commit summary (_finalize), the
+# consumption resolvers (effective_attribution) and the org projection's
+# summary merge all resolve through `strongest` below — never a second map.
+VERDICT_STRENGTH: dict[str, int] = {
+    VERDICT_YES: 0,
+    VERDICT_POSSIBLE: 1,
+    VERDICT_NO_EVIDENCE: 2,
+}
+
+# The two evidence channels. The constants are shared by storage and
+# consumption; the bare strings are never re-typed outside this module.
+CHANNEL_GIT = "git"
+CHANNEL_PR = "pr"
+
+# The disclosure line of ADR-0007 clause 5, shared verbatim by every surface
+# that carries PR-channel evidence: the update's on-mode notice (ticket #37),
+# the text report, and the HTML report's note.
+DISCLOSURE_LINE = "GitHub-sourced (PR-channel) evidence present"
 
 RULE_CO_AUTHORED = "co-authored-by"
 RULE_AGENT_EMAIL = "agent-email"
@@ -66,9 +93,33 @@ RULE_RANK: dict[str, int] = {
     RULE_BRANCH_PREFIX: 6,
 }
 
+# the `yes` tier is the rule table's top ranks (issue #34 rules 1-5); the
+# branch-prefix rule (rank 6) is a weak signal: `possible` at most
+YES_TIER_MAX_RANK = RULE_RANK[RULE_TOOL_TRAILER]
+
 _RULE_TIER: dict[str, str] = {
-    rule: VERDICT_YES if rank < 6 else VERDICT_POSSIBLE for rule, rank in RULE_RANK.items()
+    rule: VERDICT_YES if rank <= YES_TIER_MAX_RANK else VERDICT_POSSIBLE
+    for rule, rank in RULE_RANK.items()
 }
+
+
+def strongest(verdicts: Iterable[str]) -> str:
+    """The strongest tier among ``verdicts`` — the canonical ladder of
+    ``VERDICT_STRENGTH`` (yes > possible > no-evidence). Empty input is
+    ``no-evidence``; a tie keeps the first occurrence. Verdicts come only
+    from the rule tiers and the schema-checked verdict columns (all within
+    the three states above)."""
+    best = VERDICT_NO_EVIDENCE
+    for v in verdicts:
+        if VERDICT_STRENGTH[v] < VERDICT_STRENGTH[best]:
+            best = v
+    return best
+
+
+def channel_label(channel: str) -> str:
+    """The display label of one evidence channel — shared by the text and
+    HTML reports so the wording is never re-typed per surface."""
+    return "GitHub-sourced (PR-channel)" if channel == CHANNEL_PR else CHANNEL_GIT
 
 
 @dataclass(frozen=True)
@@ -339,12 +390,7 @@ def _ranked(hits: list[_Hit]) -> list[_Hit]:
 
 def _finalize(hits: list[_Hit]) -> Attribution:
     ranked = _ranked(hits)
-    if any(h.evidence.verdict == VERDICT_YES for h in ranked):
-        verdict = VERDICT_YES
-    elif ranked:
-        verdict = VERDICT_POSSIBLE
-    else:
-        verdict = VERDICT_NO_EVIDENCE
+    verdict = strongest(h.evidence.verdict for h in ranked)
     harness = next((h.harness for h in ranked if h.harness is not None), None)
     model = next((h.model for h in ranked if h.model is not None), None)
     return Attribution(verdict, harness, model, tuple(h.evidence for h in ranked))
@@ -440,3 +486,74 @@ def record(conn: sqlite3.Connection, commit_id: int, facts: CommitFacts) -> Attr
             (commit_id, e.rule, e.raw, e.verdict),
         )
     return attr
+
+
+# --------------------------------------------------------------------------
+# consumption resolvers (channel precedence): pure DB readers — no git, no
+# network. They live in this leaf so every consumer (prsweep's callers, the
+# metrics layer, the org projection) shares ONE resolution rule; prsweep
+# re-exports them for back-compat.
+# --------------------------------------------------------------------------
+
+
+def effective_evidence(conn: sqlite3.Connection, commit_id: int) -> list[tuple[str, str, str, str]]:
+    """(channel, rule, raw, verdict) contributing rows of one commit, the
+    git channel first (it outranks inherited PR evidence). Suspicious PR
+    rows never contribute — they are audit records, not attribution."""
+    out: list[tuple[str, str, str, str]] = []
+    for channel, sql, args in (
+        (
+            CHANNEL_GIT,
+            "SELECT rule, raw, verdict FROM ai_evidence WHERE commit_id = ?",
+            (commit_id,),
+        ),
+        (
+            CHANNEL_PR,
+            "SELECT rule, raw, verdict FROM pr_evidence WHERE commit_id = ? AND suspicious = 0",
+            (commit_id,),
+        ),
+    ):
+        for r in conn.execute(sql, args):
+            out.append((channel, str(r["rule"]), str(r["raw"]), str(r["verdict"])))
+    out.sort(key=lambda t: (0 if t[0] == CHANNEL_GIT else 1, RULE_RANK.get(t[1], 99), t[2]))
+    return out
+
+
+def effective_attribution(conn: sqlite3.Connection, commit_id: int) -> Attribution:
+    """The channel-precedence resolution of one commit (the consumption
+    side of "git-only evidence on the same commit outranks inherited PR
+    evidence"):
+
+    * the verdict is the strongest tier of the contributing rows — a
+      signature matched anywhere (git commit text or a mapped head commit)
+      is still a signature match;
+    * the identity claims (harness/model) resolve git-first: the walk's own
+      summary, then PR rows only where the git evidence is silent;
+    * suspicious rows contribute nothing, ever.
+    """
+    evs = effective_evidence(conn, commit_id)
+    rows = tuple(Evidence(rule, raw, verdict) for _, rule, raw, verdict in evs)
+    verdict = strongest(e.verdict for e in rows)
+    harness: str | None = None
+    model: str | None = None
+    git = conn.execute(
+        "SELECT harness, model FROM ai_attribution WHERE commit_id = ?", (commit_id,)
+    ).fetchone()
+    if git is not None:
+        harness = str(git["harness"]) if git["harness"] is not None else None
+        model = str(git["model"]) if git["model"] is not None else None
+    if harness is None or model is None:
+        prs = conn.execute(
+            "SELECT rule, raw, harness, model FROM pr_evidence"
+            " WHERE commit_id = ? AND suspicious = 0",
+            (commit_id,),
+        ).fetchall()
+        prs.sort(key=lambda r: (RULE_RANK.get(str(r["rule"]), 99), str(r["raw"])))
+        for r in prs:
+            if harness is None and r["harness"] is not None:
+                harness = str(r["harness"])
+            if model is None and r["model"] is not None:
+                model = str(r["model"])
+            if harness is not None and model is not None:
+                break
+    return Attribution(verdict, harness, model, rows)

@@ -15,9 +15,13 @@ import subprocess
 import pytest
 
 from coding_stats import artifact, cli, prsweep
-from conftest import store_dir
-from test_prsweep import FakeTransport, start_remote
-from test_prsweep_watermark import make_squash_prs, pulls
+from conftest import (
+    FakeTransport,
+    land_squash_prs,
+    pr_list_rows,
+    start_remote,
+    store_dir,
+)
 
 DISCLOSURE = "GitHub-sourced (PR-channel) evidence present"
 GITHUB_ID = (
@@ -31,7 +35,7 @@ def _built(tmp_path, repo, ks, monkeypatch):
     """A squash-PR repo with its CLI working DB, identified as a GitHub
     repo (the PR tier derives owner/name from the repositories row)."""
     start_remote(tmp_path, repo)
-    shas = make_squash_prs(repo, ks)
+    shas = land_squash_prs(repo, ks)
     monkeypatch.setattr(
         "coding_stats.identity.resolved_identity", lambda _repo: GITHUB_ID
     )
@@ -43,7 +47,7 @@ def _built(tmp_path, repo, ks, monkeypatch):
 def _serving(monkeypatch, ks):
     """Serve the list endpoint for the given PR numbers; every request is
     answered locally (zero network in tests)."""
-    served = FakeTransport(pulls(*ks))
+    served = FakeTransport(pr_list_rows(*ks))
     monkeypatch.setattr("coding_stats.prsweep.default_transport", served)
     return served
 
@@ -144,7 +148,7 @@ def test_increment_resumes_above_the_watermark_across_push_runs(
     assert "watermark 3" in out
 
     # a fourth PR lands; the next run records exactly it (PRs > watermark only)
-    make_squash_prs(repo, [4])
+    land_squash_prs(repo, [4])
     _serving(monkeypatch, [1, 2, 3, 4])
     cli.main(["update", "--db", db_path, "--no-classify", "--detect-pr"])
     out = capsys.readouterr().out

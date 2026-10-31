@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import NamedTuple
 
-from . import aiattr, prsweep
+from . import aiattr
 from .orgview import org
 
 
@@ -308,7 +308,7 @@ class FeatureAttribution:
 @dataclass
 class _Resolved:
     """One commit's union-level attribution: the channel-precedence
-    resolution of its contributing evidence rows (prsweep.effective_*)."""
+    resolution of its contributing evidence rows (aiattr.effective_*)."""
 
     cid: int
     sha: str
@@ -323,7 +323,7 @@ class _Resolved:
 def _resolved(conn: sqlite3.Connection) -> list[_Resolved]:
     """Every walked commit's attribution, resolved ONCE per commit from the
     union of its evidence rows — the channel-precedence rule of
-    prsweep.effective_attribution reused verbatim at the union level (never
+    aiattr.effective_attribution reused verbatim at the union level (never
     duplicated): the verdict is the strongest contributing tier, identity
     claims resolve git-first, suspicious rows contribute nothing. The
     channel is the strongest channel that contributed evidence ('git' when
@@ -337,8 +337,8 @@ def _resolved(conn: sqlite3.Connection) -> list[_Resolved]:
            ORDER BY c.walk_index, c.sha"""
     ):
         cid = int(r["cid"])
-        attr = prsweep.effective_attribution(conn, cid)
-        tagged = prsweep.effective_evidence(conn, cid)
+        attr = aiattr.effective_attribution(conn, cid)
+        tagged = aiattr.effective_evidence(conn, cid)
         seen: set[tuple[str, str, str]] = set()
         evidence: list[tuple[str, str, str]] = []
         for _ch, rule, raw, verdict in tagged:
@@ -347,7 +347,11 @@ def _resolved(conn: sqlite3.Connection) -> list[_Resolved]:
                 seen.add(key)
                 evidence.append(key)
         channels = [ch for ch, _rule, _raw, _v in tagged]
-        channel = "git" if "git" in channels else (prsweep.CHANNEL_PR if channels else "")
+        channel = (
+            aiattr.CHANNEL_GIT
+            if aiattr.CHANNEL_GIT in channels
+            else (aiattr.CHANNEL_PR if channels else "")
+        )
         out.append(
             _Resolved(
                 cid, str(r["sha"]), str(r["slug"]), attr.verdict, attr.harness, attr.model,

@@ -12,6 +12,7 @@ import subprocess
 from datetime import date
 from pathlib import Path
 
+from .aiattr import DISCLOSURE_LINE, channel_label
 from .metrics import (
     attribution_by_feature,
     attribution_by_repo,
@@ -669,9 +670,6 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
             else _esc(sha[:7])
         )
 
-    def channel_label(channel: str) -> str:
-        return "GitHub-sourced (PR-channel)" if channel == "pr" else "git"
-
     attr_trs = []
     for r in attr_rows:
         ev = "".join(
@@ -717,7 +715,7 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
         else ""
     )
     disclosure = (
-        "<div class='note'>GitHub-sourced (PR-channel) evidence present.</div>"
+        f"<div class='note'>{DISCLOSURE_LINE}.</div>"  # the rendered note's trailing period
         if attr.github_sourced
         else ""
     )
