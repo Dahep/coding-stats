@@ -9,16 +9,19 @@ import html
 import json
 import sqlite3
 import subprocess
+from collections.abc import Callable
 from datetime import date
 from pathlib import Path
 
 from .aiattr import DISCLOSURE_LINE, channel_label
 from .metrics import (
+    ModelTrendPoint,
     attribution_by_feature,
     attribution_by_model,
     attribution_by_repo,
     attribution_rows,
     attribution_summary,
+    attribution_trend,
     feature_ranking,
     feature_repos,
     features_timeline,
@@ -757,6 +760,64 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
         else ""
     )
     model_rows = attribution_by_model(conn)
+    trend = attribution_trend(conn)
+    months = sorted({p.month for pts in trend.values() for p in pts})
+
+    def _series_for(
+        pick: Callable[[ModelTrendPoint], int],
+        key_fn: Callable[[str], str],
+        colors: list[str],
+    ) -> list[tuple[str, list[float | None], str]]:
+        out: list[tuple[str, list[float | None], str]] = []
+        for k, pts in sorted(trend.items()):
+            vals: list[float | None] = [float(pick(p)) for p in pts]
+            if any(v is not None and v > 0 for v in vals):
+                out.append((key_fn(k), vals, colors[len(out) % len(colors)]))
+        return out
+
+    _trend_colors = ["#7aa2f7", "#9ece6a", "#f7768e", "#e0af68", "#73daca", "#ff9e64"]
+
+    def _trend_chart(
+        symbol: str, unit: str, pick: Callable[[ModelTrendPoint], int]
+    ) -> str:
+        series = _series_for(pick, lambda k: k, _trend_colors)
+        if not series:
+            return ""
+        total_vals: list[float | None] = [
+            float(sum(v for s in series if (v := s[1][i]) is not None))
+            if any(s[1][i] is not None for s in series)
+            else None
+            for i in range(len(months))
+        ]
+        return (
+            f"<h2 style='margin-top:18px;font-size:14px'>{_esc(symbol)}"
+            f" (lower bounds)</h2>"
+            + _lines_chart(
+                months,
+                series,
+                (f"total {unit}", total_vals, C["cumulative"]),
+            )
+        )
+
+    model_trend_charts = "".join(
+        (
+            _trend_chart(
+                "Features discovered per month by attributed model",
+                "features",
+                lambda p: p.features,
+            ),
+            _trend_chart(
+                "Churn carried per month by attributed model",
+                "churned lines",
+                lambda p: p.churn,
+            ),
+            _trend_chart(
+                "Fixes landing per month by attributed model",
+                "fixes reaching the model's features",
+                lambda p: p.fixes,
+            ),
+        )
+    )
     model_metric_rows = "".join(
         f"<tr><td>{_esc(m.harness)}</td><td>{_esc(m.model or '&mdash;')}</td>"
         f"<td class='num'>{m.commits}</td><td class='num'>{m.features}</td>"
@@ -801,6 +862,7 @@ PR-channel evidence).{harness_note}{model_note}</div>
 {attr_table}
 {share_tables}
 {model_metric_tables}
+{model_trend_charts}
 </section>"""
 
     churn_rows = [

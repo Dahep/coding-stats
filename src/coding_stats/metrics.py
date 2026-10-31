@@ -493,6 +493,93 @@ def _tally(rows: list[_Resolved]) -> tuple[int, int, int, int]:
 
 
 @dataclass
+class ModelTrendPoint:
+    """One month's by-model bucket, a LOWER BOUND: the model's yes-attributed
+    commits in that month, the features first defined in that month by those
+    commits, the churn that month's diffs carried, and the distinct fix
+    commits landing in that month that reach any feature the model defined
+    (all months). Missing months read as no attributed activity — an absence
+    of evidence, never a statement about authorship."""
+
+    month: str  # YYYY-MM of the event's commit
+    commits: int
+    features: int
+    churn: int
+    fixes: int
+
+
+def attribution_trend(conn: sqlite3.Connection) -> dict[str, list[ModelTrendPoint]]:
+    """The by-model metrics over time — the report's per-model monthly
+    tables and line charts (a lower bound per cell). Keyed by the same
+    ``harness/model`` identity grouping as :func:`attribution_by_model`;
+    each model's list covers the full month span of the walked history
+    (buckets with no attributed activity are zeros — absence of a signal
+    matched, never authorship). Fixes bucket by their own commit's month,
+    reaching any feature across the model's history."""
+    conn = org(conn)
+    groups: dict[tuple[str, str], list[_Resolved]] = {}
+    month_by_cid: dict[int, str] = {}
+    for r in conn.execute("SELECT id, committed_at FROM commits"):
+        month_by_cid[int(r["id"])] = str(r["committed_at"])[:7]
+    months = sorted(set(month_by_cid.values()))
+    for r in _resolved(conn):
+        if r.verdict == aiattr.VERDICT_YES and (r.harness or r.model):
+            groups.setdefault((r.harness or "?", r.model or ""), []).append(r)
+    if not groups:
+        return {}
+
+    churn_by_cid = {
+        int(r["id"]): int(r["churn_lines"])
+        for r in conn.execute("SELECT id, churn_lines FROM commits WHERE churn_lines IS NOT NULL")
+    }
+    defines: dict[int, set[str]] = {}
+    for r in conn.execute(
+        "SELECT commit_id, feature_id FROM commits_features WHERE role = 'defines'"
+    ):
+        defines.setdefault(int(r["commit_id"]), set()).add(str(r["feature_id"]))
+    fix_features: dict[str, set[str]] = {}
+    fix_month: dict[str, str] = {}
+    for r in conn.execute("SELECT DISTINCT fix_commit_id, feature_id FROM fixes_features"):
+        fix_features.setdefault(str(r["fix_commit_id"]), set()).add(str(r["feature_id"]))
+    for r in conn.execute(
+        "SELECT c.id, c.committed_at FROM commits c JOIN commit_verdicts v"
+        " ON v.commit_id = c.id WHERE v.verdict = 'fix'"
+    ):
+        fix_month.setdefault(str(r["id"]), str(r["committed_at"])[:7])
+
+    def blank(month: str) -> ModelTrendPoint:
+        return ModelTrendPoint(month, 0, 0, 0, 0)
+
+    out: dict[str, list[ModelTrendPoint]] = {}
+    for (harness, model), group in sorted(groups.items()):
+        key = f"{harness}/{model}" if model else harness
+        model_features: set[str] = set()
+        for cid in (r.cid for r in group):
+            model_features |= defines.get(cid, set())
+        grid = {m: blank(m) for m in months}
+        for r in group:
+            p = grid[month_by_cid[r.cid]]
+            p.commits += 1
+            p.churn += churn_by_cid.get(r.cid, 0)
+        features_first: dict[str, str] = {}
+        for r in group:
+            for fid in defines.get(r.cid, ()):
+                m = month_by_cid[r.cid]
+                if fid not in features_first or m < features_first[fid]:
+                    features_first[fid] = m
+        for m in features_first.values():
+            grid[m].features += 1  # features reaching the model later are not re-counted
+        for fix_cid, lfids in fix_features.items():
+            if not (lfids & model_features):
+                continue
+            m = fix_month.get(fix_cid, "")  # a fix without a bucket: skip (defensive)
+            if m and m in grid:
+                grid[m].fixes += 1
+        out[key] = [grid[m] for m in months]
+    return out
+
+
+@dataclass
 class ModelFeatureMetrics:
     """The feature metrics of one attributed AI model, as LOWER BOUNDS: the
     model's yes-attributed commits, the features they define, the churn those

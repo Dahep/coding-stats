@@ -6,7 +6,6 @@ commits reaching those features, each once per model row it reaches.
 Lower bounds everywhere; a commit without a matched identity contributes
 to no row, and ``no-evidence`` never renders as a model."""
 
-
 from coding_stats import htmlreport
 from coding_stats.metrics import attribution_by_model
 from conftest import add_feature, commit_files, make_db
@@ -18,15 +17,12 @@ CODEX = "Assisted-by: codex:gpt-5"
 def _built(tmp_path, repo):
     """walked DB over three commits: A fixes f1 (claude), B touches f2
     (codex), C is an unattributed fix of f1."""
-    ha = commit_files(
-        repo, f"feat: classifier\n\n{CLAUDE}\n", {"a.txt": "x\n" * 3}
-    )
-    hb = commit_files(
-        repo, f"feat: renderer\n\n{CODEX}\n", {"b.txt": "y\n" * 2}
-    )
+    ha = commit_files(repo, f"feat: classifier\n\n{CLAUDE}\n", {"a.txt": "x\n" * 3})
+    hb = commit_files(repo, f"feat: renderer\n\n{CODEX}\n", {"b.txt": "y\n" * 2})
     hc = commit_files(repo, "fix: classifier crash", {"a.txt": "y\n" * 3})
     conn = make_db(tmp_path / "w.db", repo)
     from coding_stats import gitwalk
+
     gitwalk.walk(repo, conn, "main")
     ids = {str(r["sha"]): int(r["id"]) for r in conn.execute("SELECT id, sha FROM commits")}
     fid_a = add_feature(conn, "classifier")
@@ -67,15 +63,30 @@ def test_per_model_metrics_are_lower_bounds(tmp_path, repo):
     assert set(by_h) == {"claude", "codex"}
 
     claude = by_h["claude"]
-    assert (claude.model, claude.commits, claude.features) == (
-        "Opus 4.8 (1M context)", 1, 1
-    )
+    assert (claude.model, claude.commits, claude.features) == ("Opus 4.8 (1M context)", 1, 1)
     assert claude.churn == 3  # the walked churn_lines (3 added lines in a.txt)
     assert claude.fixes == 1 and claude.fixes_per_feature == 1.0
 
     codex = by_h["codex"]
     assert (codex.model, codex.commits, codex.features) == ("gpt-5", 1, 1)
     assert codex.churn == 2 and codex.fixes == 0 and codex.fixes_per_feature == 0.0
+    conn.close()
+
+
+def test_per_model_trend_buckets_months(tmp_path, repo):
+    """The trend splits the by-model metrics by commit month: a commit's
+    month carries its churn and its feature discovery; a fix lands in its
+    own month and reaches features across months."""
+    conn, ids = _built(tmp_path, repo)
+    from coding_stats.metrics import attribution_trend
+
+    trend = attribution_trend(conn)
+    assert set(trend) == {"claude/Opus 4.8 (1M context)", "codex/gpt-5"}
+    claude = trend["claude/Opus 4.8 (1M context)"]
+    assert all(p.month for p in claude)
+    assert sum(p.commits for p in claude) == 1
+    assert sum(p.features for p in claude) == 1 and sum(p.churn for p in claude) == 3
+    assert sum(p.fixes for p in claude) == 1
     conn.close()
 
 
@@ -90,6 +101,7 @@ def test_the_model_table_renders_and_hides_without_evidence(tmp_path, repo):
     # zero attribution: no model rows, no table, zero single-repo drift
     empty = make_db(tmp_path / "e.db", repo)
     from coding_stats import gitwalk
+
     gitwalk.walk(repo, empty, "main")
     empty.execute("DELETE FROM ai_attribution")
     empty.execute("DELETE FROM ai_evidence")
