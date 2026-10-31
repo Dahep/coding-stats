@@ -177,12 +177,16 @@ workflow is a drift edit like any other.
 
 - **Increment semantics** — after the deterministic stages and before the
   artifact is serialized (so the evidence rows and the watermark ride the
-  Artifact to the Data branch), the run records the merged PRs *above* the
-  watermark: oldest first, a few (cap 25) per push run, the watermark
+  Artifact to the Data branch), the run records the merged PRs newer than
+  the resume marker — the last incorporated PR's merge date
+  (`pr_watermark`: `last_merged_at` + `last_pr_number`): oldest first by
+  merge date (ties by PR number), a few (cap 25) per push run, the marker
   advancing after each PR's evidence is recorded. Later runs resume at the
-  first PR above it — zero skipped PRs; closed-unmerged and other-base PRs
-  never move it. Rate-limit exhaustion, the run cap, or an interruption end
-  the run with a `::notice::`, never a failure: the next run resumes.
+  first PR past the marker — zero skipped PRs (a lower-numbered PR that
+  merges later has a newer merge date and is picked up then);
+  closed-unmerged and other-base PRs never move it. Rate-limit exhaustion,
+  the run cap, or an interruption end the run with a `::notice::`, never a
+  failure: the next run resumes.
 - **Permissions** — `pull-requests: read` ONLY when `detect-pr: true`; the
   off default requests nothing beyond `contents: write`, and the update
   step's `GITHUB_TOKEN` env is scoped the same way: the run's token reaches
@@ -202,8 +206,8 @@ workflow is a drift edit like any other.
   evidence rows and the watermark, and report/Pages output renders the same
   line wherever PR-channel rows contribute.
 - **Full-history backfill** — the `pr-backfill: full` passthrough re-sweeps
-  the whole PR numbering (same oldest-first machinery, sharing the same
-  watermark — later push runs continue after it), for explicit
+  the whole PR numbering (same merge-date machinery, sharing the same
+  marker — later push runs continue after it), for explicit
   `workflow_dispatch` callers:
 
 ```yaml

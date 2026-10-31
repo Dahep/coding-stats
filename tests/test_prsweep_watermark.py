@@ -1,17 +1,19 @@
-"""Watermark resume + oldest-first per-increment PR backfill (ticket #36,
-ADR-0007 clause 2).
+"""Watermark resume + merge-date per-increment PR backfill (ticket #36,
+ADR-0007 clause 2, re-keyed per the 2026-10-30 ruling).
 
-The bounded sweep becomes watermark-driven run machinery: the watermark — the
-last INCORPORATED PR number — advances after each PR's evidence is recorded
-(never per page), so every interruption leaves a contiguous processed prefix.
-Resume starts at the first PR above the watermark: zero skipped PRs, zero
-duplicated rows (replace-not-duplicate applies on resume). Full-history mode
-walks the whole numbering sequence the same oldest-first way and shares the
+The bounded sweep becomes watermark-driven run machinery: the resume marker
+— the (merged_at, number) tuple of the last INCORPORATED PR — advances
+after each PR's evidence is recorded (never per page), so every interruption
+leaves a contiguous processed prefix in merge-date order. Resume starts at
+the first PR past the marker: zero skipped PRs, zero duplicated rows
+(replace-not-duplicate applies on resume). Full-history mode walks the whole
+numbering sequence the same way and shares the
 watermark; later push runs continue after it. Stop conditions (rate limit,
 per-run cap, interruption) end a run cleanly with a notice, never a failure —
 the next run resumes automatically. Closed-unmerged and other-base PRs are
-never incorporated: their numbers sit below whatever watermark the next
-merged PR sets. Keyed by PR number, never merge date.
+never incorporated and never advance the watermark. Keyed by merge date,
+ties by PR number: out-of-order merges are never lost (the 2026-10-30
+ruling replaces the PR-number key of ticket #36).
 """
 
 import sqlite3
@@ -129,7 +131,7 @@ def test_interrupted_run_resumes_at_the_first_pr_above_the_watermark(
         conn, repo, "main", transport=FakeTransport(pulls(1, 2, 3, 4, 5)), now=OBSERVED_AT
     )
     assert res2.stop is None and res2.processed == 3
-    assert spy.log == [3, 4, 5]  # resumes at the first PR above the watermark
+    assert spy.log == [3, 4, 5]  # resumes at the first PR past the marker
     assert prsweep.watermark(conn) == 5
     assert rows_per_pr(conn) == {1: 3, 2: 3, 3: 3, 4: 3, 5: 3}  # zero skipped
     assert duplicate_rows(conn) == []  # zero duplicated evidence rows
@@ -454,12 +456,70 @@ def test_pr_watermark_schema_step_migrates_pre_watermark_dbs(tmp_path, repo):
     conn = make_db(tmp_path / "w.db", repo)
     conn.execute("DROP TABLE pr_watermark")
     conn.execute("DROP TABLE _schema_step_0006")
+    conn.execute("DROP TABLE _schema_step_0007")  # pre-watermark: both steps pending
     conn.commit()
     conn.close()
     migrated = connect(tmp_path / "w.db")
     cols = [str(r["name"]) for r in migrated.execute("PRAGMA table_info(pr_watermark)")]
-    assert cols == ["repo_id", "last_pr_number"]
+    assert cols == ["repo_id", "last_pr_number", "last_merged_at"]
     migrated.close()
+
+
+def test_step_7_preserves_a_step_6_watermark_on_open(tmp_path, repo):
+    # a number-keyed-era DB (pr_watermark without a merge date) migrates on
+    # open: the column is added and the recorded watermark survives it —
+    # its date is NULL, a marker that claims no merge date
+    conn = make_db(tmp_path / "w.db", repo)
+    conn.execute("ALTER TABLE pr_watermark DROP COLUMN last_merged_at")
+    conn.execute(
+        "INSERT INTO pr_watermark (repo_id, last_pr_number)"
+        " VALUES ((SELECT id FROM repositories ORDER BY id LIMIT 1), 7)"
+    )
+    conn.execute("DROP TABLE _schema_step_0007")
+    conn.commit()
+    conn.close()
+    migrated = connect(tmp_path / "w.db")
+    cols = [str(r["name"]) for r in migrated.execute("PRAGMA table_info(pr_watermark)")]
+    assert cols == ["repo_id", "last_pr_number", "last_merged_at"]
+    row = migrated.execute(
+        "SELECT last_pr_number, last_merged_at FROM pr_watermark"
+    ).fetchone()
+    assert (row["last_pr_number"], row["last_merged_at"]) == (7, None)  # preserved
+    migrated.close()
+
+
+# ---------------------------------------------------------------------------
+# pagination: the increment's window never stops before a late deep merge
+# ---------------------------------------------------------------------------
+
+
+def test_the_increment_window_reaches_low_numbers_that_merged_late(tmp_path, repo, monkeypatch):
+    # The window cut is the wave's heart. "Stop when the page's min merged_at
+    # <= the marker's date" would stop at page 1 here and lose PR 30 — an
+    # old-numbered PR that merged LATE (its merge date is newer than the
+    # marker's), sitting in page 2 among neighbours that merged long before
+    # the marker. No date-based early stop is sound on number-descending
+    # pages (an older number can always merge later), so the increment's
+    # window walks the list to the end (list pages only) and cuts candidates
+    # from it by (merged_at, number) > the marker.
+    conn = make_db(tmp_path / "w.db", repo)
+    githubize(conn)
+    old = "2026-10-01T12:00:00+00:00"
+    late = "2026-10-29T12:00:00+00:00"
+    prsweep.advance_watermark(conn, "2026-10-15T12:00:00+00:00", 150)
+    rows = [pr(n, merged_at=(late if n == 30 else old)) for n in range(150, 0, -1)]
+    t = FakeTransport(rows)  # pages of 100: PR 30 sits in page 2
+    log: list[int] = []
+
+    def stub(_conn, _repo, _branch, pulled):
+        log.append(pulled.number)
+        return []
+
+    monkeypatch.setattr(prsweep, "_pr_rows", stub)
+    res = prsweep.sweep_increment(conn, repo, "main", transport=t, now=OBSERVED_AT)
+    assert res.requests == 2  # the deep page is fetched: nothing may hide below
+    assert log == [30]  # the late merge is a candidate despite its low number
+    assert prsweep.resume_key(conn) == (late, 30)
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ from conftest import commit_files, make_db
 
 OBSERVED_AT = "2026-10-30T00:00:00+00:00"
 TRAILER_VALUE = "Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+WM_DATE = "2026-10-28T12:00:00+00:00"  # the marker's merge date in _built_db
 
 
 def _built_db(tmp_path, repo, name="w.db"):
@@ -48,8 +49,9 @@ def _built_db(tmp_path, repo, name="w.db"):
     )
     # the recorded watermark beside the rows: everything through PR 8
     conn.execute(
-        "INSERT INTO pr_watermark (repo_id, last_pr_number)"
-        " VALUES ((SELECT id FROM repositories ORDER BY id LIMIT 1), 8)"
+        "INSERT INTO pr_watermark (repo_id, last_pr_number, last_merged_at)"
+        " VALUES ((SELECT id FROM repositories ORDER BY id LIMIT 1), 8, ?)",
+        (WM_DATE,),
     )
     conn.commit()
     return conn, h1, h2
@@ -273,9 +275,9 @@ def test_org_projection_carries_pr_rows(tmp_path):
             OBSERVED_AT,
         )
         conn.execute(
-            "INSERT INTO pr_watermark (repo_id, last_pr_number)"
-            " VALUES ((SELECT id FROM repositories ORDER BY id LIMIT 1), ?)",
-            (10 + len(sources),),
+            "INSERT INTO pr_watermark (repo_id, last_pr_number, last_merged_at)"
+            " VALUES ((SELECT id FROM repositories ORDER BY id LIMIT 1), ?, ?)",
+            (10 + len(sources), WM_DATE),
         )
         conn.commit()
         sources.append(artifact.write(conn, tmp_path / f"{name}-store"))
@@ -287,10 +289,12 @@ def test_org_projection_carries_pr_rows(tmp_path):
     proj = orgview.org(uconn)
     rows = _pr_rows(proj)
     assert {(r[8], r[4]) for r in rows} == {("pr", "alpha:m"), ("pr", "beta:m")}
-    # the recorded watermarks ride the projection per repository too
-    # (the loop stamps 10 for alpha — len(sources)==0 — then 11 for beta)
-    assert [r["last_pr_number"] for r in proj.execute(
-        "SELECT last_pr_number FROM pr_watermark ORDER BY last_pr_number")] == [10, 11]
+    # the recorded watermarks ride the projection per repository too — the
+    # resume marker's merge date with the PR number (the loop stamps 10 for
+    # alpha — len(sources)==0 — then 11 for beta)
+    assert [(r["last_pr_number"], r["last_merged_at"]) for r in proj.execute(
+        "SELECT last_pr_number, last_merged_at FROM pr_watermark"
+        " ORDER BY last_pr_number")] == [(10, WM_DATE), (11, WM_DATE)]
     if proj is not uconn:
         proj.close()
     uconn.close()
@@ -301,21 +305,27 @@ def test_org_projection_carries_pr_rows(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+WM_DATE = "2026-10-28T12:00:00+00:00"
+
+
 def _watermark_rows(conn):
     return [
-        (int(r["repo_id"]), int(r["last_pr_number"]))
-        for r in conn.execute("SELECT repo_id, last_pr_number FROM pr_watermark ORDER BY repo_id")
+        (int(r["repo_id"]), int(r["last_pr_number"]), r["last_merged_at"])
+        for r in conn.execute(
+            "SELECT repo_id, last_pr_number, last_merged_at FROM pr_watermark ORDER BY repo_id"
+        )
     ]
 
 
 def test_artifact_round_trips_the_pr_watermark(tmp_path, repo):
     conn, h1, h2 = _built_db(tmp_path, repo)
     before = _watermark_rows(conn)
-    assert len(before) == 1 and before[0][1] == 8
+    assert len(before) == 1 and before[0][1] == 8 and before[0][2] == WM_DATE
     data = artifact.serialize(conn)
     text = data.decode("utf-8")
     assert "CREATE TABLE pr_watermark" in text
     assert "INSERT INTO pr_watermark" in text
+    assert "last_merged_at" in text  # the resume marker's merge date rides too
     assert artifact.verify_bytes(data) is None
 
     mat = sqlite3.connect(tmp_path / "mat.db")
@@ -361,31 +371,93 @@ def test_partial_recompute_restores_the_watermark_and_pr_rows_unchanged(tmp_path
     # exactly as that version recorded them (never re-derived, and the
     # pre-recompute DB's carried-over state never clobbers them)
     assert _pr_rows(restored) == rows_at_anchor
-    assert _watermark_rows(restored) == [(1, 8)]
+    assert _watermark_rows(restored) == [(1, 8, WM_DATE)]
     # and the partial recompute's re-walk never touches them either
     assert gitwalk.walk(repo, restored, "main") == 1  # only the newer commit
     assert _pr_rows(restored) == rows_at_anchor
-    assert _watermark_rows(restored) == [(1, 8)]
+    assert _watermark_rows(restored) == [(1, 8, WM_DATE)]
     restored.close()
 
 
 def test_gather_carries_the_watermark_and_replaces_it_wholesale(tmp_path, repo):
-    conn, h1, h2 = _built_db(tmp_path, repo)  # watermark 8
+    conn, h1, h2 = _built_db(tmp_path, repo)  # watermark (8, WM_DATE)
     path = artifact.write(conn, tmp_path / "store")
     conn.close()
     union = tmp_path / "union.db"
     assert gather.gather(union, [path]).ingested == 1
     uconn = sqlite3.connect(union)
     uconn.row_factory = sqlite3.Row
-    assert [n for _, n in _watermark_rows(uconn)] == [8]
+    # the resume marker's merge date rides the gather union with the rest
+    assert _watermark_rows(uconn) == [(1, 8, WM_DATE)]
 
     # a newer artifact of the same key replaces the watermark wholesale
+    newer = "2026-10-29T12:00:00+00:00"
     conn = connect(tmp_path / "w.db")
-    conn.execute("UPDATE pr_watermark SET last_pr_number = 9")
+    conn.execute("UPDATE pr_watermark SET last_pr_number = 9, last_merged_at = ?", (newer,))
     conn.commit()
     path2 = artifact.write(conn, tmp_path / "store2")
     conn.close()
     assert gather.gather(union, [path2]).ingested == 1
-    assert [n for _, n in _watermark_rows(uconn)] == [9]  # replaced, never extended
+    assert _watermark_rows(uconn) == [(1, 9, newer)]  # replaced, never extended
     uconn.close()
+
+
+def test_step_6_minted_artifact_completes_the_shape_and_keeps_the_watermark(tmp_path, repo):
+    # a #36-era mint (pr_watermark at its step-6 shape: no merge date) stays
+    # replayable: the shape completion adds the column, the recorded
+    # watermark survives with a NULL date (a marker that claims no merge
+    # date), and the DB's own step-7 migration on open is then a no-op
+    conn, h1, h2 = _built_db(tmp_path, repo)
+    old = _step6_bytes(conn)
+    assert artifact.verify_bytes(old) is None  # crafted bytes are valid artifacts
+    conn.close()
+
+    mat = sqlite3.connect(tmp_path / "mat.db")
+    mat.row_factory = sqlite3.Row
+    artifact.restore_into(mat, old)
+    cols = [str(r["name"]) for r in mat.execute("PRAGMA table_info(pr_watermark)")]
+    assert cols == ["repo_id", "last_pr_number", "last_merged_at"]
+    assert _watermark_rows(mat) == [(1, 8, None)]  # watermark preserved, date unknown
+    mat.close()
+
+    opened = connect(tmp_path / "mat.db")  # step 7 applies cleanly on top
+    assert _watermark_rows(opened) == [(1, 8, None)]
+    opened.close()
+
+
+def _step6_bytes(conn) -> bytes:
+    """Artifact bytes as a #36-era mint wrote them: pr_watermark at its
+    step-6 shape (repo_id, last_pr_number — no merge date), header stamped
+    schema step 6, digest re-stamped (the crafting pattern above)."""
+    content = artifact.serialize(conn).decode("utf-8")
+    out: list[str] = []
+    in_wm_ddl = False
+    for line in content.splitlines(keepends=True):
+        if line.startswith("-- schema-step:"):
+            out.append("-- schema-step: 6\n")
+            continue
+        if line.startswith("CREATE TABLE pr_watermark"):
+            in_wm_ddl = True
+            out.append(line)
+            continue
+        if in_wm_ddl:
+            if "last_merged_at" in line:
+                continue  # the column did not exist at step 6
+            if line.strip() == ");":
+                in_wm_ddl = False
+            out.append(line)
+            continue
+        if line.startswith("INSERT INTO pr_watermark "):
+            line = re.sub(
+                r"\(repo_id, last_pr_number, last_merged_at\) VALUES"
+                r" \((\d+), (\d+), '[^']*'\)",
+                r"(repo_id, last_pr_number) VALUES (\1, \2)",
+                line,
+            )
+        out.append(line)
+    blank = "".join(out)
+    digest = re.search(r"^-- digest: ([0-9a-f]+)$", blank, re.M).group(1)
+    blanked = blank.replace(f"-- digest: {digest}", "-- digest:", 1)
+    restamped = hashlib.sha256(blanked.encode()).hexdigest()
+    return blanked.replace("-- digest:", f"-- digest: {restamped}", 1).encode()
 

@@ -72,14 +72,20 @@ matplotlib scripts over SQL queries. Build git-only phase first.
 
 ### PR-channel tier (ADR-0007 clauses 3-5, ticket #35)
 
-- **Sweep**: `pr-sweep --after-pr <n>` reconstructs PR-side attribution
-  manually (watermark automation is ticket #36). Cost discipline: one list
+- **Sweep**: `pr-sweep` (watermark-driven increment; `--after-pr <n>` is
+  the bounded adoption face, `--full` the operator's full-history sweep)
+  reconstructs PR-side attribution. Cost discipline: one list
   GET per 100 closed PRs (`GET /repos/{owner}/{repo}/pulls`), bodies/titles/
   authors straight from the list response — ZERO per-PR API calls and no
   commit-list endpoints; `refs/pull/N/head` head refs come over the git
   protocol (zero API budget), fetched lazily only for squash/rebase PRs.
   Closed-unmerged PRs are listed and skipped; PRs merged into another base
-  branch never belong to this Target. No LLM calls anywhere — the PR tier
+  branch never belong to this Target. Processing is oldest-first by merge
+  date (ties by PR number); the resume marker is the last incorporated PR's
+  merge date (`pr_watermark.last_merged_at` + `last_pr_number`, schema step
+  7) — keyed by merge date, not PR number, so out-of-order merges are never
+  lost (2026-10-30 ruling; the PR number stays the per-row key and the
+  `--after-pr` bound). No LLM calls anywhere — the PR tier
   is detection-only.
 - **Merge strategies** (identified from the walk, no API): squash → the
   `(#N)` subject landing; plain merge → the MERGE_HEAD-shaped `Merge pull

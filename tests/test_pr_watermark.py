@@ -1,16 +1,22 @@
-"""Watermark-driven per-increment PR backfill (ticket #36, ADR-0007 clause 2).
+"""Watermark-driven per-increment PR backfill (ticket #36, ADR-0007 clause 2,
+re-keyed by merge date per the 2026-10-30 user ruling).
 
-The bounded sweep becomes run machinery: a Watermark (last incorporated PR
-number) rides the Artifact with the recorded evidence rows, the walk is
-oldest-first (ascending PR number) over merged PRs above it, and the
-watermark advances per PR recorded — every interruption leaves a contiguous
-processed prefix and the next run resumes at the first PR above it. Stop
-conditions (rate-limit exhaustion, per-run processing cap, interruption) end
-a run cleanly with a visible notice, never a failure. Keyed by PR number,
-never merge date: closed-unmerged PRs are skipped and never advance the
-watermark. The full-history sweep walks the same oldest-first way, sharing
-the watermark, merely further — its listing reaches the beginning of the PR
-numbering — and later push runs continue after it.
+The bounded sweep becomes run machinery: the resume marker — the
+(merged_at, number) tuple of the last INCORPORATED PR — rides the Artifact
+with the recorded evidence rows (``pr_watermark``: ``last_merged_at`` +
+``last_pr_number``, schema step 7). Merged PRs are processed OLDEST FIRST BY
+MERGE DATE (ties by PR number ascending) and the marker advances per PR
+recorded — every interruption leaves a contiguous processed prefix in
+merge-date order and the next run resumes at the first PR whose (merged_at,
+number) tuple is newer. Stop conditions (rate-limit exhaustion, per-run
+processing cap, interruption) end a run cleanly with a visible notice, never
+a failure. Closed-unmerged PRs never merge and are never candidates. The
+full-history sweep walks the same merge-date order, sharing the marker,
+merely further — its listing reaches the beginning of the PR numbering — and
+later push runs continue after it. The PR number stays the per-row key (and
+the ``--after-pr`` bounded face's bound); it is only the RESUME point that
+moved to merge dates, because the number key lost out-of-order merges (a
+still-open lower number sat below the number watermark forever).
 """
 
 import io
@@ -201,45 +207,119 @@ def test_closed_unmerged_and_other_base_never_advance_the_watermark(tmp_path, re
 
 
 # ---------------------------------------------------------------------------
-# out-of-order merges: a still-open PR number clamps the watermark below it
+# out-of-order merges: resume keyed by merge date, never the PR number
 # ---------------------------------------------------------------------------
 
 
-def test_open_pr_number_clamps_the_watermark_below_it(tmp_path, repo):
-    # PR 5 is still open while PR 7 has already merged: the watermark must
-    # stay BELOW 5 — when PR 5 merges later its number is still above the
-    # watermark and it is processed (out-of-order merges lose nothing)
+def test_out_of_order_merge_is_processed_when_its_merge_date_is_newer(tmp_path, repo):
+    # PR 5 is still open while PR 7 merges: #7 is processed first (its merge
+    # date is the only one), the marker becomes (T7, 7) — and when #5 merges
+    # LATER its merge date is newer than the marker's, so it is processed
+    # next: a still-open lower number is never lost under the merge-date key
     conn, _ = primed_db(tmp_path, repo, [7])
+    t7 = "2026-10-20T12:00:00+00:00"
+    t5 = "2026-10-25T12:00:00+00:00"
     t = FakeTransport(
         [
-            pr(7, body="Generated with Codex.\n", head="claude/f7"),
+            pr(7, body="Generated with Codex.\n", head="claude/f7", merged_at=t7),
             pr(5, body="Generated with Codex.\n", head="claude/f5", state="open"),
         ]
     )
     res = prsweep.sweep_increment(conn, repo, "main", transport=t, now=OBSERVED_AT)
-    assert res.processed == 1  # PR 7 only; PR 5 (open) is skipped entirely
-    assert res.watermark == 4 == prsweep.watermark(conn)  # clamped below 5
+    assert res.processed == 1  # PR 7 only; PR 5 (open) is not merged: never a candidate
     assert row_numbers(conn) == {7}
+    assert prsweep.resume_key(conn) == (t7, 7)
+    assert prsweep.watermark(conn) == 7  # no clamp: the marker is PR 7's own tuple
 
-    # later run: PR 5 has merged — it sits above the watermark and lands
+    # later run: PR 5 has merged — its merge date is NEWER than the marker's
     land_prs(repo, [5])
     gitwalk.walk(repo, conn, "main")
     t2 = FakeTransport(
         [
-            pr(7, body="Generated with Codex.\n", head="claude/f7"),
-            pr(5, body="Generated with Codex.\n", head="claude/f5"),
+            pr(7, body="Generated with Codex.\n", head="claude/f7", merged_at=t7),
+            pr(5, body="Generated with Codex.\n", head="claude/f5", merged_at=t5),
         ]
     )
     res2 = prsweep.sweep_increment(conn, repo, "main", transport=t2, now=OBSERVED_AT)
-    assert res2.processed == 2  # 5 then 7, oldest first (7 replaced, not duplicated)
+    assert res2.processed == 1  # PR 5 exactly: PR 7 sits below the marker
     assert row_numbers(conn) == {5, 7}
-    assert prsweep.watermark(conn) == 7
+    assert prsweep.resume_key(conn) == (t5, 5)
+    assert prsweep.watermark(conn) == 5  # the number column: the marker PR's number
     assert_no_duplicate_rows(conn)
 
 
-def test_closed_unmerged_pr_numbers_are_passed_not_clamped(tmp_path, repo):
-    # only STILL-OPEN numbers clamp: a closed-unmerged PR can never merge
-    # later, so the watermark passes its number freely
+def test_equal_merge_dates_tie_break_by_pr_number(tmp_path, repo):
+    # deterministic tie handling: same merge date, ordered and resumed by
+    # PR number ascending — "equal merged_at + higher number than the last
+    # incorporated PR counts as newer", one increment at a time
+    conn, _ = primed_db(tmp_path, repo, [7, 8, 9])
+    t = "2026-10-25T12:00:00+00:00"
+    rows = [
+        pr(n, body="Generated with Codex.\n", head=f"claude/f{n}", merged_at=t) for n in (9, 8, 7)
+    ]
+    seen = []
+    for _ in range(3):
+        res = prsweep.sweep_increment(
+            conn, repo, "main", transport=FakeTransport(rows), now=OBSERVED_AT, max_prs=1
+        )
+        assert res.processed == 1
+        seen.append(prsweep.resume_key(conn)[1])
+    assert seen == [7, 8, 9]  # tie order: lowest number first, each the next candidate
+
+    res = prsweep.sweep_increment(
+        conn, repo, "main", transport=FakeTransport(rows), now=OBSERVED_AT, max_prs=1
+    )
+    assert res.processed == 0  # nothing is newer than (t, 9)
+    assert prsweep.resume_key(conn) == (t, 9)
+    assert row_numbers(conn) == {7, 8, 9}
+    assert_no_duplicate_rows(conn)
+
+
+def test_interrupted_run_resumes_by_merge_date_with_zero_skips(tmp_path, repo, monkeypatch):
+    # merge-date order is NOT number order here: #3 merged first, then #2,
+    # then #1 — the marker tracks merge dates, so interruption and resume
+    # follow that order and skip nothing
+    conn, _ = primed_db(tmp_path, repo, [1, 2, 3])
+    t1, t2, t3 = (
+        "2026-10-25T12:00:00+00:00",
+        "2026-10-23T12:00:00+00:00",
+        "2026-10-21T12:00:00+00:00",
+    )
+    rows = [
+        pr(3, body="Generated with Codex.\n", head="claude/f3", merged_at=t3),
+        pr(2, body="Generated with Codex.\n", head="claude/f2", merged_at=t2),
+        pr(1, body="Generated with Codex.\n", head="claude/f1", merged_at=t1),
+    ]
+    orig = prsweep.fetch_head_ref
+
+    def interrupting(r, n):
+        if n == 1:  # the third PR in merge-date order: dies mid-flight
+            raise KeyboardInterrupt
+        return orig(r, n)
+
+    monkeypatch.setattr(prsweep, "fetch_head_ref", interrupting)
+    res = prsweep.sweep_increment(
+        conn, repo, "main", transport=FakeTransport(rows), now=OBSERVED_AT
+    )
+    assert res.stop == STOP_INTERRUPTED  # clean stop, never a failure
+    assert res.processed == 2  # merge-date order: #3 (10-21) then #2 (10-23)
+    assert row_numbers(conn) == {2, 3}
+    assert prsweep.resume_key(conn) == (t2, 2)  # the contiguous date-ordered prefix
+
+    monkeypatch.setattr(prsweep, "fetch_head_ref", orig)
+    res2 = prsweep.sweep_increment(
+        conn, repo, "main", transport=FakeTransport(rows), now=OBSERVED_AT
+    )
+    assert res2.stop is None and res2.processed == 1  # #1 exactly: skipping nothing
+    assert row_numbers(conn) == {1, 2, 3}
+    assert prsweep.resume_key(conn) == (t1, 1)
+    assert_no_duplicate_rows(conn)
+
+
+def test_closed_unmerged_prs_are_never_candidates(tmp_path, repo):
+    # a closed-unmerged PR can never merge later, so it is never a candidate
+    # and the marker passes its number when the next PR incorporates (the
+    # number-key clamp of the review wave is gone — merge dates subsume it)
     conn, _ = primed_db(tmp_path, repo, [2])
     t = FakeTransport(
         [
@@ -250,6 +330,31 @@ def test_closed_unmerged_pr_numbers_are_passed_not_clamped(tmp_path, repo):
     res = prsweep.sweep_increment(conn, repo, "main", transport=t, now=OBSERVED_AT)
     assert res.processed == 1
     assert res.watermark == 2 == prsweep.watermark(conn)  # past closed PR 1
+
+
+# ---------------------------------------------------------------------------
+# a migrated number-key marker (no merge date) re-examines everything
+# ---------------------------------------------------------------------------
+
+
+def test_a_null_merge_date_marker_re_examines_every_merged_pr(tmp_path, repo):
+    # a step-6-era marker claims a number but NO merge date: it cannot vouch
+    # for any date, so every merged PR is a candidate (oldest first;
+    # replace-not-duplicate keeps the redo clean) — completeness over the
+    # number key's convenience
+    conn, _ = primed_db(tmp_path, repo, [1, 2, 3])
+    conn.execute(
+        "INSERT INTO pr_watermark (repo_id, last_pr_number, last_merged_at)"
+        " VALUES ((SELECT id FROM repositories ORDER BY id LIMIT 1), 2, NULL)"
+    )
+    conn.commit()
+    res = prsweep.sweep_increment(
+        conn, repo, "main", transport=FakeTransport(pr_list([1, 2, 3])), now=OBSERVED_AT
+    )
+    assert res.processed == 3  # nothing is skipped under an unknown date
+    assert row_numbers(conn) == {1, 2, 3}
+    assert prsweep.resume_key(conn)[0] is not None  # the marker carries a date again
+    assert_no_duplicate_rows(conn)
 
 
 # ---------------------------------------------------------------------------

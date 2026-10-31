@@ -40,32 +40,44 @@ observations and never re-derived.
    whenever the mode is on. A passthrough input `pr-backfill: full` (the
    `workflow_dispatch` caller shape) runs an explicit full-history sweep
    reusing the same watermark.
-2. **Watermark-driven per-increment runs.** The Watermark is the last
-   *incorporated* PR number, recorded in the Artifact next to the evidence
-   rows (the `pr_watermark` table, schema step 6) and surviving partial
-   recompute and gather exactly
-   as they do. Runs walk merged PRs above the Watermark **oldest first**
-   (ascending PR number — numbers are total and append-only; merge dates
-   reorder), and the Watermark advances **after each PR's evidence is
-   recorded** (rows + watermark in one per-PR transaction), never per page:
+2. **Watermark-driven per-increment runs.** The resume marker is the
+   `(merged_at, number)` tuple of the last *incorporated* PR, recorded in
+   the Artifact next to the evidence rows (the `pr_watermark` table:
+   `last_merged_at` + `last_pr_number`, schema step 7) and surviving
+   partial recompute and gather exactly
+   as they do. Runs process merged PRs whose tuple is newer than the
+   marker **oldest first by merge date** (ties broken by PR number
+   ascending, deterministic — an equal date with a higher number counts as
+   newer), and the marker advances **after each PR's evidence is
+   recorded** (rows + marker in one per-PR transaction), never per page:
    every interruption leaves a contiguous processed prefix, and resume
-   starts at the first PR above the Watermark — zero skipped PRs, redoing at
-   worst the single interrupted PR (its rows are replaced, never extended).
-   Closed-unmerged PRs and PRs merged into another base branch are never
-   incorporated and never advance the Watermark. Stop conditions — rate
+   starts at the first PR past the marker — zero skipped PRs, redoing at
+   worst the single interrupted PR (its rows are replaced, never
+   extended). *Rationale (the 2026-10-30 user ruling, superseding ticket
+   #36's letter):* the PR number stays the per-row key and the
+   `--after-pr` bounded face's bound, but it cannot be the RESUME point —
+   a still-open lower number sat below the number watermark forever,
+   losing out-of-order merges. The ruling prefers completeness over the
+   number's append-only convenience. Two consequences: the increment's
+   listing window is complete (the page walk descends to the end of the
+   list — no date-based early stop is sound, since an older-numbered PR
+   can merge later), and a migrated number-key marker (a NULL merge date)
+   claims no date, so every merged PR is re-examined. Closed-unmerged PRs
+   and PRs merged into another base branch are never incorporated and
+   never advance the marker. Stop conditions — rate
    limit exhaustion, the per-run processing cap, interruption — end a run
    cleanly with a visible notice, never a failure exit; the next run
    resumes automatically. The **full-history sweep** (explicit operator
-   invocation) is the same oldest-first walk merely continued past the
-   Watermark bound to the beginning of the numbering (or a stop condition),
-   sharing the Watermark: later push runs continue after it.
+   invocation) is the same merge-date walk merely continued past the
+   number bound to the beginning of the numbering (or a stop condition),
+   sharing the marker: later push runs continue after it.
 3. **PR listing and head-ref retrieval.** One `GET
    /repos/{owner}/{repo}/pulls?state=all&per_page=100` per 100 PRs,
-   ascending processing order, keeping merged ones only — mergedness is the
+   keeping merged ones only — mergedness is the
    wire's `merged_at` timestamp-or-null (`merged: true` in prose is the
-   intent, never the wire format) (closed-unmerged PRs are listed and
-   skipped; still-open PR numbers clamp the Watermark below them, so an
-   out-of-order merge stays above it). Bodies, titles and
+   intent, never the wire format) (closed-unmerged and still-open PRs are
+   listed and skipped — an open PR that merges later is picked up then,
+   its merge date newer than the marker's). Bodies, titles and
    authors come from the LIST response: ZERO per-PR API calls and no
    commit-list endpoints anywhere — a 10k-PR repo costs ~100 requests
    against the `pull-requests: read` budget. `refs/pull/N/head` is fetched

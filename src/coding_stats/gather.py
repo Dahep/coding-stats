@@ -393,11 +393,13 @@ def _upsert(conn: sqlite3.Connection, item: _Ingest) -> None:
     for r in src.execute(
         "SELECT * FROM pr_watermark ORDER BY repo_id"
     ):
-        # the Watermark is recorded state like the evidence rows: it rides
-        # the union per repo and is replaced wholesale on re-ingest
+        # the resume marker is recorded state like the evidence rows: it
+        # rides the union per repo (merge date and PR number together) and
+        # is replaced wholesale on re-ingest
         conn.execute(
-            "INSERT INTO pr_watermark (repo_id, last_pr_number) VALUES (?, ?)",
-            (repo_id, r["last_pr_number"]),
+            "INSERT INTO pr_watermark (repo_id, last_pr_number, last_merged_at)"
+            " VALUES (?, ?, ?)",
+            (repo_id, r["last_pr_number"], r["last_merged_at"]),
         )
     for r in src.execute("SELECT * FROM commits_features ORDER BY commit_id, feature_id"):
         conn.execute(

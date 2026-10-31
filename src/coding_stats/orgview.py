@@ -200,12 +200,14 @@ def _copy_verdicts(
 
 def _copy_watermarks(conn: sqlite3.Connection, out: sqlite3.Connection) -> None:
     """The recorded watermarks ride the projection per repository too
-    (ticket #36): run state recorded like the evidence rows, copied
-    verbatim — never derived here."""
+    (ticket #36): run state recorded like the evidence rows — the resume
+    marker's merge date and PR number together — copied verbatim, never
+    derived here."""
     for r in conn.execute("SELECT * FROM pr_watermark ORDER BY repo_id"):
         out.execute(
-            "INSERT INTO pr_watermark (repo_id, last_pr_number) VALUES (?, ?)",
-            (r["repo_id"], r["last_pr_number"]),
+            "INSERT INTO pr_watermark (repo_id, last_pr_number, last_merged_at)"
+            " VALUES (?, ?, ?)",
+            (r["repo_id"], r["last_pr_number"], r["last_merged_at"]),
         )
 
 

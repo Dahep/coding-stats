@@ -586,6 +586,27 @@ def _step_6(conn: sqlite3.Connection) -> None:
     )
 
 
+def _step_7(conn: sqlite3.Connection) -> None:
+    """PR sweep watermark re-keyed by merge date (the 2026-10-30 user
+    ruling; ADR-0007 clause 2).
+
+    ``pr_watermark`` gains ``last_merged_at`` — the merge date of the last
+    incorporated PR. The resume marker is the tuple ``(last_merged_at,
+    last_pr_number)`` of that PR: out-of-order merges are never lost under
+    it (the PR-number key of step 6 dropped a still-open lower number below
+    the watermark forever). Extend, never migrate-shed: the existing column
+    stays (the PR number remains the per-row key and the ``--after-pr``
+    bounded face's bound). A step-6 row migrates with ``last_merged_at``
+    NULL — a marker that claims no merge date, so the next increment
+    re-examines every merged PR (completeness over the number key's
+    convenience). The column is added defensively: an Artifact restored at
+    its completed shape already carries it (artifact shape completion runs
+    before this step would)."""
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(pr_watermark)")}
+    if "last_merged_at" not in cols:
+        conn.execute("ALTER TABLE pr_watermark ADD COLUMN last_merged_at TEXT")
+
+
 SCHEMA_STEPS: list[Step] = [
     STEP_0_SQL,  # 0: initial schema
     _step_1,  # 1: repository identity, repo-scoped commits, prefixed feature ids
@@ -594,4 +615,5 @@ SCHEMA_STEPS: list[Step] = [
     _step_4,  # 4: AI attribution verdict + evidence rows — ADR-0007 baseline
     _step_5,  # 5: PR-channel evidence rows — ADR-0007 clauses 3-5 (ticket #35)
     _step_6,  # 6: PR sweep watermark — ADR-0007 clause 2 (ticket #36)
+    _step_7,  # 7: PR sweep watermark re-keyed by merge date (2026-10-30 ruling)
 ]
