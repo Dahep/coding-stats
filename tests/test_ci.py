@@ -292,6 +292,53 @@ def test_ci_init_validates_branch_ref_name(repo):
     assert on["push"]["branches"] == ["feature;id"]
 
 
+# ------------------------------------------ detect-pr mode (ticket #37) ---
+
+
+def test_render_workflow_off_case_asks_no_pull_requests():
+    """The off render is byte-identical to today's: no detect-pr input, no
+    `pull-requests` permission anywhere — the git-only guarantee."""
+    import yaml
+
+    text = ci.render_workflow("main")
+    assert "pull-requests" not in text
+    assert "detect-pr" not in text
+    doc = yaml.safe_load(text)
+    update = doc["jobs"]["update"]
+    assert update["permissions"] == {"contents": "write"}  # unchanged
+    (step,) = [s for s in update["steps"] if s.get("uses") == "Dahep/coding-stats@v1"]
+    assert set(step["with"]) == {"opencode-api-key", "openrouter-api-key"}
+
+
+def test_render_workflow_detect_pr_adds_input_and_pull_requests_read():
+    import yaml
+
+    text = ci.render_workflow("main", detect_pr=True)
+    doc = yaml.safe_load(text)
+    update = doc["jobs"]["update"]
+    assert update["permissions"] == {"contents": "write", "pull-requests": "read"}
+    (step,) = [s for s in update["steps"] if s.get("uses") == "Dahep/coding-stats@v1"]
+    assert step["with"]["detect-pr"] == "true"
+    # the mode touches only the update job: the report job's permissions and
+    # the trigger stay exactly as rendered off
+    assert doc["jobs"]["report"]["permissions"] == {
+        "contents": "read",
+        "pages": "write",
+        "id-token": "write",
+    }
+    on = doc.get("on", doc.get(True))
+    assert on["push"]["branches"] == ["main"]
+
+
+def test_ci_init_detect_pr_renders_the_opt_in_and_still_refuses_drift(repo):
+    ci.init(repo, "main", detect_pr=True)
+    wf = repo / ".github" / "workflows" / "coding-stats.yml"
+    assert wf.read_text(encoding="utf-8") == ci.render_workflow("main", detect_pr=True)
+    # flipping the mode between renders is drift like any other hand edit
+    with pytest.raises(ci.DriftError, match="--upgrade"):
+        ci.init(repo, "main")
+
+
 def test_ci_land_parents_previous_data_tip_and_survives_target_movement(repo, tmp_path):
     """A second landing parents on the previous Data tip; a Target branch
     that moved on in between does NOT abandon — the Data tip alone judges

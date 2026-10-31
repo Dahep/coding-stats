@@ -24,6 +24,8 @@ INPUTS = {
     "no-classify",
     "no-detect",
     "no-lineage",
+    "detect-pr",
+    "pr-backfill",
 }
 
 
@@ -53,6 +55,10 @@ def test_declared_inputs_outputs_and_composite_shape():
         assert inputs[flag]["default"] == "false"  # boolean pass-through flags
     for key in ("opencode-api-key", "openrouter-api-key"):
         assert inputs[key]["default"] == ""  # optional: no key is not an error
+    # the PR tier is opt-in: detect-pr ships OFF (the git-only default) and
+    # the backfill passthrough ships empty (no sweep)
+    assert inputs["detect-pr"]["default"] == "false"
+    assert inputs["pr-backfill"]["default"] == ""
     assert set(ACTION["outputs"]) == {"data-branch"}
     assert ACTION["outputs"]["data-branch"]["value"] == "${{ steps.land.outputs.data-branch }}"
 
@@ -62,6 +68,30 @@ def test_trim_flags_pass_through_to_update():
     for flag in ("--no-classify", "--no-detect", "--no-lineage"):
         assert flag in update
     assert "flags" in update  # flags travel as words, built from env only
+
+
+def test_detect_pr_and_pr_backfill_pass_through_to_update():
+    """The PR tier reaches the engine exactly like the trim flags: words
+    built from env, gated on the env value — `detect-pr: "true"` and a
+    non-empty `pr-backfill` are the only triggers."""
+    (update,) = _runs_matching("coding-stats update --db")
+    assert 'if [ "$CODING_STATS_DETECT_PR" = "true" ]; then flags+=(--detect-pr); fi' in update
+    assert 'if [ -n "$CODING_STATS_PR_BACKFILL" ]; then' in update
+    assert '--pr-backfill "$CODING_STATS_PR_BACKFILL"' in update
+    assert "--detect-pr" in update
+
+
+def test_pr_tier_env_reaches_the_update_step():
+    (step,) = [s for s in _steps() if "coding-stats update --db" in s.get("run", "")]
+    env = step.get("env", {})
+    assert env["CODING_STATS_DETECT_PR"] == "${{ inputs.detect-pr }}"
+    assert env["CODING_STATS_PR_BACKFILL"] == "${{ inputs.pr-backfill }}"
+    # the PR-tier list API authenticates with the run's own token (env
+    # mapping position — never interpolated into a run line, never a PAT) —
+    # and only WHEN the PR tier is on: off mode receives no token at all
+    assert env["GITHUB_TOKEN"] == (
+        "${{ (inputs.detect-pr == 'true' || inputs.pr-backfill != '') && github.token || '' }}"
+    )
 
 
 # ---------------------------------------- engine from the action checkout ---
@@ -103,11 +133,17 @@ def test_parameters_reach_shell_steps_through_env_only():
             assert step.get("shell") == "bash"  # composite steps name a shell
 
 
-def test_caller_needs_only_contents_write():
+def test_caller_needs_only_contents_write_unless_the_pr_tier_is_on():
     assert set(ACTION) <= {"name", "description", "inputs", "outputs", "runs", "branding"}
-    assert "contents: write" in ACTION_TEXT  # documented: the only permission
-    for extra in ("pages: write", "id-token: write", "pull-requests", "packages:"):
+    assert "contents: write" in ACTION_TEXT  # documented: the default's only permission
+    for extra in ("pages: write", "id-token: write", "packages:"):
         assert extra not in ACTION_TEXT
+    # `pull-requests: read` exists ONLY as the detect-pr opt-in scope: every
+    # line naming it also names detect-pr (the off default is git-only)
+    assert "pull-requests: read" in ACTION_TEXT
+    for line in ACTION_TEXT.splitlines():
+        if "pull-requests" in line:
+            assert "detect-pr" in line, line
     # evaluated lines reference no secrets: the two LLM keys arrive as inputs
     # (a header comment may show the caller mapping one — comments evaluate
     # to nothing)

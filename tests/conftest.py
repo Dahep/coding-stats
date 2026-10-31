@@ -11,11 +11,14 @@ History (chronological, all on main):
   c8 "whitespace"    a.txt adds trailing newline only   -> cleanup (no deleted lines)
 """
 
+import re
+import sqlite3
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from coding_stats import cli, gitwalk
 from coding_stats.classify import create_feature
 from coding_stats.db import connect
 from coding_stats.identity import register_repository
@@ -87,6 +90,160 @@ def with_remote(repo: Path, bare) -> None:
     run(repo, "remote", "add", "origin", bare)
     run(repo, "push", "-q", "-u", "origin", "main")
     subprocess.run(["git", "-C", bare, "symbolic-ref", "HEAD", "refs/heads/main"], check=True)
+
+
+# ---------------------------------------------------------------------------
+# PR-tier shared helpers (the zero-network API/git fixture layer of the
+# prsweep suites) and the squash-PR sweep builders shared by the watermark
+# suites — named helpers here so every suite builds the same fixtures
+# ---------------------------------------------------------------------------
+
+TRAILER_VALUE = "Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+TRAILER_LINE = f"Co-authored-by: {TRAILER_VALUE}"
+OBSERVED_AT = "2026-10-30T00:00:00+00:00"
+
+
+def pr(number, **kw):
+    """One PR as the LIST endpoint returns it (the Pull Request Simple
+    schema's fields the sweep reads). The wire shape is the real one: mergedness
+    is the ``merged_at`` timestamp-or-null — there is NO ``merged`` boolean on
+    the wire (``merged: true`` in GitHub's docs and ticket bodies is the intent,
+    not the wire format). ``merge_commit_sha`` is the landing sha the
+    walk-coverage check reads; ``merged_at`` doubles as the resume marker's
+    merge date (``merged_at=`` overrides it per row)."""
+    merged = kw.get("merged", kw.get("state", "closed") != "open")
+    return {
+        "number": number,
+        "title": kw.get("title", f"PR {number}"),
+        "body": kw.get("body", ""),
+        "state": kw.get("state", "closed"),
+        "merged_at": kw.get("merged_at", "2026-10-29T12:00:00+00:00") if merged else None,
+        "merge_commit_sha": kw.get("merge_commit_sha"),
+        "user": {"login": kw.get("login", "daniel"), "type": kw.get("utype", "User")},
+        "head": {"ref": kw.get("head", "feature/x")},
+        "base": {"ref": kw.get("base", "main")},
+    }
+
+
+class FakeTransport:
+    """Injected API transport: serves list pages, counts every request."""
+
+    def __init__(self, pulls):
+        self.pulls = pulls  # in API order (descending number)
+        self.urls = []
+
+    def __call__(self, url):
+        self.urls.append(url)
+        m = re.search(r"[?&]page=(\d+)", url)
+        page = int(m.group(1)) if m else 1
+        start = (page - 1) * 100
+        return self.pulls[start : start + 100]
+
+
+def githubize(conn):
+    """Register a GitHub identity for the DB's repo (the API side derives
+    owner/name from the repositories row's clone URL)."""
+    conn.execute(
+        "UPDATE repositories SET clone_url = 'https://github.com/dahep/coding-stats',"
+        " repo_key = 'https://github.com/dahep/coding-stats@main'"
+    )
+    conn.commit()
+
+
+def push_head_ref(repo, sha, n):
+    """The GitHub-side PR head ref, on the bare 'origin' remote."""
+    run(repo, "push", "-q", "origin", f"{sha}:refs/pull/{n}/head")
+
+
+def start_remote(tmp_path, repo):
+    """Initial commit plus a bare 'origin' remote (PR head refs live there)."""
+    commit_files(repo, "init", {"a.txt": "a\n"})
+    with_remote(repo, bare_remote(tmp_path))
+
+
+def pr_rows(conn, pr_number=None):
+    out = []
+    sql = (
+        "SELECT c.sha, e.pr_number, e.rule, e.raw, e.verdict, e.channel, e.observed_at,"
+        " e.suspicious, e.harness, e.model FROM pr_evidence e"
+        " LEFT JOIN commits c ON c.id = e.commit_id"
+    )
+    args: tuple = ()
+    if pr_number is not None:
+        sql += " WHERE e.pr_number = ?"
+        args = (pr_number,)
+    sql += " ORDER BY e.pr_number, e.rule, e.raw"
+    for r in conn.execute(sql, args):
+        out.append(tuple(r))
+    return out
+
+
+def rows_at(conn, sha):
+    return {
+        (r["rule"], r["raw"], r["verdict"], r["channel"], r["suspicious"])
+        for r in conn.execute(
+            "SELECT e.rule, e.raw, e.verdict, e.channel, e.suspicious FROM pr_evidence e"
+            " JOIN commits c ON c.id = e.commit_id WHERE c.sha = ?",
+            (sha,),
+        )
+    }
+
+
+def commit_id(conn, sha):
+    return int(conn.execute("SELECT id FROM commits WHERE sha = ?", (sha,)).fetchone()["id"])
+
+
+def land_squash_prs(repo, numbers):
+    """One squash-merged PR per number, oldest first: a trailer-carrying
+    head pushed to refs/pull/N/head (then the branch deleted), then the
+    ``(#n)`` landing on main (the same patch — the head-parentage check
+    passes)."""
+    shas = {}
+    for n in numbers:
+        run(repo, "checkout", "-b", f"claude/f{n}")
+        h = commit_files(repo, f"feat: core {n}\n\n{TRAILER_LINE}\n", {f"f{n}.txt": f"{n}\n"})
+        push_head_ref(repo, h, n)
+        run(repo, "checkout", "main")
+        run(repo, "branch", "-D", f"claude/f{n}")
+        shas[n] = commit_files(repo, f"feat: work {n} (#{n})", {f"f{n}.txt": f"{n}\n"})
+    return shas
+
+
+def pr_list_rows(*numbers):
+    """The list endpoint's rows for the given PR numbers (API order:
+    descending number), every PR carrying a body signal and an agent-prefixed
+    head ref so each one records at least one evidence row."""
+    return [
+        pr(n, body="Generated with Codex.\n", head=f"claude/f{n}")
+        for n in sorted(numbers, reverse=True)
+    ]
+
+
+def primed_sweep_db(tmp_path, repo, numbers):
+    """Landed squash PRs + a walked, GitHub-identified DB (the sweep's
+    pre-state): 1 remote fetch per PR, list pages served by the injected
+    transport."""
+    start_remote(tmp_path, repo)
+    shas = land_squash_prs(repo, numbers)
+    conn = make_db(tmp_path / "w.db", repo)
+    gitwalk.walk(repo, conn, "main")
+    githubize(conn)
+    return conn, shas
+
+
+def cli_sweep_db(tmp_path, repo, numbers):
+    """A CLI working DB over landed squash PRs (init + walk, identified as
+    a GitHub repo) — the pr-sweep CLI faces' pre-state."""
+    start_remote(tmp_path, repo)
+    land_squash_prs(repo, numbers)
+    db = tmp_path / "cli.db"
+    cli.main(["init", str(repo), "--db", str(db)])
+    cli.main(["walk", "--db", str(db)])
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    githubize(conn)
+    conn.close()
+    return db
 
 
 @pytest.fixture()

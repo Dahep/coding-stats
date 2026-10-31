@@ -3,17 +3,46 @@
 import sqlite3
 from pathlib import Path
 
-from .metrics import feature_repos, repo_count, snapshot
+from .aiattr import DISCLOSURE_LINE, channel_label
+from .metrics import attribution_summary, feature_repos, repo_count, snapshot
 
 
 def text_report(conn: sqlite3.Connection, top: int = 15) -> str:
     snap = snapshot(conn, top=top)
+    attr = attribution_summary(conn)
     multi = repo_count(conn) > 1
     repos = feature_repos(conn) if multi else {}
     lines = [
         "=" * 60,
         f"Walk {snap.total_commits} commits on Target branch",
         f"Verdicts: {snap.verdict_counts}",
+        (
+            "AI attribution (lower bounds): "
+            f"yes {attr.verdict_counts.get('yes', 0)}, "
+            f"possible {attr.verdict_counts.get('possible', 0)}, "
+            f"no-evidence {attr.verdict_counts.get('no-evidence', 0)}"
+        ),
+        *(
+            [
+                "  channels: "
+                + ", ".join(
+                    f"{channel_label(c)} {n}" for c, n in sorted(attr.channel_counts.items())
+                )
+            ]
+            if attr.channel_counts
+            else []
+        ),
+        *(
+            [f"  harnesses: {', '.join(f'{h} {n}' for h, n in attr.harness_counts)}"]
+            if attr.harness_counts
+            else []
+        ),
+        *(
+            [f"  models: {', '.join(f'{m} {n}' for m, n in attr.model_counts)}"]
+            if attr.model_counts
+            else []
+        ),
+        *([DISCLOSURE_LINE] if attr.github_sourced else []),
         f"Features: {snap.total_features}",
         f"Fixes:    {snap.total_fixes}",
         f"Features / year: {snap.features_per_year:.1f}",

@@ -9,10 +9,19 @@ import html
 import json
 import sqlite3
 import subprocess
+from collections.abc import Callable
 from datetime import date
 from pathlib import Path
 
+from .aiattr import DISCLOSURE_LINE, channel_label
 from .metrics import (
+    ModelTrendPoint,
+    attribution_by_feature,
+    attribution_by_model,
+    attribution_by_repo,
+    attribution_rows,
+    attribution_summary,
+    attribution_trend,
     feature_ranking,
     feature_repos,
     features_timeline,
@@ -647,6 +656,215 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
         conn, int(unattr_raw) if unattr_raw is not None else None, complete
     )
 
+    # ------------------------------------------------ AI attribution ----
+    attr = attribution_summary(conn)
+    attr_rows = attribution_rows(conn)
+    attr_donut = _donut(
+        [
+            ("yes", attr.verdict_counts.get("yes", 0), C["cumulative"]),
+            ("possible", attr.verdict_counts.get("possible", 0), C["churn"]),
+            ("no-evidence", attr.verdict_counts.get("no-evidence", 0), C["muted"]),
+        ]
+    )
+
+    def sha_link(sha: str) -> str:
+        return (
+            f'<a href="{html.escape(fallback_url, quote=True)}/commit/{sha}">{sha[:7]}</a>'
+            if fallback_url
+            else _esc(sha[:7])
+        )
+
+    attr_trs = []
+    for r in attr_rows:
+        ev = "".join(
+            f"<div><code>{_esc(rule)}</code> {_esc(raw)}"
+            f" <span class='muted'>{_esc(verdict)}</span></div>"
+            for rule, raw, verdict in r.evidence
+        )
+        attr_trs.append(
+            f"<tr><td>{sha_link(r.sha)}</td><td>{_esc(r.verdict)}</td>"
+            f"<td>{_esc(r.harness or '—')}</td><td>{_esc(r.model or '—')}</td>"
+            f"<td>{_esc(channel_label(r.channel))}</td><td>{ev}</td></tr>"
+        )
+    attr_table = (
+        "<table><thead><tr><th>Commit</th><th>Verdict</th><th>Harness</th>"
+        "<th>Model</th><th>Channel</th><th>Evidence (rule · raw matched string)</th>"
+        "</tr></thead><tbody>"
+        + "".join(attr_trs)
+        + "</tbody></table>"
+        if attr_trs
+        else "<div class='note'>no attributed commits in this walk</div>"
+    )
+    harness_note = (
+        " Harnesses seen: "
+        + " · ".join(f"{_esc(h)} {n}" for h, n in attr.harness_counts)
+        + "."
+        if attr.harness_counts
+        else ""
+    )
+    model_note = (
+        " Models seen (where known): "
+        + " · ".join(f"{_esc(m)} {n}" for m, n in attr.model_counts)
+        + "."
+        if attr.model_counts
+        else ""
+    )
+    channel_note = (
+        "<div class='note'>Channel breakdown: "
+        + " · ".join(
+            f"{_esc(channel_label(ch))} {n}" for ch, n in sorted(attr.channel_counts.items())
+        )
+        + ".</div>"
+        if attr.channel_counts
+        else ""
+    )
+    disclosure = (
+        f"<div class='note'>{DISCLOSURE_LINE}.</div>"  # the rendered note's trailing period
+        if attr.github_sourced
+        else ""
+    )
+    repo_share_rows = "".join(
+        f"<tr><td>{_esc(a.slug)}</td><td class='num'>{a.commits}</td>"
+        f"<td class='num'>{a.yes}</td><td class='num'>{a.possible}</td>"
+        f"<td class='num'>{a.no_evidence}</td>"
+        f"<td class='num'>{100.0 * a.ai_share:.0f}%</td></tr>"
+        for a in attribution_by_repo(conn)
+    )
+    feature_share_rows = "".join(
+        f"<tr><td>#{_esc(f.fid)} {_esc(f.title)}</td><td class='num'>{f.commits}</td>"
+        f"<td class='num'>{f.yes}</td><td class='num'>{f.possible}</td>"
+        f"<td class='num'>{f.no_evidence}</td>"
+        f"<td class='num'>{100.0 * f.ai_share:.0f}%</td></tr>"
+        for f in attribution_by_feature(conn)
+    )
+    share_cols = (
+        "<th class='num'>Commits</th><th class='num'>yes</th>"
+        "<th class='num'>possible</th><th class='num'>no-evidence</th>"
+        "<th class='num'>AI share</th>"
+    )
+    share_tables = (
+        (
+            "<h2 style='margin-top:18px;font-size:14px'>AI share per repository"
+            " (lower bound)</h2>"
+            f"<table><thead><tr><th>Repo</th>{share_cols}</tr></thead><tbody>"
+            + repo_share_rows
+            + "</tbody></table>"
+            "<h2 style='margin-top:18px;font-size:14px'>AI share per feature"
+            " (lower bound)</h2>"
+            f"<table><thead><tr><th>Feature</th>{share_cols}</tr></thead><tbody>"
+            + feature_share_rows
+            + "</tbody></table>"
+        )
+        # org mode only: the single-repo report keeps zero visual diff
+        if multi and (repo_share_rows or feature_share_rows)
+        else ""
+    )
+    model_rows = attribution_by_model(conn)
+    trend = attribution_trend(conn)
+    months = sorted({p.month for pts in trend.values() for p in pts})
+
+    def _series_for(
+        pick: Callable[[ModelTrendPoint], int],
+        key_fn: Callable[[str], str],
+        colors: list[str],
+    ) -> list[tuple[str, list[float | None], str]]:
+        out: list[tuple[str, list[float | None], str]] = []
+        for k, pts in sorted(trend.items()):
+            vals: list[float | None] = [float(pick(p)) for p in pts]
+            if any(v is not None and v > 0 for v in vals):
+                out.append((key_fn(k), vals, colors[len(out) % len(colors)]))
+        return out
+
+    _trend_colors = ["#7aa2f7", "#9ece6a", "#f7768e", "#e0af68", "#73daca", "#ff9e64"]
+
+    def _trend_chart(
+        symbol: str, unit: str, pick: Callable[[ModelTrendPoint], int]
+    ) -> str:
+        series = _series_for(pick, lambda k: k, _trend_colors)
+        if not series:
+            return ""
+        total_vals: list[float | None] = [
+            float(sum(v for s in series if (v := s[1][i]) is not None))
+            if any(s[1][i] is not None for s in series)
+            else None
+            for i in range(len(months))
+        ]
+        return (
+            f"<h2 style='margin-top:18px;font-size:14px'>{_esc(symbol)}"
+            f" (lower bounds)</h2>"
+            + _lines_chart(
+                months,
+                series,
+                (f"total {unit}", total_vals, C["cumulative"]),
+            )
+        )
+
+    model_trend_charts = "".join(
+        (
+            _trend_chart(
+                "Features discovered per month by attributed model",
+                "features",
+                lambda p: p.features,
+            ),
+            _trend_chart(
+                "Churn carried per month by attributed model",
+                "churned lines",
+                lambda p: p.churn,
+            ),
+            _trend_chart(
+                "Fixes landing per month by attributed model",
+                "fixes reaching the model's features",
+                lambda p: p.fixes,
+            ),
+        )
+    )
+    model_metric_rows = "".join(
+        f"<tr><td>{_esc(m.harness)}</td><td>{_esc(m.model or '&mdash;')}</td>"
+        f"<td class='num'>{m.commits}</td><td class='num'>{m.features}</td>"
+        f"<td class='num'>{m.churn}</td><td class='num'>{m.fixes}</td>"
+        f"<td class='num'>{m.fixes_per_feature:.1f}</td></tr>"
+        for m in model_rows
+    )
+    model_metric_tables = (
+        "<h2 style='margin-top:18px;font-size:14px'>Features, churn and fixes"
+        " per AI model (lower bounds)</h2>"
+        "<div class='note'>Per attributed model: the model's yes-attributed"
+        " commits, the features they define, the churn their diffs carry and"
+        " the fix commits reaching those features — each counted once per"
+        " model it reaches. Every cell is a lower bound from recorded"
+        " evidence, never normalized upward.</div>"
+        "<table><thead><tr><th>Harness</th><th>Model</th>"
+        "<th class='num'>yes-commits</th><th class='num'>Features</th>"
+        "<th class='num'>Churn (lines)</th><th class='num'>Fixes</th>"
+        "<th class='num'>Fixes/feature</th></tr></thead><tbody>"
+        + model_metric_rows
+        + "</tbody></table>"
+        if model_metric_rows
+        else ""
+    )
+    attr_section = f"""<section>
+<h2>AI attribution (lower bounds)</h2>
+<div class="note">Per-commit attribution computed from git data (commit
+trailers, raw identity strings before any mailmap resolution, body
+signatures and tool trailers — plus merge-subject branch prefixes as weak
+<code>possible</code> signals) and from GitHub-sourced PR-channel evidence
+where the PR tier has run. <code>no-evidence</code> means no attribution
+signal matched the commit: an absence of evidence, never a statement about
+authorship. Every attribution is auditable through its evidence rows
+(rule id + the raw matched string). Every number here is a lower bound:
+shares are counted over walked commits and never normalized upward to PR
+counts. A commit reached through several branches keeps one attribution,
+resolved by channel precedence (git-only evidence outranks inherited
+PR-channel evidence).{harness_note}{model_note}</div>
+{disclosure}
+{channel_note}
+{attr_donut}
+{attr_table}
+{share_tables}
+{model_metric_tables}
+{model_trend_charts}
+</section>"""
+
     churn_rows = [
         f"<tr><td class='num'>{i}</td><td>#{fid} {_esc(title)}</td>"
         + (f"<td>{_esc(repos.get(fid, ''))}</td>" if multi else "")
@@ -711,6 +929,8 @@ per feature it reaches. The table covers all {len(ranking)} features.</div>
 {hbars_fixes}
 {rank_table}
 </section>
+
+{attr_section}
 
 {live_section}
 

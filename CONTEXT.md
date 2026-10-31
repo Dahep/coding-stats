@@ -26,6 +26,18 @@ The mapping of a commit onto a Feature: directly (the commit defines the feature
 The single LLM-assigned class of a commit: Feature, Fix, Refactor, Revert, or Cleanup. Blame evidence feeds it, but exactly one verdict drives which metrics count the commit.
 _Avoid_: commit type, category
 
+**AI attribution**:
+The per-commit attribution state of a Target-branch commit, computed from git data alone: `yes` (a signature rule matched), `possible` (weak signal only), or `no-evidence` (nothing matched — absence of a signal, never a claim about authorship). Matched on the raw identity strings, before any mailmap resolution.
+_Avoid_: human commit, AI commit
+
+**Attribution evidence**:
+One auditable match behind an AI attribution: rule id plus the raw matched string (and its tier), stored per commit and carried in the Artifact. The git-channel rows are pure functions of the Target branch: re-derived deterministically, never hand-edited.
+_Avoid_: signal, hint
+
+**PR-channel evidence**:
+Attribution evidence recorded from merged PRs (PR body footers, PR author identity, head branch names, and head-commit messages read via `refs/pull/N/head`) and attached at the landed Target-branch sha. Recorded once per (PR, commit, rule), never re-derived; channel `pr` — inherited, and outranked by git-only evidence on the same commit. Evidence whose head ref failed its parentage check is recorded as suspicious evidence: audit only, never attribution.
+_Avoid_: PR signal
+
 **Refactor**:
 A Commit verdict for a change that restructures existing Feature lines without defect repair intent.
 _Avoid_: clean-up, rewrite

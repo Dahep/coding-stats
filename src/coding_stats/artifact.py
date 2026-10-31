@@ -140,6 +140,74 @@ _TABLES: tuple[_Table, ...] = (
         {"run_id": None},  # run provenance is machine-local
     ),
     _Table(
+        "ai_attribution",
+        """CREATE TABLE ai_attribution (
+               commit_id INTEGER PRIMARY KEY,
+               verdict TEXT NOT NULL CHECK (verdict IN ('yes', 'possible', 'no-evidence')),
+               harness TEXT,
+               model TEXT
+           );""",
+        ("commit_id", "verdict", "harness", "model"),
+        "SELECT commit_id, verdict, harness, model FROM ai_attribution ORDER BY commit_id",
+    ),
+    _Table(
+        "ai_evidence",
+        """CREATE TABLE ai_evidence (
+               commit_id INTEGER NOT NULL,
+               rule TEXT NOT NULL,
+               raw TEXT NOT NULL,
+               verdict TEXT NOT NULL CHECK (verdict IN ('yes', 'possible')),
+               PRIMARY KEY (commit_id, rule, raw)
+           );""",
+        ("commit_id", "rule", "raw", "verdict"),
+        "SELECT commit_id, rule, raw, verdict FROM ai_evidence"
+        " ORDER BY commit_id, rule, raw",
+    ),
+    _Table(
+        "pr_evidence",
+        """CREATE TABLE pr_evidence (
+               repo_id INTEGER NOT NULL,
+               pr_number INTEGER NOT NULL,
+               commit_id INTEGER,
+               rule TEXT NOT NULL,
+               raw TEXT NOT NULL,
+               verdict TEXT NOT NULL CHECK (verdict IN ('yes', 'possible')),
+               harness TEXT,
+               model TEXT,
+               channel TEXT NOT NULL CHECK (channel = 'pr'),
+               observed_at TEXT NOT NULL,
+               suspicious INTEGER NOT NULL CHECK (suspicious IN (0, 1)),
+               UNIQUE (repo_id, pr_number, commit_id, rule, raw)
+           );""",
+        (
+            "repo_id",
+            "pr_number",
+            "commit_id",
+            "rule",
+            "raw",
+            "verdict",
+            "harness",
+            "model",
+            "channel",
+            "observed_at",
+            "suspicious",
+        ),
+        """SELECT repo_id, pr_number, commit_id, rule, raw, verdict, harness, model, channel,
+                  observed_at, suspicious
+           FROM pr_evidence ORDER BY repo_id, pr_number, commit_id, rule, raw""",
+    ),
+    _Table(
+        "pr_watermark",
+        """CREATE TABLE pr_watermark (
+               repo_id INTEGER NOT NULL,
+               last_pr_number INTEGER NOT NULL,
+               last_merged_at TEXT,
+               PRIMARY KEY (repo_id)
+           );""",
+        ("repo_id", "last_pr_number", "last_merged_at"),
+        "SELECT repo_id, last_pr_number, last_merged_at FROM pr_watermark ORDER BY repo_id",
+    ),
+    _Table(
         "features",
         """CREATE TABLE features (
                id TEXT NOT NULL,
@@ -391,16 +459,77 @@ def materialize(conn: sqlite3.Connection, data: bytes) -> None:
         raise MaterializeError(f"artifact refused: {exc}") from exc
     finally:
         conn.set_authorizer(None)
+    _complete_shape(conn, _schema_step_of(data))
     _check_shape(conn)
     _check_ownership(conn)
+
+
+# The tables minted AFTER the core settled (schema steps 4-6): shape
+# completion only ever fills THESE, and only for artifacts whose header
+# schema-step predates the table's own step. Core tables (repositories,
+# commits, commit_verdicts, features, ...) are NEVER resurrected — an
+# artifact missing one is refused by _check_shape.
+_COMPLETE_STEPS: dict[str, int] = {
+    "ai_attribution": 4,
+    "ai_evidence": 4,
+    "pr_evidence": 5,
+    "pr_watermark": 6,
+}
+
+# Columns minted after their table (schema step 7): a replay whose body
+# created the table at its OLDER shape gets the column added (outside the
+# guarded replay), so bodies minted before the column existed stay
+# replayable — pr_watermark's resume-marker merge date is NULL there, a
+# marker that claims no merge date. Completed only for artifacts whose
+# header stamp predates the column's step: a newer stamp carrying the old
+# shape is drift, and _check_shape refuses it.
+_COMPLETE_COLUMNS: dict[tuple[str, str], int] = {
+    ("pr_watermark", "last_merged_at"): 7,
+}
+
+
+def _schema_step_of(data: bytes) -> int:
+    """The artifact header's schema-step stamp (0 when the body carries
+    none)."""
+    m = re.search(rb"^-- schema-step: (\d+)$", data, re.M)
+    return int(m.group(1)) if m else 0
+
+
+def _complete_shape(conn: sqlite3.Connection, step: int) -> None:
+    """Bring a pre-feature artifact body up to the curated shape: of the
+    post-step-3 tables (ai_attribution, ai_evidence, pr_evidence,
+    pr_watermark), every one the replay did not create AND whose schema step
+    is NEWER than the artifact's header stamp is created EMPTY by us, outside
+    the guarded replay; likewise every column minted after its table is
+    ADDED to an old-shape table of such a body (see _COMPLETE_COLUMNS).
+    Artifacts minted before a table (or column) existed stay replayable —
+    their rows for the new table are simply absent, and pure state (AI
+    attribution) re-derives on the next walk. A mint that already claimed
+    the table's step must carry it (no completion): missing core tables are
+    never resurrected, and _check_shape refuses the artifact."""
+    for table in _TABLES:
+        at_step = _COMPLETE_STEPS.get(table.name)
+        if at_step is None or step >= at_step:
+            continue
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table.name,)
+        ).fetchone()
+        if not exists:
+            conn.execute(table.ddl)
+    for (tname, column), at_step in _COMPLETE_COLUMNS.items():
+        if step >= at_step:
+            continue
+        cols = {str(r[1]) for r in conn.execute(f"PRAGMA table_info({tname})")}
+        if cols and column not in cols:
+            # a missing table is _check_shape's refusal, not ours to fill
+            conn.execute(f"ALTER TABLE {tname} ADD COLUMN {column} TEXT")
 
 
 def stamp_schema_steps(conn: sqlite3.Connection, data: bytes) -> None:
     """Mark the artifact's schema step as applied (db.connect bookkeeping).
     Runs AFTER the guarded replay: bookkeeping tables are ours, not artifact
     data, and the authorizer denies creating them."""
-    m = re.search(rb"^-- schema-step: (\d+)$", data, re.M)
-    step = int(m.group(1)) if m else 0
+    step = _schema_step_of(data)
     for i in range(step + 1):
         conn.execute(f"CREATE TABLE IF NOT EXISTS _schema_step_{i:04d} (ok)")
     conn.commit()
@@ -471,14 +600,16 @@ def _artifact_authorizer() -> Callable[[int, str | None, str | None, str | None,
 def _check_shape(conn: sqlite3.Connection) -> None:
     """Post-replay drift guard: the replay must have created every curated
     table with exactly its curated columns (an attacker's CREATE TABLE name is
-    checked by the authorizer; its column list, here)."""
+    checked by the authorizer; its column list, here). Positional reads: the
+    guards run on whatever connection the caller replays into, with no
+    row_factory requirement."""
     created = {
         str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
     for name, cols in KNOWN_TABLES.items():
         if name not in created:
             raise MaterializeError(f"artifact refused: missing table {name}")
-        actual = [str(r["name"]) for r in conn.execute(f"PRAGMA table_info({name})")]
+        actual = [str(r[1]) for r in conn.execute(f"PRAGMA table_info({name})")]
         if actual != list(cols):
             raise MaterializeError(
                 f"artifact refused: table {name} has columns {actual}, expected {list(cols)}"
@@ -495,7 +626,7 @@ def _check_ownership(conn: sqlite3.Connection) -> None:
         raise MaterializeError(
             f"artifact refused: {len(repos)} repositories rows (expected exactly 1)"
         )
-    rid = int(repos[0]["id"])
+    rid = int(repos[0][0])
     in_commits = "(SELECT id FROM commits)"
     in_features = "(SELECT id FROM features)"
     foreign = [
@@ -504,6 +635,23 @@ def _check_ownership(conn: sqlite3.Connection) -> None:
         (
             "commit_verdicts",
             f"SELECT COUNT(*) c FROM commit_verdicts WHERE commit_id NOT IN {in_commits}",
+        ),
+        (
+            "ai_attribution",
+            f"SELECT COUNT(*) c FROM ai_attribution WHERE commit_id NOT IN {in_commits}",
+        ),
+        (
+            "ai_evidence",
+            f"SELECT COUNT(*) c FROM ai_evidence WHERE commit_id NOT IN {in_commits}",
+        ),
+        (
+            "pr_evidence",
+            f"SELECT COUNT(*) c FROM pr_evidence WHERE repo_id != {rid}"
+            f" OR (commit_id IS NOT NULL AND commit_id NOT IN {in_commits})",
+        ),
+        (
+            "pr_watermark",
+            f"SELECT COUNT(*) c FROM pr_watermark WHERE repo_id != {rid}",
         ),
         (
             "commits_features",
@@ -532,7 +680,7 @@ def _check_ownership(conn: sqlite3.Connection) -> None:
         ),
     ]
     for table, sql in foreign:
-        n = int(conn.execute(sql).fetchone()["c"])
+        n = int(conn.execute(sql).fetchone()[0])
         if n:
             raise MaterializeError(
                 f"artifact refused: {table} has {n} row(s) outside the artifact's repository"

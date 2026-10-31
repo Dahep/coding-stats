@@ -34,7 +34,9 @@ See `DESIGN.md` (decisions) and `CONTEXT.md` (domain language).
    stateless and the committed artifact is the store), so a fresh DB adopts
    the checkout's git repo and seeds itself from the artifact. Classification
    is best-effort: a backlog stays visible in the final line and reprocesses
-   on a later run.
+   on a later run. One opt-in extra stage (ADR-0007 clause 1, `detect-pr`):
+   the watermark-driven PR-channel increment runs after `live-lines`, before
+   `serialize` — see "PR-channel attribution (opt-in: `detect-pr`)" below.
 7. `migrate` — two one-time moves. From the legacy `skill-stats` layout
    (ADR-0005): verifies the legacy artifact, reuses the machine-local DB
    when it corresponds (verdicts survive), relabels the repository key when
@@ -85,16 +87,18 @@ gathers every Data branch and publishes to
 ```sh
 uv sync
 uv run coding-stats init ~/dotfiles --db ~/.coding-stats/coding-stats.db
-uv run coding-stats update  --db ~/.coding-stats/coding-stats.db   # verify->walk->seed->classify->...->serialize
+uv run coding-stats update  --db ~/.coding-stats/coding-stats.db [--detect-pr]  # verify->walk->seed->classify->...->serialize
 uv run coding-stats report  --db ~/.coding-stats/coding-stats.db --json --charts [--html out.html]
-uv run coding-stats ci init [--branch main] [--no-report] [--upgrade]  # in the target repo
+uv run coding-stats ci init [--branch main] [--no-report] [--detect-pr] [--upgrade]  # in the target repo
 uv run coding-stats ci land --branch main                              # landing verb
+uv run coding-stats pr-sweep --db db [--full | --after-pr N] [--max-prs K]  # PR-channel plumbing face
 uv run coding-stats migrate . --data-branch     # ADR-0003 store -> the Data branch
 uv run coding-stats gather --db union.db ~/dotfiles ~/.config-repo     # union of artifacts
 ```
 
-The plumbing verbs (`walk`, `classify`, `detect`, `lineage`) remain available
-as stage subcommands of `update` for development and debugging.
+The plumbing verbs (`walk`, `classify`, `detect`, `lineage`, `pr-sweep`)
+remain available as stage subcommands of `update` for development and
+debugging.
 
 ## Adopting in CI
 
@@ -142,6 +146,87 @@ DB with `include-db: true`), and deploys to Pages only with `deploy-pages:
 true` — then the report job carries `pages: write` / `id-token: write`, and
 the update job never does. A `push` trigger on `coding-stats/**` never
 fires: pushes made with `GITHUB_TOKEN` do not start workflows.
+
+## PR-channel attribution (opt-in: `detect-pr`)
+
+The git-only guarantee is the default: with `detect-pr` off (the default)
+the run is byte-identical to the pipeline table above — no PR API access,
+no `pull-requests: read`, nothing GitHub-sourced. Turning the input on adds
+the PR tier (ADR-0007): a watermark-driven increment that reconstructs
+attribution the Target-branch walk alone cannot see (PR body footers, bot
+authors, head branch names recovered from `refs/pull/N/head`). Detection
+only — never an LLM call, classification cost unchanged.
+
+```yaml
+    permissions:
+      contents: write
+      pull-requests: read   # detect-pr mode only: the PR list API
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: Dahep/coding-stats@v1
+        with:
+          opencode-api-key: ${{ secrets.OPENCODE_API_KEY }}
+          detect-pr: "true"
+```
+
+`coding-stats ci init --detect-pr` renders exactly this workflow (input and
+permission come together); flipping the input on in an already-rendered
+workflow is a drift edit like any other.
+
+- **Increment semantics** — after the deterministic stages and before the
+  artifact is serialized (so the evidence rows and the watermark ride the
+  Artifact to the Data branch), the run records the merged PRs newer than
+  the resume marker — the last incorporated PR's merge date
+  (`pr_watermark`: `last_merged_at` + `last_pr_number`): oldest first by
+  merge date (ties by PR number), a few (cap 25) per push run, the marker
+  advancing after each PR's evidence is recorded. Later runs resume at the
+  first PR past the marker — zero skipped PRs (a lower-numbered PR that
+  merges later has a newer merge date and is picked up then);
+  closed-unmerged and other-base PRs never move it. Rate-limit exhaustion,
+  the run cap, or an interruption end the run with a `::notice::`, never a
+  failure: the next run resumes.
+- **Permissions** — `pull-requests: read` ONLY when `detect-pr: true`; the
+  off default requests nothing beyond `contents: write`, and the update
+  step's `GITHUB_TOKEN` env is scoped the same way: the run's token reaches
+  the engine only when the PR tier is on (`detect-pr: true` or a
+  `pr-backfill`) — the off default passes no token at all.
+- **Private repos, no PAT** — head refs `refs/pull/N/head` fetch over the
+  authenticated git transport, never the REST API: `git fetch` rides the
+  `http.https://github.com/.extraheader` AUTHORIZATION config that
+  `actions/checkout` persists in the checkout's git config (the run's own
+  `GITHUB_TOKEN`). Deleted squash branches therefore recover head-ref
+  evidence in CI with the checkout token alone. With
+  `persist-credentials: false`, set the same config yourself before the
+  action runs:
+  `git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"`.
+- **Disclosure** — whenever the mode is on, the run prints
+  `GitHub-sourced (PR-channel) evidence present`; the Artifact carries the
+  evidence rows and the watermark, and report/Pages output renders the same
+  line wherever PR-channel rows contribute.
+- **Full-history backfill** — the `pr-backfill: full` passthrough re-sweeps
+  the whole PR numbering (same merge-date machinery, sharing the same
+  marker — later push runs continue after it), for explicit
+  `workflow_dispatch` callers:
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      pr-backfill:
+        description: "full = re-sweep the entire PR history"
+        default: ""
+jobs:
+  update:
+    # ... as above, with both inputs passed through:
+    #   detect-pr: "true"
+    #   pr-backfill: ${{ inputs.pr-backfill }}
+```
+
+Spec: [ADR-0007](docs/adr/0007-pr-channel-attribution.md); the detection
+rules themselves: [the commit-attribution
+research](docs/commit-attribution-research.md).
 
 ## Releases
 

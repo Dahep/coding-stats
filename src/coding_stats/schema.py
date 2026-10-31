@@ -15,17 +15,25 @@ from . import gitwalk, identity
 Step = str | Callable[[sqlite3.Connection], None]
 
 
-STEP_0_SQL = """
+RUNS_DDL = """CREATE TABLE IF NOT EXISTS runs (
+    id INTEGER PRIMARY KEY,
+    config_json TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    notes TEXT
+)"""
+"""The machine-local run journal. ADR-0006 keeps ``runs`` out of the
+artifact (recorded state only), yet every working DB shape references it
+(``features.created_run_id REFERENCES runs(id)``) — a seeded or migrated DB
+that carries the markers but not this table fails its next
+``features`` DML under FK enforcement. ``db.connect`` re-creates it
+whenever the step markers happened without the DDL."""
+
+STEP_0_SQL = f"""
     PRAGMA journal_mode = WAL;
     PRAGMA foreign_keys = ON;
 
-    CREATE TABLE runs (
-        id INTEGER PRIMARY KEY,
-        config_json TEXT NOT NULL,
-        started_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        notes TEXT
-    );
+    {RUNS_DDL};
 
     -- settings as JSON key/value
     CREATE TABLE settings (
@@ -506,9 +514,114 @@ def _step_3(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX idx_fixes_features_feature ON fixes_features(feature_id)")
 
 
+def _step_4(conn: sqlite3.Connection) -> None:
+    """AI attribution state (ADR-0007 baseline tier, ticket #34).
+
+    Per-commit git-only attribution verdict (yes / possible / no-evidence —
+    the states of CONTEXT.md "AI attribution") plus its auditable evidence
+    rows. Both are pure functions of the Target branch's commit objects:
+    the walk records them per commit and re-derives any missing rows on the
+    next walk (a restored pre-feature artifact carries none), so they ride
+    the Artifact like every other recorded state. ``IF NOT EXISTS`` because
+    artifact.materialize completes a pre-feature artifact's missing known
+    tables before this step runs on the replayed DB."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS ai_attribution (
+               commit_id INTEGER PRIMARY KEY REFERENCES commits(id),
+               verdict TEXT NOT NULL CHECK (verdict IN ('yes', 'possible', 'no-evidence')),
+               harness TEXT,
+               model TEXT
+           )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS ai_evidence (
+               commit_id INTEGER NOT NULL REFERENCES commits(id),
+               rule TEXT NOT NULL,
+               raw TEXT NOT NULL,
+               verdict TEXT NOT NULL CHECK (verdict IN ('yes', 'possible')),
+               PRIMARY KEY (commit_id, rule, raw)
+           )"""
+    )
+
+
+def _step_5(conn: sqlite3.Connection) -> None:
+    """PR-channel evidence rows (ADR-0007 clauses 3-5, ticket #35).
+
+    The channel-pr tier's RECORDED observations — PR number, rule id, raw
+    matched string, the tier, the identity the raw names, ``observed_at`` and
+    channel — attached at the mapped landed sha. Unlike ``ai_evidence`` these
+    are never re-derived by recompute (they read GitHub data and PR head
+    refs, not just the Target branch); a re-run replaces one PR's rows
+    wholesale via (repo_id, pr_number). ``commit_id`` is NULL exactly for
+    suspicious rows — the head-parentage check failed — which are audit
+    records and never attribution. ``repo_id`` scopes rows whose commit is
+    NULL (suspicious) in multi-repo unions. ``IF NOT EXISTS`` for the same
+    replay reason as step 4."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS pr_evidence (
+               repo_id INTEGER NOT NULL REFERENCES repositories(id),
+               pr_number INTEGER NOT NULL,
+               commit_id INTEGER REFERENCES commits(id),
+               rule TEXT NOT NULL,
+               raw TEXT NOT NULL,
+               verdict TEXT NOT NULL CHECK (verdict IN ('yes', 'possible')),
+               harness TEXT,
+               model TEXT,
+               channel TEXT NOT NULL CHECK (channel = 'pr'),
+               observed_at TEXT NOT NULL,
+               suspicious INTEGER NOT NULL CHECK (suspicious IN (0, 1)),
+               UNIQUE (repo_id, pr_number, commit_id, rule, raw)
+           )"""
+    )
+
+
+def _step_6(conn: sqlite3.Connection) -> None:
+    """PR sweep watermark (ADR-0007 clause 2, ticket #36).
+
+    The Watermark — the last incorporated PR number of the PR-channel sweep
+    — recorded state exactly like the ``pr_evidence`` rows it guards: it
+    rides the Artifact, survives partial recompute and gather unchanged, and
+    is never re-derived. One row per repository; the run machinery advances
+    it after each PR's evidence is recorded (rows + watermark, one
+    transaction), so every interruption leaves a contiguous processed
+    prefix. ``IF NOT EXISTS`` for the same replay reason as steps 4-5."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS pr_watermark (
+               repo_id INTEGER NOT NULL REFERENCES repositories(id),
+               last_pr_number INTEGER NOT NULL,
+               PRIMARY KEY (repo_id)
+           )"""
+    )
+
+
+def _step_7(conn: sqlite3.Connection) -> None:
+    """PR sweep watermark re-keyed by merge date (the 2026-10-30 user
+    ruling; ADR-0007 clause 2).
+
+    ``pr_watermark`` gains ``last_merged_at`` — the merge date of the last
+    incorporated PR. The resume marker is the tuple ``(last_merged_at,
+    last_pr_number)`` of that PR: out-of-order merges are never lost under
+    it (the PR-number key of step 6 dropped a still-open lower number below
+    the watermark forever). Extend, never migrate-shed: the existing column
+    stays (the PR number remains the per-row key and the ``--after-pr``
+    bounded face's bound). A step-6 row migrates with ``last_merged_at``
+    NULL — a marker that claims no merge date, so the next increment
+    re-examines every merged PR (completeness over the number key's
+    convenience). The column is added defensively: an Artifact restored at
+    its completed shape already carries it (artifact shape completion runs
+    before this step would)."""
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(pr_watermark)")}
+    if "last_merged_at" not in cols:
+        conn.execute("ALTER TABLE pr_watermark ADD COLUMN last_merged_at TEXT")
+
+
 SCHEMA_STEPS: list[Step] = [
     STEP_0_SQL,  # 0: initial schema
     _step_1,  # 1: repository identity, repo-scoped commits, prefixed feature ids
     _step_2,  # 2: features.live_lines + feature_line_samples (Sample rows)
     _step_3,  # 3: union-wide feature key (repository, id) — ADR-0006 clause 4
+    _step_4,  # 4: AI attribution verdict + evidence rows — ADR-0007 baseline
+    _step_5,  # 5: PR-channel evidence rows — ADR-0007 clauses 3-5 (ticket #35)
+    _step_6,  # 6: PR sweep watermark — ADR-0007 clause 2 (ticket #36)
+    _step_7,  # 7: PR sweep watermark re-keyed by merge date (2026-10-30 ruling)
 ]

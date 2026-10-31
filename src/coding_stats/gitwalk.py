@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import cast
 
-from . import identity
+from . import aiattr, identity
 
 STORE_DIR_NAME = ".coding-stats"
 # Pre-rename artifacts committed in git history (`.skill-stats/`) stay excluded
@@ -206,7 +206,17 @@ def _parents(repo: Path, sha: str) -> int:
 
 def patch_id_for(repo: Path, sha: str) -> str | None:
     """git patch-id of the stable diff. Returns None if diff is empty."""
-    diff = diff_for(repo, sha)
+    return _patch_id_of_diff(repo, diff_for(repo, sha))
+
+
+def patch_id_for_range(repo: Path, base: str, tip: str) -> str | None:
+    """git patch-id of the aggregate diff base..tip (None when empty) — the
+    squash-plausibility check of ticket #35: a squash landing carries the
+    whole head range's patch."""
+    return _patch_id_of_diff(repo, _git(repo, "diff", f"{base}..{tip}"))
+
+
+def _patch_id_of_diff(repo: Path, diff: str) -> str | None:
     if not diff.strip():
         return None
     p = subprocess.run(
@@ -221,8 +231,58 @@ def patch_id_for(repo: Path, sha: str) -> str | None:
     return token[0] if token else None
 
 
+def list_range(repo: Path, base: str, tip: str) -> list[str]:
+    """Chronological shas of base..tip (oldest first) — the commits a PR
+    head adds (ticket #35: head-chain detection)."""
+    out = _git(repo, "rev-list", "--reverse", f"{base}..{tip}")
+    return [s for s in out.splitlines() if s]
+
+
+def merge_base(repo: Path, a: str, b: str) -> str | None:
+    """The merge base of two revs; None when histories do not connect."""
+    p = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", a, b],
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode != 0:
+        return None
+    sha = p.stdout.strip()
+    return sha or None
+
+
 def tree_sha(repo: Path, sha: str) -> str:
     return _git(repo, "rev-parse", f"{sha}^{{tree}}").strip()
+
+
+def commit_facts(repo: Path, sha: str) -> aiattr.CommitFacts:
+    """The RAW identity strings (lowercase git placeholders: pre-mailmap)
+    plus message text the attribution rule table reads (ticket #34)."""
+    raw = _git(repo, "show", "-s", "--format=%an%x1f%ae%x1f%cn%x1f%ce%x1f%s%x1f%B", sha)
+    an, ae, cn, ce, subject, body = raw.split("\x1f", 5)
+    return aiattr.CommitFacts(
+        author_name=an,
+        author_email=ae,
+        committer_name=cn,
+        committer_email=ce,
+        title=subject.strip(),
+        message=body.strip(),
+    )
+
+
+def backfill_attribution(conn: sqlite3.Connection, repo: Path) -> int:
+    """Re-derive AI attribution rows for walked commits that carry none
+    (restored artifacts minted before the detector, or a wiped table): the
+    rows are pure functions of the commit objects, so re-derivation is
+    deterministic. Returns the number of commits filled."""
+    rows = conn.execute(
+        """SELECT c.id, c.sha FROM commits c
+           LEFT JOIN ai_attribution a ON a.commit_id = c.id
+           WHERE a.commit_id IS NULL ORDER BY c.walk_index"""
+    ).fetchall()
+    for r in rows:
+        aiattr.record(conn, int(r["id"]), commit_facts(repo, str(r["sha"])))
+    return len(rows)
 
 
 def author_and_time(repo: Path, sha: str) -> tuple[str, str]:
@@ -321,4 +381,8 @@ def walk(repo: Path, conn: sqlite3.Connection, branch: str | None = None) -> int
                 ),
             )
             added += 1
+        # AI attribution (ticket #34): recorded per walked commit, and any
+        # row left missing (a restored pre-feature artifact) is re-derived
+        # from the same commit objects — deterministic, git-only
+        backfill_attribution(conn, repo)
     return added

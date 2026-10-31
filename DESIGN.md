@@ -45,6 +45,84 @@ matplotlib scripts over SQL queries. Build git-only phase first.
 - **User metrics**: dropped for now (single human, 5 author-strings). Author
 - normalization is out of scope.
 
+## AI attribution (ADR-0007 baseline tier, ticket #34)
+
+- **Detector**: git-only, per walked commit, on the RAW identity strings
+  (before mailmap resolution). Ranked rule table from #34: (1) Co-authored-by
+  trailer, email-keyed known agent identity; (2) author/committer email —
+  known agent domain or GitHub bot noreply (numeric-prefix aware); (3) name
+  suffixes ((aider), [bot], Cursor Agent); (4) body signatures; (5) tool
+  trailers (Assisted-by / Generated-by / Agent-Logs-Url / Claude-Session);
+  (6) merge-subject branch prefixes (claude/, codex/) — `possible` tier at
+  most. Repo-level config artifacts (CLAUDE.md …) are repo-level facts and
+  stay out of the per-commit walk (no working-tree checks inside it).
+  GitHub squash framing matches the raw-trailer rules: trailer lines inside
+  the squash body block and the trailing summary Co-authored-by are commit
+  object text.
+- **Output**: per-commit verdict `yes` / `possible` / `no-evidence` (never
+  "human": absence of a signal is not a statement about authorship) plus
+  evidence rows (rule id + raw matched string) for audit. Harness is
+  normalized from the matched identity; the model is parsed only where the
+  harness names one (Claude, Aider; `Claude Opus 4.8 (1M context)` → `Opus
+  4.8 (1M context)`).
+- **Storage**: `ai_attribution` + `ai_evidence` ride the Artifact like all
+  recorded state (serializer + verify chain); they are pure functions of the
+  Target branch, so the walk re-derives any missing rows (restored
+  pre-feature artifacts carry none) deterministically.
+
+### PR-channel tier (ADR-0007 clauses 3-5, ticket #35)
+
+- **Sweep**: `pr-sweep` (watermark-driven increment; `--after-pr <n>` is
+  the bounded adoption face, `--full` the operator's full-history sweep)
+  reconstructs PR-side attribution. Cost discipline: one list
+  GET per 100 closed PRs (`GET /repos/{owner}/{repo}/pulls`), bodies/titles/
+  authors straight from the list response — ZERO per-PR API calls and no
+  commit-list endpoints; `refs/pull/N/head` head refs come over the git
+  protocol (zero API budget), fetched lazily only for squash/rebase PRs.
+  Closed-unmerged PRs are listed and skipped; PRs merged into another base
+  branch never belong to this Target. Processing is oldest-first by merge
+  date (ties by PR number); the resume marker is the last incorporated PR's
+  merge date (`pr_watermark.last_merged_at` + `last_pr_number`, schema step
+  7) — keyed by merge date, not PR number, so out-of-order merges are never
+  lost (2026-10-30 ruling; the PR number stays the per-row key and the
+  `--after-pr` bound). No LLM calls anywhere — the PR tier
+  is detection-only.
+- **Merge strategies** (identified from the walk, no API): squash → the
+  `(#N)` subject landing; plain merge → the MERGE_HEAD-shaped `Merge pull
+  request #N` commit, never fetched — its commits are already identical in
+  the repo, so evidence is recorded once from them (merge^1..merge^2,
+  locally), never twice; rebase → patch-id twins of the fetched head
+  commits, each head commit mapped onto its landed copy, PR-level rows
+  anchored at the head tip's twin.
+- **Detection**: head commits run through #34's rule table unchanged; the
+  PR-level signals (PR body footers, PR author bot identity, head branch
+  name prefixes) go through the same table (`aiattr.pr_matches`) — never a
+  second rule engine. Rows carry the rule id, raw matched string, tier, the
+  identity the raw names, `observed_at`, channel `pr`, and the PR number.
+- **Head-parentage check**: a fetched ref is trusted only when it plausibly
+  is the PR's merge head — the squash landing carries the head range's
+  aggregate patch-id, and every content-carrying rebase head commit maps to
+  a walked twin. A force-pushed, vanished or unmappable head records
+  SUSPICIOUS rows (no commit attached) — audit records, never attribution.
+- **Storage**: `pr_evidence` (schema step 5) rides the Artifact like every
+  recorded state and survives gather/org projection with commit-id remap.
+  Rows are RECORDED, never re-derived by recompute (they are not pure
+  functions of the Target branch). Replace-not-duplicate: a re-run replaces
+  that PR's rows wholesale, keyed by (repo_id, pr_number). `repo_id` scopes
+  suspicious rows (which carry no commit) in multi-repo unions.
+- **Channel precedence**: git-only evidence on the same commit outranks
+  inherited PR evidence. Stored: where the walk already recorded the
+  identical match at the same commit, the PR row is not stored — recorded
+  once, not twice. Consumed (`aiattr.effective_evidence` /
+  `effective_attribution` — the resolvers live in the aiattr leaf, which
+  also owns the channel constants, the disclosure line and the one verdict
+  ladder; prsweep re-exports them, and metrics resolves through aiattr
+  only): the verdict is the strongest tier of the contributing rows; the
+  identity claims (harness/model) resolve git-first, PR rows fill only what
+  the git evidence leaves silent; suspicious rows never contribute. The
+  `channel` column is the provenance the gather/report layer (ticket #38)
+  acts on.
+
 ## Artifact & multi-repo (settled grill 2, ADR-0003)
 
 - **Artifact**: each Target repo commits `.coding-stats/` — the whole
