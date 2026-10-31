@@ -28,15 +28,15 @@ def pr(number, **kw):
     is the ``merged_at`` timestamp-or-null — there is NO ``merged`` boolean on
     the wire (``merged: true`` in GitHub's docs and ticket bodies is the intent,
     not the wire format). ``merge_commit_sha`` is the landing sha the
-    walk-coverage check reads; ``state`` separates still-open PRs (the watermark
-    clamp) from closed ones."""
+    walk-coverage check reads; ``merged_at`` doubles as the resume marker's
+    merge date (``merged_at=`` overrides it per row)."""
     merged = kw.get("merged", kw.get("state", "closed") != "open")
     return {
         "number": number,
         "title": kw.get("title", f"PR {number}"),
         "body": kw.get("body", ""),
         "state": kw.get("state", "closed"),
-        "merged_at": "2026-10-29T12:00:00+00:00" if merged else None,
+        "merged_at": kw.get("merged_at", "2026-10-29T12:00:00+00:00") if merged else None,
         "merge_commit_sha": kw.get("merge_commit_sha"),
         "user": {"login": kw.get("login", "daniel"), "type": kw.get("utype", "User")},
         "head": {"ref": kw.get("head", "feature/x")},

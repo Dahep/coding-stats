@@ -201,10 +201,11 @@ _TABLES: tuple[_Table, ...] = (
         """CREATE TABLE pr_watermark (
                repo_id INTEGER NOT NULL,
                last_pr_number INTEGER NOT NULL,
+               last_merged_at TEXT,
                PRIMARY KEY (repo_id)
            );""",
-        ("repo_id", "last_pr_number"),
-        "SELECT repo_id, last_pr_number FROM pr_watermark ORDER BY repo_id",
+        ("repo_id", "last_pr_number", "last_merged_at"),
+        "SELECT repo_id, last_pr_number, last_merged_at FROM pr_watermark ORDER BY repo_id",
     ),
     _Table(
         "features",
@@ -475,6 +476,17 @@ _COMPLETE_STEPS: dict[str, int] = {
     "pr_watermark": 6,
 }
 
+# Columns minted after their table (schema step 7): a replay whose body
+# created the table at its OLDER shape gets the column added (outside the
+# guarded replay), so bodies minted before the column existed stay
+# replayable — pr_watermark's resume-marker merge date is NULL there, a
+# marker that claims no merge date. Completed only for artifacts whose
+# header stamp predates the column's step: a newer stamp carrying the old
+# shape is drift, and _check_shape refuses it.
+_COMPLETE_COLUMNS: dict[tuple[str, str], int] = {
+    ("pr_watermark", "last_merged_at"): 7,
+}
+
 
 def _schema_step_of(data: bytes) -> int:
     """The artifact header's schema-step stamp (0 when the body carries
@@ -488,11 +500,13 @@ def _complete_shape(conn: sqlite3.Connection, step: int) -> None:
     post-step-3 tables (ai_attribution, ai_evidence, pr_evidence,
     pr_watermark), every one the replay did not create AND whose schema step
     is NEWER than the artifact's header stamp is created EMPTY by us, outside
-    the guarded replay. Artifacts minted before a table existed stay
-    replayable — their rows for the new table are simply absent, and pure
-    state (AI attribution) re-derives on the next walk. A mint that already
-    claimed the table's step must carry it (no completion): missing core
-    tables are never resurrected, and _check_shape refuses the artifact."""
+    the guarded replay; likewise every column minted after its table is
+    ADDED to an old-shape table of such a body (see _COMPLETE_COLUMNS).
+    Artifacts minted before a table (or column) existed stay replayable —
+    their rows for the new table are simply absent, and pure state (AI
+    attribution) re-derives on the next walk. A mint that already claimed
+    the table's step must carry it (no completion): missing core tables are
+    never resurrected, and _check_shape refuses the artifact."""
     for table in _TABLES:
         at_step = _COMPLETE_STEPS.get(table.name)
         if at_step is None or step >= at_step:
@@ -502,6 +516,13 @@ def _complete_shape(conn: sqlite3.Connection, step: int) -> None:
         ).fetchone()
         if not exists:
             conn.execute(table.ddl)
+    for (tname, column), at_step in _COMPLETE_COLUMNS.items():
+        if step >= at_step:
+            continue
+        cols = {str(r[1]) for r in conn.execute(f"PRAGMA table_info({tname})")}
+        if cols and column not in cols:
+            # a missing table is _check_shape's refusal, not ours to fill
+            conn.execute(f"ALTER TABLE {tname} ADD COLUMN {column} TEXT")
 
 
 def stamp_schema_steps(conn: sqlite3.Connection, data: bytes) -> None:

@@ -6,15 +6,15 @@ see — PR body footers, bot authors, and head branch names recovered from
 PR head refs — and records it as evidence rows CHANNELED ``pr``, attached at
 the landed Target-branch sha. The pipeline per sweep run from a lower bound:
 
-1. **List** PRs with number > the bound via one ``GET
-   /repos/{owner}/{repo}/pulls?state=all`` per 100 PRs (ascending processing
-   order). Bodies, titles and authors come from the LIST response: ZERO
-   per-PR API calls and no commit-list endpoints anywhere — a 10k-PR repo
-   costs ~100 requests total. Mergedness is the wire's ``merged_at``
-   timestamp-or-null (there is no ``merged`` boolean on the wire); merged
-   ones are processed, closed-unmerged PRs are listed and skipped, and
-   still-open PR numbers clamp the Watermark below them (out-of-order merges:
-   the PR is above the watermark and gets processed when it merges later).
+1. **List** PRs via one ``GET /repos/{owner}/{repo}/pulls?state=all`` per
+   100 PRs (pages newest-number first). Bodies, titles and authors come
+   from the LIST response: ZERO per-PR API calls and no commit-list
+   endpoints anywhere — a 10k-PR repo costs ~100 requests total.
+   Mergedness is the wire's ``merged_at`` timestamp-or-null (there is no
+   ``merged`` boolean on the wire); merged ones are candidates, closed-
+   unmerged and still-open PRs are listed and skipped (an open PR that
+   merges later simply becomes a candidate then — its merge date is newer
+   than the marker's).
 2. **Fetch** ``refs/pull/N/head`` over the git protocol (zero API budget),
    lazily — only for squash/rebase-merged PRs whose shas were rewritten on
    the Target branch. Plain-merge PRs are skipped entirely by the fetch:
@@ -41,24 +41,39 @@ the landed Target-branch sha. The pipeline per sweep run from a lower bound:
    functions of the Target branch); a re-run replaces that PR's rows
    wholesale rather than duplicating them (``replace_pr_rows``).
 
-The run machinery (ticket #36, ADR-0007 clause 2) — Keyed by PR number,
-NEVER merge date (PR numbers are total and append-only; dates reorder):
+The run machinery (ticket #36, ADR-0007 clause 2) — keyed by MERGE DATE,
+ties by PR number (the 2026-10-30 user ruling; ticket #36's letter keyed it
+by PR number, which lost out-of-order merges — a still-open lower number
+sat below the number watermark forever):
 
-* **Watermark** = the last incorporated PR number, recorded in the Artifact
-  next to the evidence rows and surviving partial recompute and gather
-  exactly as they do (``pr_watermark``, schema step 6).
-* **Oldest-first** walk (ascending PR number) over merged PRs above the
-  watermark; the watermark advances AFTER EACH PR's evidence is recorded
-  (rows + watermark land in one per-PR transaction, ``incorporate_pr``) —
-  never per page. Every interruption leaves a contiguous processed prefix
-  and the next run resumes at the first PR above the watermark, skipping
-  nothing and redoing at worst the single interrupted PR (its rows are
-  replaced, never extended).
+* **Resume marker** = the ``(merged_at, number)`` tuple of the last
+  INCORPORATED PR, recorded in the Artifact next to the evidence rows and
+  surviving partial recompute and gather exactly as they do
+  (``pr_watermark``: ``last_merged_at`` + ``last_pr_number``, schema step
+  7). The PR number stays the per-row key and the ``--after-pr`` bounded
+  face's bound; only the RESUME point moved to merge dates — completeness
+  over the number key's append-only convenience.
+* **Oldest-first by merge date** (ascending ``(merged_at, number)``) over
+  merged PRs whose tuple is strictly newer than the marker; the marker
+  advances AFTER EACH PR's evidence is recorded (rows + marker land in one
+  per-PR transaction, ``incorporate_pr``) — never per page. Every
+  interruption leaves a contiguous processed prefix in merge-date order and
+  the next run resumes at the first PR past the marker, skipping nothing
+  and redoing at worst the single interrupted PR (its rows are replaced,
+  never extended). A merge-date tie breaks by PR number ascending
+  (deterministic); an equal date with a higher number counts as newer.
+* **Window** (the pagination rule): the increment's LIST walk descends the
+  pages to the END of the list and candidates are cut from the complete
+  window by the tuple comparison. No date-based early stop is sound on
+  number-descending pages: an older-numbered PR can merge later and sit in
+  a page below any date cutoff — exactly the out-of-order case the
+  merge-date key repairs. One request per 100 PRs; the ``--after-pr``
+  bounded faces keep their NUMBER bound as the walk stop (their bound keys
+  on ``last_pr_number``).
 * Closed-unmerged PRs and PRs merged into another base branch are never
-  incorporated and never advance the watermark: their numbers sit below
-  whatever watermark the next merged PR produces. A still-open PR number,
-  though, CLAMPS the watermark below it (out-of-order merges: the number is
-  processed once the PR merges later).
+  incorporated and never advance the marker: they can never become
+  candidates (a closed-unmerged PR never merges; an other-base PR is not
+  part of this Target).
 * **Stop conditions** end a run cleanly with a visible notice — never a
   failure exit: genuine rate-limit exhaustion (``RateLimited`` — 429, or a
   403 with the rate budget at zero; a permissions 403 is a distinct stop
@@ -67,10 +82,13 @@ NEVER merge date (PR numbers are total and append-only; dates reorder):
   (``WalkStale`` — waiting for the walk to catch up), or a transient git
   fetch failure (``FetchUnavailable``). The next run resumes automatically.
 * **Full-history sweep** (``sweep_full``, explicit operator invocation):
-  the same oldest-first walk sharing the watermark, merely walked further —
-  its listing walk continues past the watermark bound until the beginning
-  of the PR numbering (or a stop condition), re-sweeping the full history;
-  later push runs continue after the shared watermark.
+  the same merge-date walk sharing the marker, merely walked further — its
+  listing walk continues past the number bound until the beginning of the
+  PR numbering (or a stop condition), re-sweeping the full history (the
+  marker never regresses while history below it is re-recorded); later push
+  runs continue after the shared marker. A marker with a NULL merge date (a
+  migrated step-6 row) claims no date: every merged PR is a candidate and
+  the increment re-examines the history oldest-first.
 
 Channel precedence (consumption): git-only evidence on the same commit
 outranks inherited PR evidence. The storage encodes it — where the walk
@@ -135,7 +153,8 @@ class WalkStale(RuntimeError):
 class PullRequest:
     """The PR-list fields the sweep reads (one list response row — GitHub's
     Pull Request Simple schema). ``merged`` is PARSED from the wire's
-    ``merged_at`` timestamp-or-null (the wire carries no ``merged`` boolean)."""
+    ``merged_at`` timestamp-or-null (the wire carries no ``merged`` boolean);
+    the normalized ``merged_at`` is the resume marker's merge date."""
 
     number: int
     title: str
@@ -144,9 +163,12 @@ class PullRequest:
     author_is_bot: bool
     head_ref: str | None
     base_ref: str | None
-    merged: bool
-    is_open: bool  # state == "open" (the watermark clamp for out-of-order merges)
+    merged_at: str | None  # normalized ISO UTC; None = never merged
     landing_sha: str | None  # the wire's merge_commit_sha (walk-coverage check)
+
+    @property
+    def merged(self) -> bool:
+        return self.merged_at is not None
 
 
 @dataclass(frozen=True)
@@ -169,7 +191,7 @@ class SweepResult:
     rows: int
     suspicious: int
     requests: int  # API requests spent (list pages only)
-    watermark: int = 0  # the watermark after the run (last incorporated PR)
+    watermark: int = 0  # the marker's PR number after the run (audit + display)
     stop: str | None = None  # None = ran to its end; else a stop condition
 
 
@@ -215,17 +237,29 @@ def default_transport(url: str) -> Any:
         raise
 
 
+def _norm_ts(value: str) -> str:
+    """Wire timestamp -> normalized ISO UTC (second precision): the resume
+    marker's comparable form — lexicographic order equals chronological, so
+    the tuple comparison is a plain string comparison."""
+    return (
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        .astimezone(UTC)
+        .isoformat(timespec="seconds")
+    )
+
+
 def _parse_pr(item: dict[str, Any]) -> PullRequest:
     """One LIST row -> the sweep's fields. The wire format is GitHub's Pull
     Request Simple schema: mergedness is the ``merged_at`` timestamp-or-null
     (there is NO ``merged`` boolean on the wire — ``merged: true`` in docs and
     ticket bodies is the intent, not the wire format), the landing sha is
-    ``merge_commit_sha``, and ``state`` separates still-open PRs from closed
-    ones."""
+    ``merge_commit_sha``, and ``merged_at`` doubles as the resume marker's
+    merge date."""
     user = item.get("user") or {}
     head = item.get("head") or {}
     base = item.get("base") or {}
     login = user.get("login")
+    raw_merged_at = item.get("merged_at")
     return PullRequest(
         number=int(item["number"]),
         title=str(item.get("title") or ""),
@@ -234,38 +268,40 @@ def _parse_pr(item: dict[str, Any]) -> PullRequest:
         author_is_bot=user.get("type") == "Bot",
         head_ref=str(head["ref"]) if head.get("ref") else None,
         base_ref=str(base["ref"]) if base.get("ref") else None,
-        merged=item.get("merged_at") is not None,
-        is_open=item.get("state") == "open",
+        merged_at=_norm_ts(str(raw_merged_at)) if raw_merged_at else None,
         landing_sha=str(item["merge_commit_sha"]) if item.get("merge_commit_sha") else None,
     )
 
 
 @dataclass(frozen=True)
 class Listing:
-    """One LIST walk's result: the merged PRs above the bound (ascending) and
-    the watermark clamp for out-of-order merges."""
+    """One LIST walk's result: the merged PRs kept above the number bound
+    (bound 0 = the increment's complete window), ordered oldest-first by
+    (merged_at, number)."""
 
-    merged: list[PullRequest]  # number > bound, ascending, merged ones only
+    merged: list[PullRequest]
     requests: int  # API requests spent (list pages only)
-    open_floor: int | None  # lowest still-open PR number seen (None: none seen)
 
 
 def list_pulls(
     owner: str, repo: str, after: int, transport: Transport | None = None
 ) -> Listing:
-    """The LIST query (ticket #35 step 1): ``state=all``, one GET per 100 PRs
-    (ascending processing order). Bodies, titles and authors come from the
-    LIST response: ZERO per-PR API calls and no commit-list endpoints anywhere
-    — a 10k-PR repo costs ~100 requests total. Merged PRs with number >
-    ``after`` are kept (mergedness = the wire's ``merged_at``); closed-unmerged
-    PRs are listed and skipped. Still-open PR numbers are returned as
-    ``open_floor``: out-of-order merges — an open PR numbered below merged ones
-    — must stay ABOVE the watermark (it is clamped below them), or the PR is
-    lost when it merges later. Pages arrive newest-first and paging stops at
-    the bound (the numbering sequence is total and append-only)."""
+    """The LIST query (ticket #35 step 1): ``state=all``, one GET per 100
+    PRs. Bodies, titles and authors come from the LIST response: ZERO per-PR
+    API calls and no commit-list endpoints anywhere — a 10k-PR repo costs
+    ~100 requests total. Merged PRs with number > ``after`` are kept
+    (mergedness = the wire's ``merged_at``); closed-unmerged and still-open
+    PRs are listed and skipped. The kept rows come back oldest-first by
+    (merged_at, number) — the processing order of the merge-date key.
+
+    ``after`` is the NUMBER bound of the ``--after-pr`` bounded faces, and
+    the walk stops at it (the numbering sequence is total and append-only).
+    The increment face passes 0: its window is COMPLETE (the walk descends
+    to the end of the list) because no date-based stop is sound — an
+    older-numbered PR can merge later and sit in a page below any date
+    cutoff (the out-of-order case the merge-date key repairs)."""
     call = transport or default_transport
     kept: dict[int, PullRequest] = {}
-    open_floor: int | None = None
     requests = 0
     page = 1
     while True:
@@ -282,14 +318,12 @@ def list_pulls(
         for item in items:
             parsed = _parse_pr(item)
             numbers.append(parsed.number)
-            if parsed.is_open:
-                open_floor = parsed.number if open_floor is None else min(open_floor, parsed.number)
             if parsed.number > after and parsed.merged:
                 kept[parsed.number] = parsed
         if len(items) < DEFAULT_PER_PAGE or max(numbers) <= after:
             break
         page += 1
-    return Listing([kept[n] for n in sorted(kept)], requests, open_floor)
+    return Listing(sorted(kept.values(), key=lambda p: (p.merged_at or "", p.number)), requests)
 
 
 class FetchUnavailable(RuntimeError):
@@ -447,9 +481,11 @@ def effective_attribution(conn: sqlite3.Connection, commit_id: int) -> aiattr.At
 
 
 def watermark(conn: sqlite3.Connection) -> int:
-    """The Watermark: the last incorporated PR number (0 when nothing is
-    incorporated yet). Recorded state — it rides the Artifact next to the
-    evidence rows and survives partial recompute and gather unchanged."""
+    """The Watermark's PR number: the number of the last incorporated PR (0
+    when nothing is incorporated yet) — audit trail plus the ``--after-pr``
+    bounded face's contiguity check key on it. Recorded state — it rides the
+    Artifact next to the evidence rows and survives partial recompute and
+    gather unchanged. (Resume itself keys on the merge date, ``resume_key``.)"""
     row = conn.execute(
         "SELECT last_pr_number FROM pr_watermark WHERE repo_id = ?",
         (identity.repo_id_for(conn),),
@@ -457,15 +493,44 @@ def watermark(conn: sqlite3.Connection) -> int:
     return int(row["last_pr_number"]) if row is not None else 0
 
 
-def advance_watermark(conn: sqlite3.Connection, pr_number: int) -> None:
-    """Move the Watermark to ``pr_number``, monotonically (never backwards):
-    the last incorporated PR number only ever grows, so a full-history
-    sweep re-recording history below it never regresses the resume point."""
+def resume_key(conn: sqlite3.Connection) -> tuple[str | None, int]:
+    """The resume marker: the (merged_at, number) tuple of the last
+    INCORPORATED PR. A merged PR is a candidate exactly when its own tuple
+    is strictly newer — merge date first, PR number as the deterministic
+    tie break. A NULL merge date (a migrated step-6 marker) claims no date
+    and sorts below every real one: such a marker re-examines every merged
+    PR (completeness over the number key's convenience)."""
+    row = conn.execute(
+        "SELECT last_pr_number, last_merged_at FROM pr_watermark WHERE repo_id = ?",
+        (identity.repo_id_for(conn),),
+    ).fetchone()
+    if row is None:
+        return None, 0
+    merged_at = row["last_merged_at"]
+    return (str(merged_at) if merged_at is not None else None), int(row["last_pr_number"])
+
+
+def _is_newer(merged_at: str | None, number: int, marker: tuple[str | None, int]) -> bool:
+    """Whether (merged_at, number) is strictly newer than the marker tuple
+    (a NULL date sorts below every real one)."""
+    return (merged_at or "", number) > (marker[0] or "", marker[1])
+
+
+def advance_watermark(
+    conn: sqlite3.Connection, merged_at: str | None, pr_number: int
+) -> None:
+    """Move the resume marker to ``(merged_at, pr_number)`` — the two
+    columns describe ONE PR, the last incorporated one — monotonically in
+    tuple order (never backwards): a full-history sweep re-recording history
+    below the marker never regresses the resume point."""
+    if not _is_newer(merged_at, pr_number, resume_key(conn)):
+        return
     conn.execute(
-        "INSERT INTO pr_watermark (repo_id, last_pr_number) VALUES (?, ?)"
+        "INSERT INTO pr_watermark (repo_id, last_pr_number, last_merged_at) VALUES (?, ?, ?)"
         " ON CONFLICT(repo_id) DO UPDATE"
-        " SET last_pr_number = MAX(last_pr_number, excluded.last_pr_number)",
-        (identity.repo_id_for(conn), pr_number),
+        " SET last_pr_number = excluded.last_pr_number,"
+        " last_merged_at = excluded.last_merged_at",
+        (identity.repo_id_for(conn), pr_number, merged_at),
     )
 
 
@@ -476,54 +541,50 @@ def incorporate_pr(
     pr: PullRequest,
     *,
     now: str | None = None,
-    advance_to: int | None = None,
+    advance: bool = False,
 ) -> tuple[int, int]:
     """The per-PR step of the run machinery (ticket #36): record one PR's
     evidence rows (replace-not-duplicate) and — when the run may claim
-    contiguous coverage — advance the Watermark to ``advance_to`` (normally
-    the PR's number, clamped below the lowest still-open PR number when
-    out-of-order merges leave one), BOTH in one transaction. Interruption at
-    any point leaves the previously incorporated prefix intact; the
-    interrupted PR is at worst redone (replaced) by the next run. Returns
-    (stored rows, suspicious)."""
+    contiguous coverage — advance the resume marker to this PR's own
+    (merged_at, number) tuple, BOTH in one transaction. Interruption at any
+    point leaves the previously incorporated prefix intact; the interrupted
+    PR is at worst redone (replaced) by the next run. Returns (stored rows,
+    suspicious)."""
     observed_at = now or datetime.now(UTC).isoformat(timespec="seconds")
     rows = _pr_rows(conn, repo, branch, pr)
     stored = replace_pr_rows(conn, pr.number, rows, observed_at)
-    if advance_to is not None:
-        advance_watermark(conn, advance_to)
-    conn.commit()  # rows + watermark land atomically, per PR (never per page)
+    if advance:
+        advance_watermark(conn, pr.merged_at, pr.number)
+    conn.commit()  # rows + marker land atomically, per PR (never per page)
     return stored, sum(1 for r in rows if r.suspicious)
 
 
-def sweep(
+def _run(
     conn: sqlite3.Connection,
     repo: Path,
     branch: str,
-    after_pr: int,
     *,
-    transport: Transport | None = None,
-    now: str | None = None,
-    max_prs: int | None = None,
+    after_pr: int,
+    resume: bool,
+    transport: Transport | None,
+    now: str | None,
+    max_prs: int | None,
 ) -> SweepResult:
-    """One channel-pr sweep run over merged PRs with number > ``after_pr``,
-    oldest first (ticket #35's numbered behavior on #36's machinery).
-    Run after the walk: the mapping reads the walked commits, and a PR whose
-    landing is not walked yet stops the run AT that PR (``STOP_WALK_STALE`` —
-    waiting for the walk): nothing is recorded for it, the watermark never
-    claims past it, and the next run after a newer walk redoes it
-    (replace-per-PR).
-
-    The Watermark advances per incorporated PR — but only while the run
-    claims CONTIGUOUS coverage: a bound above the watermark leaves the range
-    in between unexamined, so the watermark never claims past a gap ("zero
-    skipped PRs" stays true and a later increment walks the gap). ``max_prs``
-    caps the run (a stop condition, not a failure). A rate-limit or
-    interruption during the LISTING stops the run before anything is
-    processed — a partial listing is newest-first and would leave a gap
-    below the watermark, so its PRs are never walked. Later runs resume
-    above the watermark."""
-    if after_pr < 0:
-        raise SweepError(f"--after-pr must be >= 0 (got {after_pr})")
+    """The shared run machinery. ``resume=True`` (the increment face): a
+    complete listing window (the walk descends to the end of the list — no
+    date-based early stop is sound), candidates = merged PRs whose
+    (merged_at, number) tuple is newer than the resume marker, processed
+    oldest-first by merge date (ties by PR number); the marker always
+    advances. ``resume=False`` (the bounded face): candidates = merged PRs
+    with number > ``after_pr``, the walk stops at the number bound, and the
+    marker advances only while the run claims CONTIGUOUS coverage — a bound
+    above the watermark number leaves the range in between unexamined, so
+    the marker never claims past a gap ("zero skipped PRs" stays true and a
+    later increment walks the gap). ``max_prs`` caps the run (a stop
+    condition, not a failure). A rate-limit or interruption during the
+    LISTING stops the run before anything is processed — a partial listing
+    would leave unseen PRs below the claimed marker, so its PRs are never
+    walked."""
     if not branch:
         # an empty Target branch would silently skip every PR through the
         # base-ref mismatch — error loudly instead
@@ -534,11 +595,10 @@ def sweep(
     owner, name = _github_repo(conn)
     pulls: list[PullRequest] = []
     requests = 0
-    open_floor: int | None = None
     stop: str | None = None
     try:
-        listing = list_pulls(owner, name, after_pr, transport)
-        pulls, requests, open_floor = listing.merged, listing.requests, listing.open_floor
+        listing = list_pulls(owner, name, 0 if resume else after_pr, transport)
+        pulls, requests = listing.merged, listing.requests
     except RateLimited:
         stop = STOP_RATE_LIMIT  # incomplete listing: nothing may be processed
     except urllib.error.HTTPError as exc:
@@ -548,10 +608,12 @@ def sweep(
         stop = verdict
     except KeyboardInterrupt:
         stop = STOP_INTERRUPTED
-    # contiguous coverage only: a bound above the watermark leaves a gap the
-    # watermark must never claim over (resume = first PR above it, skipping
-    # nothing)
-    can_advance = after_pr <= watermark(conn)
+    if resume:
+        marker = resume_key(conn)
+        pulls = [p for p in pulls if _is_newer(p.merged_at, p.number, marker)]
+        can_advance = True
+    else:
+        can_advance = after_pr <= watermark(conn)
     processed = rows_n = suspicious_n = 0
     if stop is None:
         try:
@@ -561,16 +623,8 @@ def sweep(
                 if max_prs is not None and processed >= max_prs:
                     stop = STOP_CAP
                     break
-                advance_to: int | None = None
-                if can_advance:
-                    # out-of-order merges: the watermark never claims past a
-                    # still-open PR number — when it merges later it must sit
-                    # above the watermark
-                    advance_to = pulled.number
-                    if open_floor is not None:
-                        advance_to = min(advance_to, open_floor - 1)
                 stored, susp = incorporate_pr(
-                    conn, repo, branch, pulled, now=now, advance_to=advance_to
+                    conn, repo, branch, pulled, now=now, advance=can_advance
                 )
                 processed += 1
                 rows_n += stored
@@ -591,6 +645,32 @@ def sweep(
     return SweepResult(processed, rows_n, suspicious_n, requests, watermark(conn), stop)
 
 
+def sweep(
+    conn: sqlite3.Connection,
+    repo: Path,
+    branch: str,
+    after_pr: int,
+    *,
+    transport: Transport | None = None,
+    now: str | None = None,
+    max_prs: int | None = None,
+) -> SweepResult:
+    """One channel-pr sweep run over merged PRs with number > ``after_pr``
+    — the ``--after-pr`` bounded face (``sweep_full`` is this at bound 0),
+    keyed by PR NUMBER: its bound is a number and the walk stops at it.
+    Run after the walk: the mapping reads the walked commits, and a PR whose
+    landing is not walked yet stops the run AT that PR (``STOP_WALK_STALE`` —
+    waiting for the walk): nothing is recorded for it, the marker never
+    claims past it, and the next run after a newer walk redoes it
+    (replace-per-PR)."""
+    if after_pr < 0:
+        raise SweepError(f"--after-pr must be >= 0 (got {after_pr})")
+    return _run(
+        conn, repo, branch, after_pr=after_pr, resume=False,
+        transport=transport, now=now, max_prs=max_prs,
+    )
+
+
 def sweep_increment(
     conn: sqlite3.Connection,
     repo: Path,
@@ -601,11 +681,13 @@ def sweep_increment(
     max_prs: int | None = DEFAULT_RUN_CAP,
 ) -> SweepResult:
     """The watermark-driven per-increment run (the push-run face): merged
-    PRs above the Watermark, oldest first, capped per run. The next run —
-    push run or full-history sweep — resumes automatically above wherever
-    this one's watermark stopped."""
-    return sweep(
-        conn, repo, branch, watermark(conn), transport=transport, now=now, max_prs=max_prs
+    PRs whose (merged_at, number) tuple is newer than the resume marker,
+    oldest first by merge date (ties by PR number), capped per run. The next
+    run — push run or full-history sweep — resumes automatically past
+    wherever this one's marker stopped."""
+    return _run(
+        conn, repo, branch, after_pr=0, resume=True,
+        transport=transport, now=now, max_prs=max_prs,
     )
 
 
@@ -619,12 +701,16 @@ def sweep_full(
     max_prs: int | None = None,
 ) -> SweepResult:
     """The full-history sweep (explicit operator invocation): the same
-    oldest-first walk sharing the Watermark, merely walked further — its
-    listing continues past the watermark bound until the beginning of the
-    PR numbering (or a stop condition), so the whole history is re-swept
-    (replace-not-duplicate keeps it clean). Later push runs continue after
-    the shared watermark."""
-    return sweep(conn, repo, branch, 0, transport=transport, now=now, max_prs=max_prs)
+    merge-date walk sharing the resume marker, merely walked further — its
+    listing continues past the number bound until the beginning of the PR
+    numbering (or a stop condition), so the whole history is re-swept
+    (replace-not-duplicate keeps it clean, and the marker never regresses
+    while history below it is re-recorded). Later push runs continue after
+    the shared marker."""
+    return _run(
+        conn, repo, branch, after_pr=0, resume=False,
+        transport=transport, now=now, max_prs=max_prs,
+    )
 
 
 def _github_repo(conn: sqlite3.Connection) -> tuple[str, str]:

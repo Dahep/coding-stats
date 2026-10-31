@@ -149,8 +149,9 @@ def main(argv: list[str] | None = None) -> None:
         "--full",
         action="store_true",
         help="full-history sweep (explicit operator invocation): re-sweep every"
-        " merged PR from the beginning of the numbering, oldest first, sharing"
-        " the watermark (later push runs continue after it)",
+        " merged PR from the beginning of the numbering, oldest first by merge"
+        " date (ties by PR number), sharing the watermark (later push runs"
+        " continue after it)",
     )
     sweep_p.add_argument(
         "--max-prs",
@@ -408,7 +409,7 @@ def _report_sweep(res: prsweep.SweepResult) -> None:
         else:
             print(
                 f"::notice::pr-sweep stopped: {notices[res.stop]}; watermark"
-                f" {res.watermark}, the next run resumes above it"
+                f" {res.watermark}, the next run resumes past it"
             )
 
 
@@ -593,14 +594,14 @@ def _run_update(
         except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as exc:
             # best-effort like classification (Q13): an unavailable PR tier
             # never fails the deterministic pipeline; the watermark is
-            # untouched and a later update resumes above it. ValueError/
+            # untouched and a later update resumes past it. ValueError/
             # KeyError cover malformed API bodies, SubprocessError covers git
             # failures. KeyboardInterrupt is deliberately NOT caught — an
             # interrupt is the sweep's own stop condition (and otherwise
             # stays the operator's).
             print(
                 f"WARNING: pr-sweep unavailable ({exc}); no PR-channel evidence"
-                " recorded this run — a later update resumes above the watermark"
+                " recorded this run — a later update resumes past the watermark"
             )
         else:
             _report_sweep(res)
