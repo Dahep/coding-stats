@@ -89,7 +89,7 @@ uv sync
 uv run coding-stats init ~/dotfiles --db ~/.coding-stats/coding-stats.db
 uv run coding-stats update  --db ~/.coding-stats/coding-stats.db [--detect-pr]  # verify->walk->seed->classify->...->serialize
 uv run coding-stats report  --db ~/.coding-stats/coding-stats.db --json --charts [--html out.html]
-uv run coding-stats ci init [--branch main] [--no-report] [--detect-pr] [--opencode-service-account ID] [--upgrade]  # in the target repo
+uv run coding-stats ci init [--branch main] [--no-report] [--detect-pr] [--upgrade]  # in the target repo
 uv run coding-stats ci land --branch main                              # landing verb
 uv run coding-stats pr-sweep --db db [--full | --after-pr N | --skip-pr N | --unskip-pr N] [--max-prs K]  # PR-channel plumbing face
 uv run coding-stats migrate . --data-branch     # ADR-0003 store -> the Data branch
@@ -130,12 +130,6 @@ jobs:
 - **The per-branch, non-cancelling concurrency group** keeps at most one
   pending run per branch; a superseded run abandons at landing (a
   `::notice::`, never a red run) and paid classification is never discarded.
-- **OpenCode console service account (no stored key)**: `coding-stats ci
-  init --opencode-service-account <client id>` renders a sign-in step that
-  exchanges the job's GitHub OIDC token for a short-lived OpenCode access
-  token (the update job gains `id-token: write`) and passes it to the action
-  instead of the `OPENCODE_API_KEY` secret. A failed sign-in still lets the
-  deterministic stages run and land, then fails the job so it is noticed.
 - **Work repos should pin the commit sha** (`uses: Dahep/coding-stats/<sha>`)
   rather than the moving `v1` tag: the update job holds `contents: write`
   and the LLM keys. Upgrades are then a one-line PR, Dependabot-manageable.
