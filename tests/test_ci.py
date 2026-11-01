@@ -363,6 +363,60 @@ def test_ci_land_parents_previous_data_tip_and_survives_target_movement(repo, tm
     assert second != first
 
 
+# This repo's OpenCode console service account (a client id, not a secret:
+# the token exchange only succeeds with this repository's GitHub OIDC token).
+DOGFOOD_SERVICE_ACCOUNT = "sk_09f4d201-fb17-43e5-bef3-d94dbd0a365c"
+
+
+# --------------------------------- OpenCode service-account sign-in mode ---
+
+
+def test_render_workflow_service_account_signs_in_and_fails_after_landing():
+    import yaml
+
+    doc = yaml.safe_load(ci.render_workflow("main", opencode_service_account="sk_abc-123"))
+    update = doc["jobs"]["update"]
+    assert update["permissions"] == {"contents": "write", "id-token": "write"}
+    names = [s.get("name") or s.get("uses") for s in update["steps"]]
+    assert names == [
+        "actions/checkout@v4",
+        "Sign in to OpenCode",
+        "Dahep/coding-stats@v1",
+        "OpenCode sign-in failed",
+    ]
+    signin, action, check = update["steps"][1:]
+    assert signin["continue-on-error"] is True  # never blocks walk/derive/landing
+    assert "client_id=sk_abc-123" in signin["run"]
+    assert "::add-mask::$token" in signin["run"]
+    assert action["with"]["opencode-api-key"] == "${{ env.OPENCODE_API_KEY }}"
+    assert "secrets.OPENCODE_API_KEY" not in yaml.safe_dump(doc)
+    assert check["if"] == "${{ steps.opencode-signin.outcome == 'failure' }}"
+    assert "exit 1" in check["run"]
+    # the report job is untouched by the mode
+    assert doc["jobs"]["report"] == yaml.safe_load(ci.render_workflow("main"))["jobs"]["report"]
+
+
+@pytest.mark.parametrize("bad", ["", "sk 1", "sk;rm -rf", "sk$(x)", "a\nb", "sk'1"])
+def test_service_account_client_id_is_validated(bad):
+    with pytest.raises(ValueError, match="client id"):
+        ci.render_workflow("main", opencode_service_account=bad)
+
+
+def test_ci_init_service_account_flag(repo, capsys, monkeypatch):
+    from coding_stats.cli import main
+
+    monkeypatch.chdir(repo)
+    main(["ci", "init", "--branch", "main", "--opencode-service-account", "sk_abc-123"])
+    wf = repo / ".github" / "workflows" / "coding-stats.yml"
+    assert wf.read_text(encoding="utf-8") == ci.render_workflow(
+        "main", opencode_service_account="sk_abc-123"
+    )
+    with pytest.raises(SystemExit, match="client id"):
+        main(
+            ["ci", "init", "--branch", "main", "--opencode-service-account", "bad id", "--upgrade"]
+        )
+
+
 def test_ci_dogfood_workflow_is_the_generated_caller_workflow():
     """This repo adopts like any other caller: the committed workflow is
     `ci init`'s render, with only this repo's per-repo opt-in (Pages)
@@ -375,7 +429,9 @@ def test_ci_dogfood_workflow_is_the_generated_caller_workflow():
     got = yaml.safe_load(committed.read_text(encoding="utf-8"))
     on = got.get("on", got.get(True))  # PyYAML 1.1 reads bare `on` as bool
     assert on["push"]["branches"] == ["main"]
-    rendered = yaml.safe_load(ci.render_workflow("main"))
+    rendered = yaml.safe_load(
+        ci.render_workflow("main", opencode_service_account=DOGFOOD_SERVICE_ACCOUNT)
+    )
     # normalize the single per-repo opt-in on BOTH sides, then compare whole
     for doc in (got, rendered):
         doc["jobs"]["report"]["steps"][-1]["with"]["deploy-pages"] = "normalized"

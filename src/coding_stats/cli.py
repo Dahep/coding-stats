@@ -120,6 +120,13 @@ def main(argv: list[str] | None = None) -> None:
         help='render the ADR-0007 clause 1 opt-in: detect-pr: "true" on the'
         " action plus pull-requests: read on the update job",
     )
+    ci_init.add_argument(
+        "--opencode-service-account",
+        default=None,
+        metavar="CLIENT_ID",
+        help="sign in with this OpenCode console service account (GitHub OIDC)"
+        " instead of the OPENCODE_API_KEY secret; adds id-token: write",
+    )
     ci_init.add_argument("--upgrade", action="store_true", help="overwrite a drifted workflow")
     ci_land = ci_sub.add_parser(
         "land", help="land the artifact-update commit (Q15/Q17/Q18 rules; usable anywhere)"
@@ -265,9 +272,10 @@ def main(argv: list[str] | None = None) -> None:
                     report=not args.no_report,
                     upgrade=args.upgrade,
                     detect_pr=args.detect_pr,
+                    opencode_service_account=args.opencode_service_account,
                 ):
                     print(msg)
-            except ci.DriftError as exc:
+            except (ci.DriftError, ValueError) as exc:
                 sys.exit(f"error: {exc}")
         else:
             try:

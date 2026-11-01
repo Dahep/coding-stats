@@ -22,6 +22,7 @@ choice)."""
 
 import difflib
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from importlib import metadata
@@ -49,7 +50,26 @@ class Landing:
     detail: str
 
 
-def render_workflow(branch: str, report: bool = True, detect_pr: bool = False) -> str:
+OPENCODE_CONSOLE_AUDIENCE = "https://opencode.ai/console"
+OPENCODE_TOKEN_URL = "https://opencode.ai/console/auth/oauth/token"
+_SERVICE_ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def validate_service_account(client_id: str) -> str:
+    """An OpenCode console service-account client id is interpolated into a
+    `run:` script, so only a plain token shape is accepted (no shell or YAML
+    metacharacters can reach the workflow)."""
+    if not _SERVICE_ACCOUNT_RE.fullmatch(client_id):
+        raise ValueError(f"invalid OpenCode service-account client id: {client_id!r}")
+    return client_id
+
+
+def render_workflow(
+    branch: str,
+    report: bool = True,
+    detect_pr: bool = False,
+    opencode_service_account: str | None = None,
+) -> str:
     """The CALLER workflow adopted in a Target repo (ADR-0006 clause 5):
     a `uses: Dahep/coding-stats@v1` update job (which lands on the Data
     branch `coding-stats/<branch>`) plus a report job triggered on the
@@ -60,7 +80,16 @@ def render_workflow(branch: str, report: bool = True, detect_pr: bool = False) -
     passes `detect-pr: "true"` to the action AND gains exactly one
     permission more — `pull-requests: read`, the PR-tier list API. The off
     render (the default) is byte-identical to the git-only workflow: no
-    detect-pr input, no pull-requests permission anywhere."""
+    detect-pr input, no pull-requests permission anywhere.
+
+    ``opencode_service_account`` (an OpenCode console service-account
+    client id) replaces the long-lived OPENCODE_API_KEY secret with a
+    short-lived token: the update job gains `id-token: write`, a sign-in
+    step exchanges the job's GitHub OIDC token for an OpenCode access token,
+    and the action reads it from the job env. A failed sign-in never blocks
+    the deterministic stages or the landing: the step continues on error,
+    the action runs without a key, and a last step fails the job so the
+    broken sign-in is visible (a rejected credential is never a green run)."""
     b = _yaml_scalar(branch)
     detect_perms = (
         "\n      pull-requests: read  # detect-pr only: the PR-tier list API" if detect_pr else ""
@@ -68,6 +97,45 @@ def render_workflow(branch: str, report: bool = True, detect_pr: bool = False) -
     detect_input = (
         '\n          detect-pr: "true"  # opt-in PR tier (ADR-0007 clause 1)' if detect_pr else ""
     )
+    if opencode_service_account is None:
+        oidc_perms = ""
+        signin_step = ""
+        opencode_key = "${{ secrets.OPENCODE_API_KEY }}"
+        signin_check = ""
+    else:
+        client_id = validate_service_account(opencode_service_account)
+        oidc_perms = "\n      id-token: write  # OpenCode service-account sign-in (GitHub OIDC)"
+        signin_step = f"""
+      # OpenCode console service account: exchange this job's GitHub OIDC
+      # token for a short-lived OpenCode access token (no stored API key).
+      - name: Sign in to OpenCode
+        id: opencode-signin
+        continue-on-error: true  # the deterministic stages still run and land
+        env:
+          AUDIENCE: {OPENCODE_CONSOLE_AUDIENCE}
+        run: |
+          oidc=$(curl -sSf --oauth2-bearer "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" \\
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" | jq -r .value)
+          token=$(curl -sSf {OPENCODE_TOKEN_URL} \\
+            -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \\
+            -d subject_token_type=urn:ietf:params:oauth:token-type:jwt \\
+            -d client_id={client_id} \\
+            -d subject_token="$oidc" | jq -r .access_token)
+          if [ -z "$token" ] || [ "$token" = "null" ]; then
+            echo "::error::OpenCode sign-in returned no access token"
+            exit 1
+          fi
+          echo "::add-mask::$token"
+          echo "OPENCODE_API_KEY=$token" >> "$GITHUB_ENV\""""
+        opencode_key = "${{ env.OPENCODE_API_KEY }}"
+        signin_check = """
+      # A failed sign-in fails the job AFTER the artifact landed.
+      - name: OpenCode sign-in failed
+        if: ${{ steps.opencode-signin.outcome == 'failure' }}
+        run: |
+          echo "::error::OpenCode service-account sign-in failed; classification was skipped"
+          exit 1"""
+    extra_perms = detect_perms + oidc_perms
     report_job = """
   # Reports render on their own cadence (the store holds only the SQL
   # artifact). This job's permissions: checkout/fetch need contents: read;
@@ -115,17 +183,17 @@ jobs:
       group: coding-${{{{ github.workflow }}}}-${{{{ github.ref_name }}}}
       cancel-in-progress: false
     permissions:
-      contents: write  # the landing commit is the only write (GITHUB_TOKEN){detect_perms}
+      contents: write  # the landing commit is the only write (GITHUB_TOKEN){extra_perms}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # walk, blame and partial recompute need full history
+          fetch-depth: 0  # walk, blame and partial recompute need full history{signin_step}
       # Work repos: pin the commit sha instead of the moving tag — this job
       # holds contents: write and LLM keys.
       - uses: Dahep/coding-stats@v1
         with:
-          opencode-api-key: ${{{{ secrets.OPENCODE_API_KEY }}}}
-          openrouter-api-key: ${{{{ secrets.OPENROUTER_API_KEY }}}}{detect_input}
+          opencode-api-key: {opencode_key}
+          openrouter-api-key: ${{{{ secrets.OPENROUTER_API_KEY }}}}{detect_input}{signin_check}
 {report_job if report else ""}"""
 
 
@@ -147,6 +215,7 @@ def init(
     report: bool = True,
     upgrade: bool = False,
     detect_pr: bool = False,
+    opencode_service_account: str | None = None,
 ) -> list[str]:
     """Write the caller workflow. Identical content is an idempotent
     assertion ('up to date'); drifted content refuses with a diff summary
@@ -154,7 +223,15 @@ def init(
     anything is written — a refusal never leaves a half-written file."""
     datastore.validate_ref(branch)
     plan = [
-        (WORKFLOW_REL, render_workflow(branch, report=report, detect_pr=detect_pr)),
+        (
+            WORKFLOW_REL,
+            render_workflow(
+                branch,
+                report=report,
+                detect_pr=detect_pr,
+                opencode_service_account=opencode_service_account,
+            ),
+        ),
     ]
     drifted = []
     for rel, content in plan:
