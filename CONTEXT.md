@@ -38,6 +38,10 @@ _Avoid_: signal, hint
 Attribution evidence recorded from merged PRs (PR body footers, PR author identity, head branch names, and head-commit messages read via `refs/pull/N/head`) and attached at the landed Target-branch sha. Recorded once per (PR, commit, rule), never re-derived; channel `pr` — inherited, and outranked by git-only evidence on the same commit. Evidence whose head ref failed its parentage check is recorded as suspicious evidence: audit only, never attribution.
 _Avoid_: PR signal
 
+**PR-channel disclosure marker**:
+The recorded marker — one row per repository — that the PR tier has run against it: recorded before a sweep lists any PRs, never removed. Reports disclose the PR channel whenever the marker exists, even when the run recorded zero non-suspicious evidence rows; Artifacts from before the marker existed disclose on their non-suspicious PR-channel evidence instead.
+_Avoid_: enabled flag, disclosure mode
+
 **Refactor**:
 A Commit verdict for a change that restructures existing Feature lines without defect repair intent.
 _Avoid_: clean-up, rewrite

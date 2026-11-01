@@ -40,9 +40,11 @@ footers, PR author identity, head branch name) through ``pr_matches``.
 
 This leaf also owns the shared resolution vocabulary: the channel
 constants, the disclosure line, and the ONE verdict ladder
-(``VERDICT_STRENGTH``/``strongest``) plus the consumption resolvers
-(``effective_evidence``/``effective_attribution``) every layer resolves
-through — pure DB readers, no git, no network.
+(``VERDICT_STRENGTH``/``strongest``) plus the canonical per-commit
+resolution (``resolve`` — ONE evidence read carrying the Attribution, the
+resolved channel and the channel-tagged rows) every layer resolves through,
+with ``effective_evidence`` as its row-level view (the summary view is
+``resolve(...).attribution``) — pure DB readers, no git, no network.
 """
 
 import re
@@ -56,8 +58,8 @@ VERDICT_NO_EVIDENCE = "no-evidence"
 
 # The canonical verdict ladder (yes > possible > no-evidence), ONE strength
 # notion for every consumer: the walk's per-commit summary (_finalize), the
-# consumption resolvers (effective_attribution) and the org projection's
-# summary merge all resolve through `strongest` below — never a second map.
+# consumption resolver (resolve) and the org projection's summary merge all
+# resolve through `strongest` below — never a second map.
 VERDICT_STRENGTH: dict[str, int] = {
     VERDICT_YES: 0,
     VERDICT_POSSIBLE: 1,
@@ -198,7 +200,11 @@ _HARNESS_ALIASES: dict[str, str] = {
 _SIGNATURES: tuple[tuple[str, str], ...] = (
     ("generated with [claude code]", "claude"),
     ("generated with codex", "codex"),
-    ("gemini cli", "gemini"),
+    # Gemini CLI signs with the Generated-with shape (bracketed link or the
+    # bare form) — a bare "gemini cli" anywhere is integration prose, never
+    # a signature
+    ("generated with [gemini cli]", "gemini"),
+    ("generated with gemini cli", "gemini"),
     ("made with cursor", "cursor"),
 )
 
@@ -455,21 +461,6 @@ def pr_matches(
     )
 
 
-def pr_attribution(
-    body: str,
-    author_login: str | None,
-    author_is_bot: bool,
-    head_branch: str | None,
-) -> Attribution:
-    """The PR-level signals' combined verdict + evidence, summarized exactly
-    like a commit's attribution (same tiers, same ranking)."""
-    hits = [
-        _Hit(Evidence(m.rule, m.raw, m.verdict), m.harness, m.model)
-        for m in pr_matches(body, author_login, author_is_bot, head_branch)
-    ]
-    return _finalize(hits)
-
-
 def record(conn: sqlite3.Connection, commit_id: int, facts: CommitFacts) -> Attribution:
     """Store one commit's attribution verdict + evidence rows (idempotent:
     re-recording replaces the commit's rows). Returns the Attribution."""
@@ -490,9 +481,10 @@ def record(conn: sqlite3.Connection, commit_id: int, facts: CommitFacts) -> Attr
 
 # --------------------------------------------------------------------------
 # consumption resolvers (channel precedence): pure DB readers — no git, no
-# network. They live in this leaf so every consumer (prsweep's callers, the
-# metrics layer, the org projection) shares ONE resolution rule; prsweep
-# re-exports them for back-compat.
+# network. They live in this leaf so every consumer (the metrics layer, the
+# org projection, prsweep's callers) shares ONE resolution rule and ONE
+# evidence read per commit: `resolve` is the canonical entry point and the
+# channel rule lives HERE, never re-typed per consumer.
 # --------------------------------------------------------------------------
 
 
@@ -519,17 +511,35 @@ def effective_evidence(conn: sqlite3.Connection, commit_id: int) -> list[tuple[s
     return out
 
 
-def effective_attribution(conn: sqlite3.Connection, commit_id: int) -> Attribution:
-    """The channel-precedence resolution of one commit (the consumption
-    side of "git-only evidence on the same commit outranks inherited PR
-    evidence"):
+@dataclass(frozen=True)
+class Resolution:
+    """One commit's canonical consumption resolution: the existing
+    Attribution plus the channel that contributed evidence (``''`` when none
+    did) and the channel-tagged contributing rows — all derived from ONE
+    ``effective_evidence`` read."""
+
+    attribution: Attribution
+    channel: str  # '' | CHANNEL_GIT | CHANNEL_PR
+    tagged: tuple[tuple[str, str, str, str], ...]  # (channel, rule, raw, verdict)
+
+
+def resolve(conn: sqlite3.Connection, commit_id: int) -> Resolution:
+    """THE per-commit resolution every consumer reads through (the
+    consumption side of "git-only evidence on the same commit outranks
+    inherited PR evidence"):
 
     * the verdict is the strongest tier of the contributing rows — a
       signature matched anywhere (git commit text or a mapped head commit)
       is still a signature match;
     * the identity claims (harness/model) resolve git-first: the walk's own
       summary, then PR rows only where the git evidence is silent;
+    * the channel is the strongest channel that contributed evidence —
+      ``git`` when the walk recorded any row, else ``pr``, else ``''`` —
+      ONE channel rule, owned here;
     * suspicious rows contribute nothing, ever.
+
+    The contributing rows are read ONCE (one ``effective_evidence`` call):
+    the resolved channel and the tagged rows derive from that same read.
     """
     evs = effective_evidence(conn, commit_id)
     rows = tuple(Evidence(rule, raw, verdict) for _, rule, raw, verdict in evs)
@@ -556,4 +566,6 @@ def effective_attribution(conn: sqlite3.Connection, commit_id: int) -> Attributi
                 model = str(r["model"])
             if harness is not None and model is not None:
                 break
-    return Attribution(verdict, harness, model, rows)
+    channels = {ch for ch, _rule, _raw, _v in evs}
+    channel = CHANNEL_GIT if CHANNEL_GIT in channels else (CHANNEL_PR if channels else "")
+    return Resolution(Attribution(verdict, harness, model, rows), channel, tuple(evs))

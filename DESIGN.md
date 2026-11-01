@@ -109,15 +109,23 @@ matplotlib scripts over SQL queries. Build git-only phase first.
   Rows are RECORDED, never re-derived by recompute (they are not pure
   functions of the Target branch). Replace-not-duplicate: a re-run replaces
   that PR's rows wholesale, keyed by (repo_id, pr_number). `repo_id` scopes
-  suspicious rows (which carry no commit) in multi-repo unions.
+  suspicious rows (which carry no commit) in multi-repo unions. The
+  disclosure marker `pr_disclosure` (schema step 8 — `repo_id` as primary
+  key, one row per repository meaning the PR tier has RUN) rides the
+  Artifact beside them as recorded state too and drives report disclosure —
+  marker OR (for pre-step-8 artifacts) non-suspicious rows — never row-only
+  disclosure.
 - **Channel precedence**: git-only evidence on the same commit outranks
   inherited PR evidence. Stored: where the walk already recorded the
   identical match at the same commit, the PR row is not stored — recorded
-  once, not twice. Consumed (`aiattr.effective_evidence` /
-  `effective_attribution` — the resolvers live in the aiattr leaf, which
-  also owns the channel constants, the disclosure line and the one verdict
-  ladder; prsweep re-exports them, and metrics resolves through aiattr
-  only): the verdict is the strongest tier of the contributing rows; the
+  once, not twice. Consumed (`aiattr.resolve` — the canonical per-commit
+  resolution carrying the attribution, the resolved channel and the
+  channel-tagged rows from ONE evidence read, with `effective_evidence` as
+  its contributing-rows view and `resolve(...).attribution` as the summary
+  — the resolvers live in the aiattr
+  leaf, which also owns the channel constants, the disclosure line and the
+  one verdict ladder; metrics resolves through aiattr once per commit):
+  the verdict is the strongest tier of the contributing rows; the
   identity claims (harness/model) resolve git-first, PR rows fill only what
   the git evidence leaves silent; suspicious rows never contribute. The
   `channel` column is the provenance the gather/report layer (ticket #38)

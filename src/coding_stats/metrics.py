@@ -3,6 +3,7 @@ and time series (features over time, 1-month-rolling fixes/feature)."""
 
 import json
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import NamedTuple
@@ -257,7 +258,7 @@ class AttributionSummary:
     harness_counts: list[tuple[str, int]]  # harness -> attributed commits
     model_counts: list[tuple[str, int]]  # model -> attributed commits (where known)
     channel_counts: dict[str, int]  # 'git'/'pr' -> commits attributed through it
-    github_sourced: bool  # contributing PR-channel evidence present (disclosure)
+    github_sourced: bool  # disclosure: the PR tier has run (marker) or legacy PR rows
     ai_share: float  # yes / walked commits — a LOWER BOUND (0.0 with no commits)
 
 
@@ -297,7 +298,6 @@ class FeatureAttribution:
 
     fid: str
     title: str
-    repo: str  # repository slug
     commits: int
     yes: int
     possible: int
@@ -306,9 +306,10 @@ class FeatureAttribution:
 
 
 @dataclass
-class _Resolved:
+class ResolvedCommit:
     """One commit's union-level attribution: the channel-precedence
-    resolution of its contributing evidence rows (aiattr.effective_*)."""
+    resolution of its contributing evidence rows (aiattr.resolve — the
+    canonical per-commit resolver)."""
 
     cid: int
     sha: str
@@ -320,54 +321,63 @@ class _Resolved:
     evidence: list[tuple[str, str, str]]
 
 
-def _resolved(conn: sqlite3.Connection) -> list[_Resolved]:
+def resolve_attribution(conn: sqlite3.Connection) -> list[ResolvedCommit]:
     """Every walked commit's attribution, resolved ONCE per commit from the
-    union of its evidence rows — the channel-precedence rule of
-    aiattr.effective_attribution reused verbatim at the union level (never
-    duplicated): the verdict is the strongest contributing tier, identity
-    claims resolve git-first, suspicious rows contribute nothing. The
-    channel is the strongest channel that contributed evidence ('git' when
-    the walk recorded any, else 'pr'); no contributing evidence reads as
-    '' and the verdict as ``no-evidence``."""
+    union of its evidence rows through aiattr's canonical per-commit resolver
+    (``aiattr.resolve`` — ONE evidence read per commit, carrying the
+    attribution, the resolved channel and the channel-tagged rows): the
+    verdict is the strongest contributing tier, identity claims resolve
+    git-first, suspicious rows contribute nothing, and the channel is the
+    resolver's ('git' when the walk recorded any row, else 'pr'; no
+    contributing evidence reads as '' and the verdict as ``no-evidence``).
+    Only the presentation dedup of the evidence rows happens here — never a
+    second resolution rule or evidence read.
+
+    The ONE resolution pass: a caller building several attribution views
+    resolves here once and hands the result back through each view's
+    ``resolved=`` parameter (computed from this same connection), so a
+    report build never re-resolves per view."""
     conn = org(conn)
-    out: list[_Resolved] = []
+    out: list[ResolvedCommit] = []
     for r in conn.execute(
         """SELECT c.id cid, c.sha sha, rp.slug slug FROM commits c
            JOIN repositories rp ON rp.id = c.repo_id
            ORDER BY c.walk_index, c.sha"""
     ):
         cid = int(r["cid"])
-        attr = aiattr.effective_attribution(conn, cid)
-        tagged = aiattr.effective_evidence(conn, cid)
+        resolved = aiattr.resolve(conn, cid)  # ONE evidence read per commit
         seen: set[tuple[str, str, str]] = set()
         evidence: list[tuple[str, str, str]] = []
-        for _ch, rule, raw, verdict in tagged:
+        for _ch, rule, raw, verdict in resolved.tagged:
             key = (rule, raw, verdict)
             if key not in seen:
                 seen.add(key)
                 evidence.append(key)
-        channels = [ch for ch, _rule, _raw, _v in tagged]
-        channel = (
-            aiattr.CHANNEL_GIT
-            if aiattr.CHANNEL_GIT in channels
-            else (aiattr.CHANNEL_PR if channels else "")
-        )
         out.append(
-            _Resolved(
-                cid, str(r["sha"]), str(r["slug"]), attr.verdict, attr.harness, attr.model,
-                channel, evidence,
+            ResolvedCommit(
+                cid,
+                str(r["sha"]),
+                str(r["slug"]),
+                resolved.attribution.verdict,
+                resolved.attribution.harness,
+                resolved.attribution.model,
+                resolved.channel,
+                evidence,
             )
         )
     return out
 
 
-def attribution_summary(conn: sqlite3.Connection) -> AttributionSummary:
+def attribution_summary(
+    conn: sqlite3.Connection, *, resolved: Sequence[ResolvedCommit] | None = None
+) -> AttributionSummary:
     """Org-level AI attribution counts (the projection dedups Shared commits
     to ONE attribution each). ``no-evidence`` is absence of a signal — never
     a claim about authorship — and every count is a lower bound over walked
-    commits, never normalized upward to PR counts."""
+    commits, never normalized upward to PR counts. ``resolved`` is a prior
+    :func:`resolve_attribution` pass over this same connection."""
     conn = org(conn)
-    rows = _resolved(conn)
+    rows = resolve_attribution(conn) if resolved is None else resolved
     verdict_counts: dict[str, int] = {}
     harness_counts: dict[str, int] = {}
     model_counts: dict[str, int] = {}
@@ -384,8 +394,15 @@ def attribution_summary(conn: sqlite3.Connection) -> AttributionSummary:
                 model_counts[r.model] = model_counts.get(r.model, 0) + 1
         if r.channel:
             channel_counts[r.channel] = channel_counts.get(r.channel, 0) + 1
+    # Disclosure (ADR-0007 clause 5): MODE state, not row state — true when
+    # the recorded marker shows the PR tier has RUN (even at zero
+    # non-suspicious rows), with the legacy fallback for pre-step-8
+    # artifacts that carry no marker: their non-suspicious PR-channel rows
+    # are the disclosure trigger. Neither marker nor such rows: no
+    # disclosure.
     github_sourced = (
-        conn.execute("SELECT 1 FROM pr_evidence WHERE suspicious = 0 LIMIT 1").fetchone()
+        conn.execute("SELECT 1 FROM pr_disclosure LIMIT 1").fetchone() is not None
+        or conn.execute("SELECT 1 FROM pr_evidence WHERE suspicious = 0 LIMIT 1").fetchone()
         is not None
     )
     return AttributionSummary(
@@ -398,12 +415,16 @@ def attribution_summary(conn: sqlite3.Connection) -> AttributionSummary:
     )
 
 
-def attribution_rows(conn: sqlite3.Connection) -> list[AttributionRow]:
+def attribution_rows(
+    conn: sqlite3.Connection, *, resolved: Sequence[ResolvedCommit] | None = None
+) -> list[AttributionRow]:
     """Attributed commits (never the no-evidence ones — they carry no
     evidence rows) in walk order, each with its channel-resolved evidence
-    rows (git channel first)."""
+    rows (git channel first). ``resolved`` is a prior
+    :func:`resolve_attribution` pass over this same connection."""
+    rows = resolve_attribution(conn) if resolved is None else resolved
     out: list[AttributionRow] = []
-    for r in _resolved(conn):
+    for r in rows:
         if r.verdict == aiattr.VERDICT_NO_EVIDENCE:
             continue
         out.append(
@@ -419,14 +440,18 @@ def attribution_rows(conn: sqlite3.Connection) -> list[AttributionRow]:
     return out
 
 
-def attribution_by_repo(conn: sqlite3.Connection) -> list[RepoAttribution]:
+def attribution_by_repo(
+    conn: sqlite3.Connection, *, resolved: Sequence[ResolvedCommit] | None = None
+) -> list[RepoAttribution]:
     """Per-repository AI-attribution state over each repo's walked commits —
     the org report's AI-share-per-repo table (a lower bound per row). A key
     whose commits all deduped under another key reads as all-zero: Shared
-    commits count ONCE, under the dedup's winner."""
+    commits count ONCE, under the dedup's winner. ``resolved`` is a prior
+    :func:`resolve_attribution` pass over this same connection."""
     conn = org(conn)
-    by_slug: dict[str, list[_Resolved]] = {}
-    for r in _resolved(conn):
+    rows = resolve_attribution(conn) if resolved is None else resolved
+    by_slug: dict[str, list[ResolvedCommit]] = {}
+    for r in rows:
         by_slug.setdefault(r.slug, []).append(r)
     out: list[RepoAttribution] = []
     for row in conn.execute("SELECT slug FROM repositories ORDER BY slug"):
@@ -445,17 +470,19 @@ def attribution_by_repo(conn: sqlite3.Connection) -> list[RepoAttribution]:
     return out
 
 
-def attribution_by_feature(conn: sqlite3.Connection) -> list[FeatureAttribution]:
+def attribution_by_feature(
+    conn: sqlite3.Connection, *, resolved: Sequence[ResolvedCommit] | None = None
+) -> list[FeatureAttribution]:
     """Per-feature AI-attribution state over the feature's linked commits
     (defines or touches) — the org report's AI-share-per-feature table (a
-    lower bound per row). A commit claimed by two features counts in both."""
+    lower bound per row). A commit claimed by two features counts in both.
+    ``resolved`` is a prior :func:`resolve_attribution` pass over this same
+    connection."""
     conn = org(conn)
-    by_id = {r.cid: r for r in _resolved(conn)}
+    rows = resolve_attribution(conn) if resolved is None else resolved
+    by_id = {r.cid: r for r in rows}
     out: list[FeatureAttribution] = []
-    for f in conn.execute(
-        """SELECT f.id fid, f.title title, rp.slug slug FROM features f
-           JOIN repositories rp ON rp.id = f.repo_id ORDER BY f.id"""
-    ):
+    for f in conn.execute("SELECT f.id fid, f.title title FROM features f ORDER BY f.id"):
         fid = str(f["fid"])
         linked = sorted(
             {
@@ -466,14 +493,11 @@ def attribution_by_feature(conn: sqlite3.Connection) -> list[FeatureAttribution]
                 )
             }
         )
-        commits, yes, possible, no_evidence = _tally(
-            [by_id[cid] for cid in linked if cid in by_id]
-        )
+        commits, yes, possible, no_evidence = _tally([by_id[cid] for cid in linked if cid in by_id])
         out.append(
             FeatureAttribution(
                 fid=fid,
                 title=str(f["title"]),
-                repo=str(f["slug"]),
                 commits=commits,
                 yes=yes,
                 possible=possible,
@@ -484,12 +508,54 @@ def attribution_by_feature(conn: sqlite3.Connection) -> list[FeatureAttribution]
     return out
 
 
-def _tally(rows: list[_Resolved]) -> tuple[int, int, int, int]:
+def _tally(rows: Sequence[ResolvedCommit]) -> tuple[int, int, int, int]:
     """(commits, yes, possible, no-evidence) over one scope's resolved
     commits — the three states always sum to the commit count."""
     yes = sum(1 for r in rows if r.verdict == aiattr.VERDICT_YES)
     possible = sum(1 for r in rows if r.verdict == aiattr.VERDICT_POSSIBLE)
     return len(rows), yes, possible, len(rows) - yes - possible
+
+
+class _ModelPreload(NamedTuple):
+    """The per-commit lookups both by-model views read."""
+
+    churn_by_cid: dict[int, int]  # commit id -> churn lines (walk-stored)
+    defines: dict[int, set[str]]  # commit id -> the features it defines
+    fix_features: dict[str, set[str]]  # fix commit id -> the features it reaches
+
+
+def _model_groups(
+    rows: Sequence[ResolvedCommit],
+) -> dict[tuple[str, str], list[ResolvedCommit]]:
+    """The by-model eligibility and identity grouping both views share:
+    the ``yes``-attributed commits carrying a harness or model, keyed by
+    their resolved ``(harness, model)`` identity ('?' / '' fillers).
+    Anything weaker (``possible``) or identity-less contributes to no
+    group."""
+    groups: dict[tuple[str, str], list[ResolvedCommit]] = {}
+    for r in rows:
+        if r.verdict == aiattr.VERDICT_YES and (r.harness or r.model):
+            groups.setdefault((r.harness or "?", r.model or ""), []).append(r)
+    return groups
+
+
+def _model_preload(conn: sqlite3.Connection) -> _ModelPreload:
+    """The per-commit lookups both by-model views share, read once:
+    churn lines per commit, the features each commit defines (role
+    'defines'), and the DISTINCT fix commits reaching each feature."""
+    churn_by_cid = {
+        int(r["id"]): int(r["churn_lines"])
+        for r in conn.execute("SELECT id, churn_lines FROM commits WHERE churn_lines IS NOT NULL")
+    }
+    defines: dict[int, set[str]] = {}
+    for r in conn.execute(
+        "SELECT commit_id, feature_id FROM commits_features WHERE role = 'defines'"
+    ):
+        defines.setdefault(int(r["commit_id"]), set()).add(str(r["feature_id"]))
+    fix_features: dict[str, set[str]] = {}
+    for r in conn.execute("SELECT DISTINCT fix_commit_id, feature_id FROM fixes_features"):
+        fix_features.setdefault(str(r["fix_commit_id"]), set()).add(str(r["feature_id"]))
+    return _ModelPreload(churn_by_cid, defines, fix_features)
 
 
 @dataclass
@@ -508,39 +574,29 @@ class ModelTrendPoint:
     fixes: int
 
 
-def attribution_trend(conn: sqlite3.Connection) -> dict[str, list[ModelTrendPoint]]:
+def attribution_trend(
+    conn: sqlite3.Connection, *, resolved: Sequence[ResolvedCommit] | None = None
+) -> dict[str, list[ModelTrendPoint]]:
     """The by-model metrics over time — the report's per-model monthly
     tables and line charts (a lower bound per cell). Keyed by the same
     ``harness/model`` identity grouping as :func:`attribution_by_model`;
     each model's list covers the full month span of the walked history
     (buckets with no attributed activity are zeros — absence of a signal
     matched, never authorship). Fixes bucket by their own commit's month,
-    reaching any feature across the model's history."""
+    reaching any feature across the model's history. ``resolved`` is a prior
+    :func:`resolve_attribution` pass over this same connection."""
     conn = org(conn)
-    groups: dict[tuple[str, str], list[_Resolved]] = {}
+    rows = resolve_attribution(conn) if resolved is None else resolved
     month_by_cid: dict[int, str] = {}
     for r in conn.execute("SELECT id, committed_at FROM commits"):
         month_by_cid[int(r["id"])] = str(r["committed_at"])[:7]
     months = sorted(set(month_by_cid.values()))
-    for r in _resolved(conn):
-        if r.verdict == aiattr.VERDICT_YES and (r.harness or r.model):
-            groups.setdefault((r.harness or "?", r.model or ""), []).append(r)
+    groups = _model_groups(rows)
     if not groups:
         return {}
 
-    churn_by_cid = {
-        int(r["id"]): int(r["churn_lines"])
-        for r in conn.execute("SELECT id, churn_lines FROM commits WHERE churn_lines IS NOT NULL")
-    }
-    defines: dict[int, set[str]] = {}
-    for r in conn.execute(
-        "SELECT commit_id, feature_id FROM commits_features WHERE role = 'defines'"
-    ):
-        defines.setdefault(int(r["commit_id"]), set()).add(str(r["feature_id"]))
-    fix_features: dict[str, set[str]] = {}
+    churn_by_cid, defines, fix_features = _model_preload(conn)
     fix_month: dict[str, str] = {}
-    for r in conn.execute("SELECT DISTINCT fix_commit_id, feature_id FROM fixes_features"):
-        fix_features.setdefault(str(r["fix_commit_id"]), set()).add(str(r["feature_id"]))
     for r in conn.execute(
         "SELECT c.id, c.committed_at FROM commits c JOIN commit_verdicts v"
         " ON v.commit_id = c.id WHERE v.verdict = 'fix'"
@@ -597,7 +653,9 @@ class ModelFeatureMetrics:
     fixes_per_feature: float
 
 
-def attribution_by_model(conn: sqlite3.Connection) -> list[ModelFeatureMetrics]:
+def attribution_by_model(
+    conn: sqlite3.Connection, *, resolved: Sequence[ResolvedCommit] | None = None
+) -> list[ModelFeatureMetrics]:
     """Features / churn / fixes per attributed AI model — the report's
     by-model table (a lower bound per row). Over each (harness, model)
     group's yes-attributed commits: features are the DISTINCT ids those
@@ -605,27 +663,15 @@ def attribution_by_model(conn: sqlite3.Connection) -> list[ModelFeatureMetrics]:
     ``churn_lines``, fixes are the DISTINCT ``fixes_features`` fix commits
     reaching those features. Grouped by resolved identity — git-only
     evidence outranks PR-channel claims exactly as
-    ``aiattr.effective_attribution`` resolves them."""
+    ``aiattr.resolve`` resolves them. ``resolved`` is a prior
+    :func:`resolve_attribution` pass over this same connection."""
     conn = org(conn)
-    groups: dict[tuple[str, str], list[_Resolved]] = {}
-    for r in _resolved(conn):
-        if r.verdict == aiattr.VERDICT_YES and (r.harness or r.model):
-            groups.setdefault((r.harness or "?", r.model or ""), []).append(r)
+    rows = resolve_attribution(conn) if resolved is None else resolved
+    groups = _model_groups(rows)
     if not groups:
         return []
 
-    churn_by_cid = {
-        int(r["id"]): int(r["churn_lines"])
-        for r in conn.execute("SELECT id, churn_lines FROM commits WHERE churn_lines IS NOT NULL")
-    }
-    defines: dict[int, set[str]] = {}
-    for r in conn.execute(
-        "SELECT commit_id, feature_id FROM commits_features WHERE role = 'defines'"
-    ):
-        defines.setdefault(int(r["commit_id"]), set()).add(str(r["feature_id"]))
-    fix_features: dict[str, set[str]] = {}
-    for r in conn.execute("SELECT DISTINCT fix_commit_id, feature_id FROM fixes_features"):
-        fix_features.setdefault(str(r["fix_commit_id"]), set()).add(str(r["feature_id"]))
+    churn_by_cid, defines, fix_features = _model_preload(conn)
 
     out: list[ModelFeatureMetrics] = []
     for (harness, model), group in sorted(groups.items()):

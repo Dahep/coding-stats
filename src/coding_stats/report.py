@@ -5,9 +5,11 @@ from pathlib import Path
 
 from .aiattr import DISCLOSURE_LINE, channel_label
 from .metrics import attribution_summary, feature_repos, repo_count, snapshot
+from .orgview import org
 
 
 def text_report(conn: sqlite3.Connection, top: int = 15) -> str:
+    conn = org(conn)  # enter the projection ONCE: the reads below re-enter it
     snap = snapshot(conn, top=top)
     attr = attribution_summary(conn)
     multi = repo_count(conn) > 1

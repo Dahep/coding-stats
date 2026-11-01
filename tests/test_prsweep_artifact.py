@@ -7,16 +7,13 @@ artifact re-derives #34's git rows from the commit objects but never PR
 rows. A re-run replaces one PR's rows wholesale rather than duplicating.
 """
 
-import hashlib
 import re
 import sqlite3
 
-from coding_stats import artifact, gather, gitwalk, orgview, prsweep, recovery
+from coding_stats import artifact, gather, gitwalk, metrics, orgview, prsweep, recovery
 from coding_stats.db import connect
-from conftest import commit_files, make_db
+from conftest import OBSERVED_AT, TRAILER_VALUE, commit_files, make_db, rechecksum, strip_tables
 
-OBSERVED_AT = "2026-10-30T00:00:00+00:00"
-TRAILER_VALUE = "Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 WM_DATE = "2026-10-28T12:00:00+00:00"  # the marker's merge date in _built_db
 
 
@@ -29,9 +26,7 @@ def _built_db(tmp_path, repo, name="w.db"):
     h2 = commit_files(repo, "fix: rounding", {"b.txt": "2\n"})
     conn = make_db(tmp_path / name, repo)
     gitwalk.walk(repo, conn, "main")
-    ids = {
-        r["sha"]: int(r["id"]) for r in conn.execute("SELECT id, sha FROM commits")
-    }
+    ids = {r["sha"]: int(r["id"]) for r in conn.execute("SELECT id, sha FROM commits")}
     prsweep.replace_pr_rows(
         conn,
         7,
@@ -68,55 +63,16 @@ def _pr_rows(conn):
     ]
 
 
-def _strip_tables(conn, *tables, step: int | None = None) -> bytes:
-    """Artifact bytes as a pre-feature mint would have written them: without
-    the named tables' bodies, and with the header schema-step stamped to that
-    mint's own step (shape completion only applies to older steps), digest
-    re-stamped (the test_ai_attribution_artifact crafting pattern). Crafted
-    content VERIFIES."""
-    content = artifact.serialize(conn).decode("utf-8")
-    out: list[str] = []
-    skipping_ddl = False
-    for line in content.splitlines(keepends=True):
-        if line.startswith("-- schema-step:") and step is not None:
-            out.append(f"-- schema-step: {step}\n")
-            continue
-        if any(line.startswith(f"CREATE TABLE {t}") for t in tables):
-            skipping_ddl = True
-            continue
-        if skipping_ddl:
-            if line.strip() == ");":
-                skipping_ddl = False
-            continue
-        if any(line.startswith(f"INSERT INTO {t} ") for t in tables):
-            continue
-        out.append(line)
-    blank = "".join(out)
-    digest = re.search(r"^-- digest: ([0-9a-f]+)$", blank, re.M).group(1)
-    blanked = blank.replace(f"-- digest: {digest}", "-- digest:", 1)
-    restamped = hashlib.sha256(blanked.encode()).hexdigest()
-    return blanked.replace("-- digest:", f"-- digest: {restamped}", 1).encode()
-
-
 def pre_pr_bytes(conn) -> bytes:
     """A pre-#35 artifact body: no PR-channel state at all (a #34-era mint:
     schema step 4)."""
-    return _strip_tables(conn, "pr_evidence", "pr_watermark", step=4)
+    return strip_tables(artifact.serialize(conn), "pr_evidence", "pr_watermark", step=4)
 
 
 def pre_watermark_bytes(conn) -> bytes:
     """A pre-#36 artifact body: PR rows but no watermark table (a #35-era
     mint: schema step 5)."""
-    return _strip_tables(conn, "pr_watermark", step=5)
-
-
-def _reseat(content: str, needle: str) -> bytes:
-    """Verified artifact text + one injected statement, digest re-stamped."""
-    digest = re.search(r"^-- digest: ([0-9a-f]+)$", content, re.M).group(1)
-    blanked = content.replace(f"-- digest: {digest}", "-- digest:", 1)
-    tampered = blanked + needle
-    restamped = hashlib.sha256(tampered.encode()).hexdigest()
-    return tampered.replace("-- digest:", f"-- digest: {restamped}", 1).encode()
+    return strip_tables(artifact.serialize(conn), "pr_watermark", step=5)
 
 
 def test_artifact_round_trips_pr_evidence_rows(tmp_path, repo):
@@ -170,15 +126,15 @@ def test_walk_never_touches_recorded_pr_rows(tmp_path, repo):
 
 def test_materialize_refuses_smuggled_pr_rows(tmp_path, repo):
     conn, h1, h2 = _built_db(tmp_path, repo)
-    data = artifact.serialize(conn).decode("utf-8")
+    data = artifact.serialize(conn)
     conn.close()
-    hostile = _reseat(
-        data,
+    payload = (
         "INSERT INTO pr_evidence (repo_id, pr_number, commit_id, rule, raw, verdict,"
         " harness, model, channel, observed_at, suspicious)"
         " VALUES (1, 99, 999999, 'tool-trailer', 'x', 'yes', NULL, NULL, 'pr',"
-        " '2026-10-30T00:00:00+00:00', 0);\n",
+        " '2026-10-30T00:00:00+00:00', 0);\n"
     )
+    hostile = rechecksum(data + payload.encode())
     assert artifact.verify_bytes(hostile) is None  # digest re-stamped, shape still guarded
     mat = sqlite3.connect(":memory:")
     mat.row_factory = sqlite3.Row
@@ -191,13 +147,13 @@ def test_materialize_refuses_smuggled_pr_rows(tmp_path, repo):
     finally:
         mat.close()
     # a wrong repository id is refused the same way
-    hostile2 = _reseat(
-        data,
+    payload2 = (
         "INSERT INTO pr_evidence (repo_id, pr_number, commit_id, rule, raw, verdict,"
         " harness, model, channel, observed_at, suspicious)"
         " VALUES (42, 99, NULL, 'tool-trailer', 'x', 'yes', NULL, NULL, 'pr',"
-        " '2026-10-30T00:00:00+00:00', 1);\n",
+        " '2026-10-30T00:00:00+00:00', 1);\n"
     )
+    hostile2 = rechecksum(data + payload2.encode())
     mat = sqlite3.connect(":memory:")
     mat.row_factory = sqlite3.Row
     try:
@@ -229,11 +185,15 @@ def test_gather_carries_pr_rows_and_replaces_repo_rows(tmp_path, repo):
     gitwalk.walk(repo, conn, "main")
     cid = int(conn.execute("SELECT id FROM commits WHERE sha = ?", (c2,)).fetchone()["id"])
     prsweep.replace_pr_rows(
-        conn, 7, [prsweep.PrRow("tool-trailer", "new:hotness", "yes", cid, False, "claude", None)],
+        conn,
+        7,
+        [prsweep.PrRow("tool-trailer", "new:hotness", "yes", cid, False, "claude", None)],
         OBSERVED_AT,
     )
     prsweep.replace_pr_rows(
-        conn, 9, [prsweep.PrRow("tool-trailer", "aider:y", "yes", cid, False, "aider", "y")],
+        conn,
+        9,
+        [prsweep.PrRow("tool-trailer", "aider:y", "yes", cid, False, "aider", "y")],
         OBSERVED_AT,
     )
     conn.commit()
@@ -271,7 +231,9 @@ def test_org_projection_carries_pr_rows(tmp_path):
             conn.execute("SELECT id FROM commits WHERE sha = ?", (outs[name],)).fetchone()["id"]
         )
         prsweep.replace_pr_rows(
-            conn, 3, [prsweep.PrRow("tool-trailer", f"{name}:m", "yes", cid, False, name, "m")],
+            conn,
+            3,
+            [prsweep.PrRow("tool-trailer", f"{name}:m", "yes", cid, False, name, "m")],
             OBSERVED_AT,
         )
         conn.execute(
@@ -292,9 +254,12 @@ def test_org_projection_carries_pr_rows(tmp_path):
     # the recorded watermarks ride the projection per repository too — the
     # resume marker's merge date with the PR number (the loop stamps 10 for
     # alpha — len(sources)==0 — then 11 for beta)
-    assert [(r["last_pr_number"], r["last_merged_at"]) for r in proj.execute(
-        "SELECT last_pr_number, last_merged_at FROM pr_watermark"
-        " ORDER BY last_pr_number")] == [(10, WM_DATE), (11, WM_DATE)]
+    assert [
+        (r["last_pr_number"], r["last_merged_at"])
+        for r in proj.execute(
+            "SELECT last_pr_number, last_merged_at FROM pr_watermark ORDER BY last_pr_number"
+        )
+    ] == [(10, WM_DATE), (11, WM_DATE)]
     if proj is not uconn:
         proj.close()
     uconn.close()
@@ -303,9 +268,6 @@ def test_org_projection_carries_pr_rows(tmp_path):
 # ---------------------------------------------------------------------------
 # the watermark rides the Artifact beside the rows (ticket #36)
 # ---------------------------------------------------------------------------
-
-
-WM_DATE = "2026-10-28T12:00:00+00:00"
 
 
 def _watermark_rows(conn):
@@ -360,7 +322,9 @@ def test_partial_recompute_restores_the_watermark_and_pr_rows_unchanged(tmp_path
     gitwalk.walk(repo, conn, "main")
     cid = int(conn.execute("SELECT id FROM commits WHERE sha = ?", (c2,)).fetchone()["id"])
     prsweep.replace_pr_rows(
-        conn, 9, [prsweep.PrRow("tool-trailer", "newer:row", "yes", cid, False, "claude", None)],
+        conn,
+        9,
+        [prsweep.PrRow("tool-trailer", "newer:row", "yes", cid, False, "claude", None)],
         OBSERVED_AT,
     )
     conn.execute("UPDATE pr_watermark SET last_pr_number = 9")
@@ -425,10 +389,136 @@ def test_step_6_minted_artifact_completes_the_shape_and_keeps_the_watermark(tmp_
     opened.close()
 
 
+# ---------------------------------------------------------------------------
+# the PR-channel disclosure marker rides the Artifact too (schema step 8):
+# one row per repository, a row meaning the PR tier has RUN — recorded state
+# like the evidence rows and the watermark, never re-derived
+# ---------------------------------------------------------------------------
+
+
+def _marker_rows(conn):
+    return [
+        int(r["repo_id"])
+        for r in conn.execute("SELECT repo_id FROM pr_disclosure ORDER BY repo_id")
+    ]
+
+
+def test_artifact_round_trips_the_disclosure_marker(tmp_path, repo):
+    conn, h1, h2 = _built_db(tmp_path, repo)
+    prsweep.record_disclosure(conn)
+    before = _marker_rows(conn)
+    assert len(before) == 1  # one row per repository: the tier has run
+    data = artifact.serialize(conn)
+    text = data.decode("utf-8")
+    assert "CREATE TABLE pr_disclosure" in text
+    assert "INSERT INTO pr_disclosure" in text
+    assert artifact.verify_bytes(data) is None
+
+    mat = sqlite3.connect(tmp_path / "mat.db")
+    mat.row_factory = sqlite3.Row
+    artifact.restore_into(mat, data)
+    assert _marker_rows(mat) == before
+    mat.close()
+    conn.close()
+
+
+def test_partial_recompute_preserves_the_disclosure_marker(tmp_path, repo):
+    conn, h1, h2 = _built_db(tmp_path, repo)  # rows for PRs 7/8, watermark 8
+    prsweep.record_disclosure(conn)
+    anchor = artifact.serialize(conn)  # the older verifiable Artifact version
+
+    # recorded state advances past the anchor: PR 9 sweeps in
+    c2 = commit_files(repo, "feat: more", {"c.txt": "3\n"})
+    gitwalk.walk(repo, conn, "main")
+    cid = int(conn.execute("SELECT id FROM commits WHERE sha = ?", (c2,)).fetchone()["id"])
+    prsweep.replace_pr_rows(
+        conn,
+        9,
+        [prsweep.PrRow("tool-trailer", "newer:row", "yes", cid, False, "claude", None)],
+        OBSERVED_AT,
+    )
+    conn.commit()
+
+    restored = recovery.rebuild(tmp_path / "w.db", anchor, conn, repo, "main")
+    # the marker survives unchanged: restored from the anchor exactly as that
+    # version recorded it (never re-derived, never dropped by the recompute)
+    assert _marker_rows(restored) == [1]
+    assert gitwalk.walk(repo, restored, "main") == 1  # only the newer commit
+    assert _marker_rows(restored) == [1]  # and the re-walk never touches it
+    restored.close()
+
+
+def test_pre_step_8_artifact_completes_empty_and_legacy_rows_still_disclose(tmp_path, repo):
+    # a pre-step-8 mint carries no marker: the replay completes it EMPTY
+    # (older shapes stay replayable) and the legacy fallback — any
+    # non-suspicious PR-channel row — still discloses
+    conn, h1, h2 = _built_db(tmp_path, repo)  # two non-suspicious + one suspicious row
+    old = strip_tables(artifact.serialize(conn), "pr_disclosure", step=7)
+    assert artifact.verify_bytes(old) is None  # crafted bytes are valid artifacts
+    conn.close()
+
+    mat = sqlite3.connect(tmp_path / "mat.db")
+    mat.row_factory = sqlite3.Row
+    artifact.restore_into(mat, old)
+    assert _marker_rows(mat) == []  # completed empty, never invented
+    assert metrics.attribution_summary(mat).github_sourced is True  # legacy rows disclose
+    mat.close()
+
+
+def test_no_marker_and_no_non_suspicious_rows_never_discloses(tmp_path, repo):
+    conn, h1, h2 = _built_db(tmp_path, repo)
+    conn.execute("DELETE FROM pr_evidence WHERE suspicious = 0")  # the audit row alone
+    conn.commit()
+    old = strip_tables(artifact.serialize(conn), "pr_disclosure", step=7)
+    conn.close()
+
+    mat = sqlite3.connect(tmp_path / "mat.db")
+    mat.row_factory = sqlite3.Row
+    artifact.restore_into(mat, old)
+    assert metrics.attribution_summary(mat).github_sourced is False  # nothing to disclose
+    mat.close()
+
+
+def test_gather_and_the_org_projection_preserve_the_marker_per_repo(tmp_path, repo):
+    # two Repository keys in one union: each repo's marker rides ingest as its
+    # OWN row (the repo id remapped) and the projection copies it verbatim
+    sources = []
+    for slug in ("alpha", "beta"):
+        conn = make_db(tmp_path / f"{slug}.db", repo)
+        conn.execute(
+            "UPDATE repositories SET repo_key = ?, slug = ?",
+            (f"https://github.com/dahep/{slug}@main", slug),
+        )
+        prsweep.record_disclosure(conn)
+        sources.append(artifact.write(conn, tmp_path / f"{slug}-store"))
+        conn.close()
+    union = tmp_path / "union.db"
+    assert gather.gather(union, sources).ingested == 2
+
+    def marked_slugs(c):
+        return {
+            str(r["slug"])
+            for r in c.execute(
+                "SELECT rp.slug FROM pr_disclosure d"
+                " JOIN repositories rp ON rp.id = d.repo_id ORDER BY rp.slug"
+            )
+        }
+
+    uconn = sqlite3.connect(union)
+    uconn.row_factory = sqlite3.Row
+    assert marked_slugs(uconn) == {"alpha", "beta"}  # one marker per repo, remapped
+    proj = orgview.org(uconn)
+    assert marked_slugs(proj) == {"alpha", "beta"}  # copied verbatim per repo
+    assert metrics.attribution_summary(proj).github_sourced is True  # zero rows, still disclose
+    if proj is not uconn:
+        proj.close()
+    uconn.close()
+
+
 def _step6_bytes(conn) -> bytes:
     """Artifact bytes as a #36-era mint wrote them: pr_watermark at its
     step-6 shape (repo_id, last_pr_number — no merge date), header stamped
-    schema step 6, digest re-stamped (the crafting pattern above)."""
+    schema step 6, digest re-seated (conftest.rechecksum)."""
     content = artifact.serialize(conn).decode("utf-8")
     out: list[str] = []
     in_wm_ddl = False
@@ -455,9 +545,4 @@ def _step6_bytes(conn) -> bytes:
                 line,
             )
         out.append(line)
-    blank = "".join(out)
-    digest = re.search(r"^-- digest: ([0-9a-f]+)$", blank, re.M).group(1)
-    blanked = blank.replace(f"-- digest: {digest}", "-- digest:", 1)
-    restamped = hashlib.sha256(blanked.encode()).hexdigest()
-    return blanked.replace("-- digest:", f"-- digest: {restamped}", 1).encode()
-
+    return rechecksum("".join(out).encode("utf-8"))

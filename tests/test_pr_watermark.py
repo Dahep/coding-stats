@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from coding_stats import cli, gitwalk, prsweep
+from coding_stats import cli, gitwalk, prsource, prsweep
 from conftest import (
     OBSERVED_AT,
     FakeTransport,
@@ -37,9 +37,6 @@ from conftest import (
     pr_rows,
     primed_sweep_db,
 )
-
-STOP_RATE_LIMIT = "rate-limit"
-STOP_INTERRUPTED = "interrupted"
 
 
 def row_numbers(conn):
@@ -53,7 +50,7 @@ def assert_no_duplicate_rows(conn):
 
 class LimitedTransport:
     def __call__(self, url):
-        raise prsweep.RateLimited("rate limit exhausted")
+        raise prsource.RateLimited("rate limit exhausted")
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +148,7 @@ def test_interrupted_run_resumes_by_merge_date_with_zero_skips(tmp_path, repo, m
     res = prsweep.sweep_increment(
         conn, repo, "main", transport=FakeTransport(rows), now=OBSERVED_AT
     )
-    assert res.stop == STOP_INTERRUPTED  # clean stop, never a failure
+    assert res.stop == prsource.STOP_INTERRUPTED  # clean stop, never a failure
     assert res.processed == 2  # merge-date order: #3 (10-21) then #2 (10-23)
     assert row_numbers(conn) == {2, 3}
     assert prsweep.resume_key(conn) == (t2, 2)  # the contiguous date-ordered prefix
@@ -204,13 +201,11 @@ def test_permissions_403_is_a_forbidden_stop_never_a_rate_limit(tmp_path, repo):
     conn, _ = primed_sweep_db(tmp_path, repo, [1, 2])
 
     def denied(url):
-        raise urllib.error.HTTPError(
-            url, 403, "Resource not accessible by integration", {}, None
-        )
+        raise urllib.error.HTTPError(url, 403, "Resource not accessible by integration", {}, None)
 
     res = prsweep.sweep_increment(conn, repo, "main", transport=denied, now=OBSERVED_AT)
-    assert res.stop == prsweep.STOP_FORBIDDEN  # distinct stop, never rate-limit
-    assert res.stop != STOP_RATE_LIMIT
+    assert res.stop == prsource.STOP_FORBIDDEN  # distinct stop, never rate-limit
+    assert res.stop != prsource.STOP_RATE_LIMIT
     assert res.processed == 0 and res.watermark == 0 == prsweep.watermark(conn)
 
 
@@ -222,14 +217,12 @@ def test_default_transport_only_raises_rate_limited_for_genuine_rate_limits(monk
         return go
 
     # genuine exhaustion: 403 with the rate budget at zero, and 429
-    monkeypatch.setattr(
-        urllib.request, "urlopen", failing(403, {"X-RateLimit-Remaining": "0"})
-    )
-    with pytest.raises(prsweep.RateLimited):
-        prsweep.default_transport("https://api.github.com/x")
+    monkeypatch.setattr(urllib.request, "urlopen", failing(403, {"X-RateLimit-Remaining": "0"}))
+    with pytest.raises(prsource.RateLimited):
+        prsource.default_transport("https://api.github.com/x")
     monkeypatch.setattr(urllib.request, "urlopen", failing(429, {}))
-    with pytest.raises(prsweep.RateLimited):
-        prsweep.default_transport("https://api.github.com/x")
+    with pytest.raises(prsource.RateLimited):
+        prsource.default_transport("https://api.github.com/x")
     # a permissions 403 is NOT laundered into a clean rate-limit stop
     monkeypatch.setattr(
         urllib.request,
@@ -237,7 +230,7 @@ def test_default_transport_only_raises_rate_limited_for_genuine_rate_limits(monk
         failing(403, {"X-RateLimit-Remaining": "99"}),
     )
     with pytest.raises(urllib.error.HTTPError):
-        prsweep.default_transport("https://api.github.com/x")
+        prsource.default_transport("https://api.github.com/x")
 
 
 def test_default_transport_uses_a_request_timeout(monkeypatch):
@@ -258,7 +251,7 @@ def test_default_transport_uses_a_request_timeout(monkeypatch):
         return Resp()
 
     monkeypatch.setattr(urllib.request, "urlopen", go)
-    assert prsweep.default_transport("https://api.github.com/x") == []
+    assert prsource.default_transport("https://api.github.com/x") == []
     assert seen.get("timeout") == 30  # bounded: a hung API never hangs the sweep
 
 
@@ -302,9 +295,12 @@ def _cli_rows(db):
     import sqlite3
 
     conn = sqlite3.connect(db)
-    out = [(r[0], r[1], r[2]) for r in conn.execute(
-        "SELECT pr_number, rule, raw FROM pr_evidence ORDER BY pr_number, rule, raw"
-    )]
+    out = [
+        (r[0], r[1], r[2])
+        for r in conn.execute(
+            "SELECT pr_number, rule, raw FROM pr_evidence ORDER BY pr_number, rule, raw"
+        )
+    ]
     conn.close()
     return out
 
@@ -315,11 +311,9 @@ def test_cli_forbidden_notice_names_the_permission_not_the_rate_limit(
     db = cli_sweep_db(tmp_path, repo, [1])
 
     def denied(url):
-        raise urllib.error.HTTPError(
-            url, 403, "Resource not accessible by integration", {}, None
-        )
+        raise urllib.error.HTTPError(url, 403, "Resource not accessible by integration", {}, None)
 
-    monkeypatch.setattr(prsweep, "default_transport", denied)
+    monkeypatch.setattr(prsource, "default_transport", denied)
     cli.main(["pr-sweep", "--db", str(db)])  # a clean stop, never a failure exit
     out = capsys.readouterr().out
     assert "::notice::" in out
@@ -330,7 +324,7 @@ def test_cli_forbidden_notice_names_the_permission_not_the_rate_limit(
 
 def test_cli_rate_limit_stop_notice_is_visible_and_exit_zero(tmp_path, repo, monkeypatch, capsys):
     db = cli_sweep_db(tmp_path, repo, [1, 2])
-    monkeypatch.setattr(prsweep, "default_transport", lambda url: LimitedTransport()(url))
+    monkeypatch.setattr(prsource, "default_transport", lambda url: LimitedTransport()(url))
     cli.main(["pr-sweep", "--db", str(db)])  # no failure exit
     out = capsys.readouterr().out
     assert "::notice::" in out and "rate limit" in out
@@ -340,7 +334,7 @@ def test_cli_rate_limit_stop_notice_is_visible_and_exit_zero(tmp_path, repo, mon
 def test_cli_full_flag_re_sweeps_from_the_beginning(tmp_path, repo, monkeypatch, capsys):
     db = cli_sweep_db(tmp_path, repo, [1, 2])
     t = FakeTransport(pr_list_rows(1, 2))
-    monkeypatch.setattr(prsweep, "default_transport", lambda url: t(url))
+    monkeypatch.setattr(prsource, "default_transport", lambda url: t(url))
 
     cli.main(["pr-sweep", "--db", str(db), "--after-pr", "1"])  # adoption bound
     assert read_watermark(db) == 0  # the gap below the bound is never claimed

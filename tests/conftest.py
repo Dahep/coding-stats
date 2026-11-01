@@ -11,6 +11,7 @@ History (chronological, all on main):
   c8 "whitespace"    a.txt adds trailing newline only   -> cleanup (no deleted lines)
 """
 
+import hashlib
 import re
 import sqlite3
 import subprocess
@@ -90,6 +91,53 @@ def with_remote(repo: Path, bare) -> None:
     run(repo, "remote", "add", "origin", bare)
     run(repo, "push", "-q", "-u", "origin", "main")
     subprocess.run(["git", "-C", bare, "symbolic-ref", "HEAD", "refs/heads/main"], check=True)
+
+
+# ---------------------------------------------------------------------------
+# Artifact-crafting helpers, shared by every suite that mints crafted
+# artifacts: the digest re-seat and table-stripping mechanics, ONE
+# implementation each. Bytes in, bytes out — never str/bytes dual typing —
+# and crafted content VERIFIES (the digest is an unkeyed checksum)
+# ---------------------------------------------------------------------------
+
+
+def rechecksum(data: bytes) -> bytes:
+    """Re-stamp the artifact's ``-- digest:`` line over ``data`` the way an
+    attacker would: blank the existing digest on its line, stamp sha256 of
+    the blanked bytes. Tamper by appending statements to ``data`` first —
+    the crafted content still VERIFIES and the shape guards stay the only
+    real defense. Bytes in, bytes out."""
+    m = re.search(rb"^-- digest:(?: [0-9a-f]+)?$", data, re.M)
+    assert m is not None
+    blanked = data[: m.start()] + b"-- digest:" + data[m.end() :]
+    digest = hashlib.sha256(blanked).hexdigest()
+    return blanked.replace(b"-- digest:\n", f"-- digest: {digest}\n".encode(), 1)
+
+
+def strip_tables(data: bytes, *tables: str, step: int | None = None) -> bytes:
+    """Artifact bytes as an older mint wrote them: the named tables' CREATE
+    and INSERT statements removed (the DDL through its ``);``), the header
+    ``-- schema-step:`` stamped to ``step`` when given, digest re-seated —
+    crafted content VERIFIES. A table name strips itself, never its
+    namesakes (``commits`` never strips ``commits_features``). Bytes in,
+    bytes out."""
+    out: list[str] = []
+    skipping = False
+    for line in data.decode("utf-8").splitlines(keepends=True):
+        if line.startswith("-- schema-step:") and step is not None:
+            out.append(f"-- schema-step: {step}\n")
+            continue
+        if any(line.startswith(f"CREATE TABLE {t} ") for t in tables):
+            skipping = True
+            continue
+        if skipping:
+            if line.strip() == ");":
+                skipping = False
+            continue
+        if any(line.startswith(f"INSERT INTO {t} ") for t in tables):
+            continue
+        out.append(line)
+    return rechecksum("".join(out).encode("utf-8"))
 
 
 # ---------------------------------------------------------------------------

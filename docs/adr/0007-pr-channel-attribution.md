@@ -36,10 +36,15 @@ observations and never re-derived.
    the input is on. Private-repo head refs (`refs/pull/N/head`) are fetched
    over the authenticated git transport — the checkout's persisted token
    (`http.https://github.com/.extraheader` config), never the API and never
-   a PAT. Artifacts and reports carry the disclosure line of clause 5
-   whenever the mode is on. A passthrough input `pr-backfill: full` (the
-   `workflow_dispatch` caller shape) runs an explicit full-history sweep
-   reusing the same watermark.
+   a PAT. Artifacts and reports carry the disclosure of clause 5 — the
+   recorded marker of clause 5 means the tier has RUN, not merely that rows
+   happened to exist. A passthrough input `pr-backfill: full` (the
+   `workflow_dispatch` caller shape) backfills the unincorporated history
+   in batches — the clause 2 resume machinery at 250 PRs per invocation,
+   each dispatch landing a disjoint chunk past the shared watermark and the
+   next continuing from there until history is caught up; the explicit
+   full-history RE-SWEEP (already-incorporated history included) is the
+   direct `pr-sweep --full` operator face.
 2. **Watermark-driven per-increment runs.** The resume marker is the
    `(merged_at, number)` tuple of the last *incorporated* PR, recorded in
    the Artifact next to the evidence rows (the `pr_watermark` table:
@@ -109,9 +114,21 @@ observations and never re-derived.
    evidence — the storage encodes it ("recorded once, not twice": where the
    walk already recorded the identical match at the same commit the PR row
    is not stored again) and resolution is git-first, with suspicious rows
-   excluded from every resolution. Whenever the mode is on, artifacts and
-   reports carry the disclosure line `GitHub-sourced (PR-channel) evidence
-   present`; gathered org metrics (#38) resolve one attribution per Shared
-   commit by the stronger channel and render all attribution numbers as
-   lower bounds — never normalized upward to PR counts, `no-evidence` never
-   rendered as "human".
+   excluded from every resolution. Disclosure is MODE state, recorded: every
+   actual sweep face records a `pr_disclosure` marker row (schema step 8 —
+   `repo_id` as its primary key, one row per repository, a row meaning the
+   PR tier has RUN, no enabled boolean and no timestamps) before it lists
+   any PRs and after config validation, so a run that finds zero
+   non-suspicious rows — or dies operationally right after — still leaves
+   disclosure on; a config error raises `SweepError` before the marker and
+   records nothing. The marker is RECORDED state like the rows and the
+   watermark: it rides the Artifact and survives partial recompute and
+   gather unchanged, and is never removed. Artifacts minted before the
+   marker existed (schema step < 8) complete it empty and fall back to
+   their non-suspicious `pr_evidence` rows as the disclosure trigger.
+   Reports render the disclosure line `GitHub-sourced (PR-channel) evidence
+   present` whenever a marker exists or such legacy rows do; with neither,
+   no disclosure. Gathered org metrics (#38) resolve one attribution per
+   Shared commit by the stronger channel and render all attribution numbers
+   as lower bounds — never normalized upward to PR counts, `no-evidence`
+   never rendered as "human".

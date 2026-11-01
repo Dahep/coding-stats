@@ -2,8 +2,8 @@
 
 The union resolves ONE attribution per Shared commit out of the evidence
 every branch's copy carries, by the channel-precedence rule — git-only
-evidence outranks inherited PR-channel evidence — REUSING prsweep's
-effective_* at the union level, never a second rule. The org report's AI
+evidence outranks inherited PR-channel evidence — REUSING aiattr's
+canonical resolution at the union level, never a second rule. The org report's AI
 metrics (AI share per feature/repo, harness/model/channel breakdowns) are
 rendered as LOWER BOUNDS: never normalized upward to PR counts,
 ``no-evidence`` never rendered as "human", GitHub-sourced rows carrying
@@ -13,7 +13,17 @@ per-branch artifacts: rows are recorded state, never re-derived.
 
 import sqlite3
 
-from coding_stats import artifact, db, gather, gitwalk, htmlreport, orgview, prsweep
+from coding_stats import (
+    aiattr,
+    artifact,
+    db,
+    gather,
+    gitwalk,
+    htmlreport,
+    metrics,
+    orgview,
+    prsweep,
+)
 from coding_stats.db import connect
 from coding_stats.metrics import (
     attribution_by_feature,
@@ -23,10 +33,8 @@ from coding_stats.metrics import (
     snapshot,
 )
 from coding_stats.report import text_report
-from conftest import add_feature, commit_files, make_db, run
+from conftest import OBSERVED_AT, TRAILER_VALUE, add_feature, commit_files, make_db, run
 
-OBSERVED_AT = "2026-10-30T00:00:00+00:00"
-TRAILER_VALUE = "Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 DISCLOSURE = "GitHub-sourced (PR-channel) evidence present"
 
 
@@ -74,12 +82,8 @@ def _two_key_union(tmp_path, repo):
         conn_b,
         7,
         [
-            prsweep.PrRow(
-                "tool-trailer", "codex:gpt-5", "yes", ids[h_c], False, "codex", "gpt-5"
-            ),
-            prsweep.PrRow(
-                "tool-trailer", "codex:gpt-5", "yes", ids[h_d], False, "codex", "gpt-5"
-            ),
+            prsweep.PrRow("tool-trailer", "codex:gpt-5", "yes", ids[h_c], False, "codex", "gpt-5"),
+            prsweep.PrRow("tool-trailer", "codex:gpt-5", "yes", ids[h_d], False, "codex", "gpt-5"),
         ],
         OBSERVED_AT,
     )
@@ -132,11 +136,11 @@ def test_shared_commit_is_attributed_once_by_the_stronger_signal(tmp_path, repo)
     assert s.ai_share == 1.0
 
     cid = int(view.execute("SELECT id FROM commits WHERE sha = ?", (h_c,)).fetchone()["id"])
-    eff = prsweep.effective_attribution(view, cid)
+    eff = aiattr.resolve(view, cid).attribution
     assert (eff.verdict, eff.harness, eff.model) == ("yes", "claude", "Opus 4.8 (1M context)")
     # evidence from several branches feeds that ONE attribution: the git row
     # first (it outranks), the inherited PR row still attached
-    ev = prsweep.effective_evidence(view, cid)
+    ev = aiattr.effective_evidence(view, cid)
     assert [(c, rule) for c, rule, _raw, _v in ev] == [
         ("git", "co-authored-by"),
         ("pr", "tool-trailer"),
@@ -190,9 +194,9 @@ def test_loser_git_rows_outrank_winner_pr_rows_in_the_union(tmp_path):
     view = orgview.org(conn)
     assert view.execute("SELECT COUNT(*) c FROM commits").fetchone()["c"] == 1
     cid = int(view.execute("SELECT id FROM commits WHERE sha = 'x40'").fetchone()["id"])
-    eff = prsweep.effective_attribution(view, cid)
+    eff = aiattr.resolve(view, cid).attribution
     assert (eff.verdict, eff.harness, eff.model) == ("yes", "claude", "Opus 4.8 (1M context)")
-    assert [c for c, _r, _raw, _v in prsweep.effective_evidence(view, cid)] == ["git", "pr"]
+    assert [c for c, _r, _raw, _v in aiattr.effective_evidence(view, cid)] == ["git", "pr"]
     assert attribution_summary(view).verdict_counts == {"yes": 1}
     conn.close()
 
@@ -274,6 +278,49 @@ def test_org_report_renders_breakdowns_lower_bounds_and_the_disclosure(tmp_path,
     assert DISCLOSURE in text
     assert "lower bound" in text.lower()
     assert "human" not in text.lower()
+    uconn.close()
+
+
+def test_report_build_resolves_attribution_once(tmp_path, repo, monkeypatch):
+    """M1's contract: one report build runs ONE per-commit attribution
+    resolution and derives every attribution view from that same resolved
+    data — never one resolution per view. The counter wraps the public
+    resolver wherever it is reachable: build's own entry point and the
+    views' internal fallback."""
+    union, _h_c, _h_d = _two_key_union(tmp_path, repo)
+    uconn = sqlite3.connect(union)
+    uconn.row_factory = sqlite3.Row
+    calls: list[sqlite3.Connection] = []
+    real = metrics.resolve_attribution
+
+    def counting(c: sqlite3.Connection):
+        calls.append(c)
+        return real(c)
+
+    monkeypatch.setattr(metrics, "resolve_attribution", counting)
+    monkeypatch.setattr(htmlreport, "resolve_attribution", counting)
+    htmlreport.build(uconn)
+    assert len(calls) == 1
+    uconn.close()
+
+
+def test_resolve_attribution_reads_each_commits_evidence_exactly_once(tmp_path, repo, monkeypatch):
+    """The ONE-read contract: a resolution pass consumes the canonical aiattr
+    resolver once per commit — exactly one ``effective_evidence`` read per
+    commit, never a second read for the channel or the tagged rows."""
+    union, _h_c, _h_d = _two_key_union(tmp_path, repo)
+    uconn = sqlite3.connect(union)
+    uconn.row_factory = sqlite3.Row
+    reads: list[int] = []
+    real = aiattr.effective_evidence
+
+    def counting(conn, commit_id):
+        reads.append(commit_id)
+        return real(conn, commit_id)
+
+    monkeypatch.setattr(aiattr, "effective_evidence", counting)
+    rows = metrics.resolve_attribution(uconn)
+    assert sorted(reads) == sorted(r.cid for r in rows)  # one read per commit, none doubled
     uconn.close()
 
 

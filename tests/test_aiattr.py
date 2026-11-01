@@ -97,9 +97,7 @@ def test_author_email_github_bot_noreply_numeric_prefix():
     attr = attribute(facts(author_email="198982749+Copilot@users.noreply.github.com"))
     assert attr.verdict == VERDICT_YES
     assert attr.harness == "copilot"
-    assert evidence(attr) == [
-        ("agent-email", "198982749+Copilot@users.noreply.github.com", "yes")
-    ]
+    assert evidence(attr) == [("agent-email", "198982749+Copilot@users.noreply.github.com", "yes")]
 
 
 def test_committer_email_bot_slug_noreply():
@@ -156,6 +154,7 @@ def test_name_cursor_agent():
         ("🤖 Generated with [Claude Code](https://claude.com/claude-code)", "claude"),
         ("Generated with Codex.", "codex"),
         ("✨ Generated with [Gemini CLI](https://github.com/google-gemini/gemini-cli)", "gemini"),
+        ("Generated with Gemini CLI.", "gemini"),
         ("Made with Cursor", "cursor"),
     ],
 )
@@ -166,6 +165,16 @@ def test_body_signatures(line, harness):
     assert evidence(attr) == [("body-signature", line, "yes")]
 
 
+def test_gemini_cli_prose_is_never_a_body_signature():
+    # "Gemini CLI" naming a product in integration prose is not the
+    # Generated-with signature — never yes-tier attribution
+    attr = attribute(
+        facts(title="feat: add Gemini CLI provider", message="feat: add Gemini CLI provider\n")
+    )
+    assert attr.verdict == VERDICT_NO_EVIDENCE
+    assert attr.evidence == ()
+
+
 # --------------------------------------------------- rule 5: tool trailers --
 
 
@@ -174,9 +183,7 @@ def test_assisted_by_agent_colon_model():
     assert attr.verdict == VERDICT_YES
     assert attr.harness == "claude"
     assert attr.model == "Opus 4.8 (1M context)"
-    assert evidence(attr) == [
-        ("tool-trailer", "claude-code:Opus 4.8 (1M context)", "yes")
-    ]
+    assert evidence(attr) == [("tool-trailer", "claude-code:Opus 4.8 (1M context)", "yes")]
 
 
 def test_assisted_by_uppercase_agent_colon_model():
@@ -252,8 +259,7 @@ def test_plain_merge_subject_is_no_evidence():
 
 def test_yes_outranks_possible():
     msg = (
-        "Merge pull request #5 from daniel/claude/feature-x\n\n"
-        f"Co-authored-by: {ANTHROPIC_TRAILER}"
+        f"Merge pull request #5 from daniel/claude/feature-x\n\nCo-authored-by: {ANTHROPIC_TRAILER}"
     )
     attr = attribute(
         facts(

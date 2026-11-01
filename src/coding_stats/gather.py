@@ -360,8 +360,7 @@ def _upsert(conn: sqlite3.Connection, item: _Ingest) -> None:
         )
     for r in src.execute("SELECT * FROM ai_attribution ORDER BY commit_id"):
         conn.execute(
-            "INSERT INTO ai_attribution (commit_id, verdict, harness, model)"
-            " VALUES (?, ?, ?, ?)",
+            "INSERT INTO ai_attribution (commit_id, verdict, harness, model) VALUES (?, ?, ?, ?)",
             (commit_ids[int(r["commit_id"])], r["verdict"], r["harness"], r["model"]),
         )
     for r in src.execute("SELECT * FROM ai_evidence ORDER BY commit_id, rule, raw"):
@@ -390,17 +389,19 @@ def _upsert(conn: sqlite3.Connection, item: _Ingest) -> None:
                 r["suspicious"],
             ),
         )
-    for r in src.execute(
-        "SELECT * FROM pr_watermark ORDER BY repo_id"
-    ):
+    for r in src.execute("SELECT * FROM pr_watermark ORDER BY repo_id"):
         # the resume marker is recorded state like the evidence rows: it
         # rides the union per repo (merge date and PR number together) and
         # is replaced wholesale on re-ingest
         conn.execute(
-            "INSERT INTO pr_watermark (repo_id, last_pr_number, last_merged_at)"
-            " VALUES (?, ?, ?)",
+            "INSERT INTO pr_watermark (repo_id, last_pr_number, last_merged_at) VALUES (?, ?, ?)",
             (repo_id, r["last_pr_number"], r["last_merged_at"]),
         )
+    if src.execute("SELECT 1 FROM pr_disclosure LIMIT 1").fetchone() is not None:
+        # the PR-tier disclosure marker rides the union per repo too: one
+        # row per repo whose tier has run, remapped like the watermark and
+        # replaced wholesale on re-ingest
+        conn.execute("INSERT INTO pr_disclosure (repo_id) VALUES (?)", (repo_id,))
     for r in src.execute("SELECT * FROM commits_features ORDER BY commit_id, feature_id"):
         conn.execute(
             "INSERT INTO commits_features (commit_id, feature_id, role) VALUES (?, ?, ?)",
@@ -485,6 +486,7 @@ def _purge_repo(conn: sqlite3.Connection, repo_id: int) -> None:
     conn.execute(f"DELETE FROM ai_attribution WHERE commit_id {where}", (repo_id,))
     conn.execute("DELETE FROM pr_evidence WHERE repo_id = ?", (repo_id,))
     conn.execute("DELETE FROM pr_watermark WHERE repo_id = ?", (repo_id,))
+    conn.execute("DELETE FROM pr_disclosure WHERE repo_id = ?", (repo_id,))
     conn.execute(f"DELETE FROM commits_features WHERE commit_id {where}", (repo_id,))
     conn.execute(
         f"DELETE FROM fix_touches WHERE fix_commit_id {where} OR source_commit_id {where}",

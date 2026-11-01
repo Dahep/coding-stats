@@ -8,17 +8,20 @@ the walk re-derives the rows from the commit objects, deterministically.
 ``no-evidence`` is rendered as exactly that and never as "human".
 """
 
-import hashlib
-import re
 import sqlite3
 
 from coding_stats import artifact, gather, gitwalk, htmlreport, recovery
 from coding_stats.db import connect
 from coding_stats.report import text_report
-from conftest import commit_files, make_db, run
-
-TRAILER_VALUE = "Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
-TRAILER_LINE = f"Co-authored-by: {TRAILER_VALUE}"
+from conftest import (
+    TRAILER_LINE,
+    TRAILER_VALUE,
+    commit_files,
+    make_db,
+    rechecksum,
+    run,
+    strip_tables,
+)
 
 
 def _built_db(tmp_path, repo, name="w.db"):
@@ -45,42 +48,7 @@ def pre_attribution_bytes(conn) -> bytes:
     ai_attribution/ai_evidence in the body, header schema-step 3 (the table's
     step 4 is newer — shape completion applies), digest re-stamped. Mirrors
     the test_migration_legacy old-format trick: crafted content must VERIFY."""
-    content = artifact.serialize(conn).decode("utf-8")
-    out: list[str] = []
-    skipping_ddl = False
-    for line in content.splitlines(keepends=True):
-        if line.startswith("-- schema-step:"):
-            out.append("-- schema-step: 3\n")  # the pre-#34 mint's own stamp
-            continue
-        if line.startswith("CREATE TABLE ai_attribution") or line.startswith(
-            "CREATE TABLE ai_evidence"
-        ):
-            skipping_ddl = True
-            continue
-        if skipping_ddl:
-            if line.strip() == ");":
-                skipping_ddl = False
-            continue
-        if line.startswith("INSERT INTO ai_attribution") or line.startswith(
-            "INSERT INTO ai_evidence"
-        ):
-            continue
-        out.append(line)
-    blank = "".join(out)
-    digest = re.search(r"^-- digest: ([0-9a-f]+)$", blank, re.M).group(1)
-    blanked = blank.replace(f"-- digest: {digest}", "-- digest:", 1)
-    restamped = hashlib.sha256(blanked.encode()).hexdigest()
-    return blanked.replace("-- digest:", f"-- digest: {restamped}", 1).encode()
-
-
-def _reseat(content: str, needle: str) -> bytes:
-    """Take verified artifact text, inject `needle` as a trailing statement,
-    and re-stamp the digest (a crafted-but-verifying artifact)."""
-    digest = re.search(r"^-- digest: ([0-9a-f]+)$", content, re.M).group(1)
-    blanked = content.replace(f"-- digest: {digest}", "-- digest:", 1)
-    tampered = blanked + needle
-    restamped = hashlib.sha256(tampered.encode()).hexdigest()
-    return tampered.replace("-- digest:", f"-- digest: {restamped}", 1).encode()
+    return strip_tables(artifact.serialize(conn), "ai_attribution", "ai_evidence", step=3)
 
 
 def test_artifact_round_trips_attribution_rows(tmp_path, repo):
@@ -139,13 +107,13 @@ def test_pre_attribution_artifact_materializes_and_walk_rederives(tmp_path, repo
 
 def test_materialize_refuses_smuggled_evidence_rows(tmp_path, repo):
     conn, *_ = _built_db(tmp_path, repo)
-    data = artifact.serialize(conn).decode("utf-8")
+    data = artifact.serialize(conn)
     conn.close()
-    hostile = _reseat(
-        data,
+    payload = (
         "INSERT INTO ai_evidence (commit_id, rule, raw, verdict)"
-        " VALUES (999999, 'co-authored-by', 'x', 'yes');\n",
+        " VALUES (999999, 'co-authored-by', 'x', 'yes');\n"
     )
+    hostile = rechecksum(data + payload.encode())
     assert artifact.verify_bytes(hostile) is None  # digest re-stamped, shape still guarded
     mat = sqlite3.connect(":memory:")
     mat.row_factory = sqlite3.Row
@@ -177,9 +145,7 @@ def test_gather_union_carries_attribution_rows(tmp_path, repo):
     }
     assert got[h1] == ("yes", "claude", "Opus 4.8 (1M context)")
     assert got[h2] == ("no-evidence", None, None)
-    rules = [
-        (r["rule"], r["raw"]) for r in uconn.execute("SELECT rule, raw FROM ai_evidence")
-    ]
+    rules = [(r["rule"], r["raw"]) for r in uconn.execute("SELECT rule, raw FROM ai_evidence")]
     assert rules == [("co-authored-by", TRAILER_VALUE)]
     uconn.close()
 
@@ -206,9 +172,7 @@ def test_union_report_renders_attribution_across_repos(tmp_path):
     assert gather.gather(union, sources).ingested == 2
     uconn = sqlite3.connect(union)
     uconn.row_factory = sqlite3.Row
-    assert (
-        uconn.execute("SELECT COUNT(*) c FROM ai_attribution").fetchone()["c"] == 2
-    )
+    assert uconn.execute("SELECT COUNT(*) c FROM ai_attribution").fetchone()["c"] == 2
     html = htmlreport.build(uconn)
     assert "AI attribution" in html
     assert TRAILER_VALUE.replace("<", "&lt;").replace(">", "&gt;") in html

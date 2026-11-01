@@ -109,3 +109,42 @@ def test_the_model_table_renders_and_hides_without_evidence(tmp_path, repo):
     page = htmlreport.build(empty)
     assert "per AI model" not in page
     empty.close()
+
+
+def test_model_grouping_is_yes_only_with_identity(tmp_path, repo):
+    """The eligibility both by-model views share: only ``yes``-attributed
+    commits carrying a harness or model group — a ``possible`` verdict and
+    an identity-less ``yes`` reach neither the table nor the trend. The
+    hand-built identities also pin that ``resolved=`` is consumed as-is,
+    never re-resolved."""
+    conn, ids = _built(tmp_path, repo)
+    from coding_stats.metrics import ResolvedCommit, attribution_trend
+
+    (sha_yes, cid_yes), (sha_weak, cid_weak), (sha_plain, cid_plain) = sorted(ids.items())
+    resolved = [
+        ResolvedCommit(cid_yes, sha_yes, "demo", "yes", "claude", "m1", "git", []),
+        ResolvedCommit(cid_weak, sha_weak, "demo", "possible", "codex", "gpt-5", "git", []),
+        ResolvedCommit(cid_plain, sha_plain, "demo", "yes", None, None, "git", []),
+    ]
+    rows = attribution_by_model(conn, resolved=resolved)
+    assert [(r.harness, r.model) for r in rows] == [("claude", "m1")]
+    trend = attribution_trend(conn, resolved=resolved)
+    assert set(trend) == {"claude/m1"}
+    assert sum(p.commits for p in trend["claude/m1"]) == 1
+    conn.close()
+
+
+def test_unknown_model_cell_is_a_literal_em_dash_never_an_escaped_entity(tmp_path, repo):
+    """A known harness whose evidence names no model: the model cell falls
+    back to the literal em dash like the sibling tables — the HTML must
+    never carry escaped entity text (``&amp;mdash;``) for that row."""
+    commit_files(repo, "feat: tool\n\nGenerated-by: codex\n", {"t.txt": "t\n" * 2})
+    conn = make_db(tmp_path / "w.db", repo)
+    from coding_stats import gitwalk
+
+    gitwalk.walk(repo, conn, "main")
+    assert [(r.harness, r.model) for r in attribution_by_model(conn)] == [("codex", "")]
+    html = htmlreport.build(conn)
+    assert "<td>codex</td><td>—</td>" in html  # known harness, unknown model
+    assert "&amp;mdash;" not in html  # never a doubly-escaped entity
+    conn.close()

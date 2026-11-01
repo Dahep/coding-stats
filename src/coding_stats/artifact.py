@@ -160,8 +160,7 @@ _TABLES: tuple[_Table, ...] = (
                PRIMARY KEY (commit_id, rule, raw)
            );""",
         ("commit_id", "rule", "raw", "verdict"),
-        "SELECT commit_id, rule, raw, verdict FROM ai_evidence"
-        " ORDER BY commit_id, rule, raw",
+        "SELECT commit_id, rule, raw, verdict FROM ai_evidence ORDER BY commit_id, rule, raw",
     ),
     _Table(
         "pr_evidence",
@@ -206,6 +205,15 @@ _TABLES: tuple[_Table, ...] = (
            );""",
         ("repo_id", "last_pr_number", "last_merged_at"),
         "SELECT repo_id, last_pr_number, last_merged_at FROM pr_watermark ORDER BY repo_id",
+    ),
+    _Table(
+        "pr_disclosure",
+        """CREATE TABLE pr_disclosure (
+               repo_id INTEGER NOT NULL,
+               PRIMARY KEY (repo_id)
+           );""",
+        ("repo_id",),
+        "SELECT repo_id FROM pr_disclosure ORDER BY repo_id",
     ),
     _Table(
         "features",
@@ -464,7 +472,7 @@ def materialize(conn: sqlite3.Connection, data: bytes) -> None:
     _check_ownership(conn)
 
 
-# The tables minted AFTER the core settled (schema steps 4-6): shape
+# The tables minted AFTER the core settled (schema steps 4-8): shape
 # completion only ever fills THESE, and only for artifacts whose header
 # schema-step predates the table's own step. Core tables (repositories,
 # commits, commit_verdicts, features, ...) are NEVER resurrected — an
@@ -474,6 +482,7 @@ _COMPLETE_STEPS: dict[str, int] = {
     "ai_evidence": 4,
     "pr_evidence": 5,
     "pr_watermark": 6,
+    "pr_disclosure": 8,
 }
 
 # Columns minted after their table (schema step 7): a replay whose body
@@ -498,10 +507,11 @@ def _schema_step_of(data: bytes) -> int:
 def _complete_shape(conn: sqlite3.Connection, step: int) -> None:
     """Bring a pre-feature artifact body up to the curated shape: of the
     post-step-3 tables (ai_attribution, ai_evidence, pr_evidence,
-    pr_watermark), every one the replay did not create AND whose schema step
-    is NEWER than the artifact's header stamp is created EMPTY by us, outside
-    the guarded replay; likewise every column minted after its table is
-    ADDED to an old-shape table of such a body (see _COMPLETE_COLUMNS).
+    pr_watermark, pr_disclosure), every one the replay did not create AND
+    whose schema step is NEWER than the artifact's header stamp is created
+    EMPTY by us, outside the guarded replay; likewise every column minted
+    after its table is ADDED to an old-shape table of such a body (see
+    _COMPLETE_COLUMNS).
     Artifacts minted before a table (or column) existed stay replayable —
     their rows for the new table are simply absent, and pure state (AI
     attribution) re-derives on the next walk. A mint that already claimed
@@ -652,6 +662,10 @@ def _check_ownership(conn: sqlite3.Connection) -> None:
         (
             "pr_watermark",
             f"SELECT COUNT(*) c FROM pr_watermark WHERE repo_id != {rid}",
+        ),
+        (
+            "pr_disclosure",
+            f"SELECT COUNT(*) c FROM pr_disclosure WHERE repo_id != {rid}",
         ),
         (
             "commits_features",

@@ -13,7 +13,7 @@ import subprocess
 
 import pytest
 
-from coding_stats import aiattr, cli, gitwalk, prsweep
+from coding_stats import aiattr, cli, gitwalk, prsource, prsweep
 from conftest import (
     OBSERVED_AT,
     TRAILER_LINE,
@@ -52,48 +52,53 @@ def fetch_log(monkeypatch):
 
 
 def test_pr_signals_body_footer_bot_author_and_branch_prefix():
-    m = {
-        (x.rule, x.raw): (x.harness, x.model)
-        for x in aiattr.pr_matches(
-            body="Assisted-by: codex:gpt-5\n",
-            author_login="dependabot[bot]",
-            author_is_bot=True,
-            head_branch="claude/feature",
-        )
-    }
+    rows = aiattr.pr_matches(
+        body="Assisted-by: codex:gpt-5\n",
+        author_login="dependabot[bot]",
+        author_is_bot=True,
+        head_branch="claude/feature",
+    )
+    m = {(x.rule, x.raw): (x.harness, x.model) for x in rows}
     assert ("tool-trailer", "codex:gpt-5") in m
     assert m[("tool-trailer", "codex:gpt-5")] == ("codex", "gpt-5")
     assert ("name-suffix", "dependabot[bot]") in m
     assert m[("name-suffix", "dependabot[bot]")] == ("dependabot", None)
     assert ("branch-prefix", "claude/feature") in m
     assert m[("branch-prefix", "claude/feature")] == ("claude", None)
-    attr = aiattr.pr_attribution(
-        body="Assisted-by: codex:gpt-5\n",
-        author_login="dependabot[bot]",
-        author_is_bot=True,
-        head_branch="claude/feature",
-    )
-    assert attr.verdict == "yes"  # rules 1-5 matched (bot author is a yes-tier hit)
+    # the combined verdict over the match tiers: rules 1-5 matched (the bot
+    # author is a yes-tier hit) — the canonical strongest() ladder
+    assert aiattr.strongest(x.verdict for x in rows) == "yes"
 
 
 def test_pr_signals_plain_human_and_unprefixed_branch_are_no_evidence():
-    attr = aiattr.pr_attribution(
+    rows = aiattr.pr_matches(
         body="just a description\n",
         author_login="daniel",
         author_is_bot=False,
         head_branch="feature/x",
     )
-    assert attr.verdict == "no-evidence"
-    assert attr.evidence == ()
+    assert rows == ()  # no match rows: no evidence
+    assert aiattr.strongest(x.verdict for x in rows) == "no-evidence"
 
 
 def test_pr_signals_bot_author_without_suffix_pattern_still_names_harness():
-    rows = aiattr.pr_matches(
-        body="", author_login="renovate", author_is_bot=True, head_branch=None
-    )
+    rows = aiattr.pr_matches(body="", author_login="renovate", author_is_bot=True, head_branch=None)
     assert [(x.rule, x.raw, x.harness) for x in rows] == [
         ("name-suffix", "renovate", "renovate"),
     ]
+
+
+def test_pr_signals_prose_naming_a_tool_is_never_a_body_signature():
+    # integration prose in the PR body names the tool but carries no
+    # Generated-with signature: no yes-tier attribution from it
+    rows = aiattr.pr_matches(
+        body="This PR wires up the Gemini CLI provider alongside the others.\n",
+        author_login="daniel",
+        author_is_bot=False,
+        head_branch="feature/x",
+    )
+    assert rows == ()
+    assert aiattr.strongest(x.verdict for x in rows) == "no-evidence"
 
 
 # ---------------------------------------------------------------------------
@@ -108,17 +113,17 @@ def test_list_row_without_merged_key_is_classified_by_merged_at():
     merged_row = pr(5)
     assert "merged" not in merged_row
     assert merged_row["merged_at"]
-    assert prsweep._parse_pr(merged_row).merged
+    assert prsource._parse_pr(merged_row).merged
 
     unmerged_row = pr(6, merged=False)
     assert "merged" not in unmerged_row
     assert unmerged_row["merged_at"] is None
-    assert not prsweep._parse_pr(unmerged_row).merged
+    assert not prsource._parse_pr(unmerged_row).merged
 
     # a bare list row with merged_at and nothing else merges-classifies
-    parsed = prsweep._parse_pr({"number": 7, "merged_at": "2026-10-29T12:00:00+00:00"})
+    parsed = prsource._parse_pr({"number": 7, "merged_at": "2026-10-29T12:00:00+00:00"})
     assert parsed.merged and parsed.number == 7
-    assert not prsweep._parse_pr({"number": 8, "merged_at": None}).merged
+    assert not prsource._parse_pr({"number": 8, "merged_at": None}).merged
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +134,7 @@ def test_list_row_without_merged_key_is_classified_by_merged_at():
 def test_list_pages_cost_is_one_batch_of_list_requests():
     pulls = [pr(n, merged=(n % 2 == 0)) for n in range(250, 0, -1)]
     t = FakeTransport(pulls)
-    listing = prsweep.list_pulls("dahep", "coding-stats", 0, transport=t)
+    listing = prsource.list_pulls("dahep", "coding-stats", 0, transport=t)
     assert listing.requests == 3 == -(-250 // 100)  # ceil(n/100): list pages only
     assert all(
         "pulls?" in u and "repos/dahep/coding-stats/pulls" in u and "state=all" in u for u in t.urls
@@ -140,9 +145,19 @@ def test_list_pages_cost_is_one_batch_of_list_requests():
 def test_list_stops_paging_at_the_bound():
     pulls = [pr(n) for n in range(250, 0, -1)]
     t = FakeTransport(pulls)
-    listing = prsweep.list_pulls("dahep", "coding-stats", 240, transport=t)
+    listing = prsource.list_pulls("dahep", "coding-stats", 240, transport=t)
     assert [p.number for p in listing.merged] == [241, 242, 243, 244, 245, 246, 247, 248, 249, 250]
     assert listing.requests == 2  # second page is entirely <= the bound: stop
+
+
+def test_list_pulls_binds_the_patched_default_transport_when_injected_none(monkeypatch):
+    # the default-transport seam lives in prsource: patching
+    # prsource.default_transport serves a transport-less list_pulls
+    t = FakeTransport([pr(5)])
+    monkeypatch.setattr(prsource, "default_transport", lambda url: t(url))
+    listing = prsource.list_pulls("dahep", "coding-stats", 0)
+    assert [p.number for p in listing.merged] == [5]
+    assert t.urls  # the patched default served the page
 
 
 def test_sweep_costs_list_pages_only_over_many_prs(tmp_path, repo):
@@ -206,7 +221,7 @@ def test_squash_pr_recovers_evidence_the_walk_would_miss(tmp_path, repo, fetch_l
     assert tuple(v) == ("no-evidence", None, None)
 
     # the reconstructed harness/model the walk could not know
-    eff = prsweep.effective_attribution(conn, commit_id(conn, squash))
+    eff = aiattr.resolve(conn, commit_id(conn, squash)).attribution
     assert eff.verdict == "yes"
     assert eff.harness == "claude"  # rank-first evidence naming one (co-authored-by)
     assert eff.model == "Opus 4.8 (1M context)"
@@ -383,10 +398,11 @@ def test_force_pushed_head_is_suspicious_marked_never_attribution(tmp_path, repo
     assert all(r[7] == 1 for r in rows)  # suspicious-marked
     assert {r[2] for r in rows} >= {"co-authored-by", "body-signature"}
     # and they never become attribution
-    eff = prsweep.effective_attribution(conn, commit_id(conn, squash))
+    eff = aiattr.resolve(conn, commit_id(conn, squash)).attribution
     assert eff.verdict == "no-evidence"
     assert eff.harness is None and eff.model is None
     assert eff.evidence == ()
+    assert aiattr.resolve(conn, commit_id(conn, squash)).channel == ""  # nothing contributed
 
 
 def test_walked_landing_with_unmappable_head_is_suspicious_not_a_wait(tmp_path, repo, fetch_log):
@@ -440,7 +456,7 @@ def test_vanished_head_ref_is_recorded_suspicious_not_attributed(tmp_path, repo,
     assert res.suspicious > 0
     rows = pr_rows(conn, 2)
     assert rows and all(r[0] is None and r[7] == 1 for r in rows)
-    eff = prsweep.effective_attribution(conn, commit_id(conn, squash))
+    eff = aiattr.resolve(conn, commit_id(conn, squash)).attribution
     assert eff.verdict == "no-evidence"
 
 
@@ -516,11 +532,17 @@ def test_git_evidence_outranks_inherited_pr_evidence(tmp_path, repo):
         OBSERVED_AT,
     )
     conn.commit()
-    eff = prsweep.effective_attribution(conn, cid)
+    resolved = aiattr.resolve(conn, cid)  # ONE read carries all three views
+    eff = resolved.attribution
     assert eff.harness == "codex"  # the git-only evidence outranks
     assert eff.model == "gpt-5"
+    # the canonical resolver: ONE read carries the attribution, the resolved
+    # channel and the channel-tagged rows
+    assert resolved.channel == "git"
+    assert [c for c, _, _, _ in resolved.tagged] == ["git", "pr", "pr"]
+    assert "evil[bot]" not in {raw for _, _, raw, _ in resolved.tagged}
     # audit rows keep their provenance, git first; suspicious rows excluded
-    seen = prsweep.effective_evidence(conn, cid)
+    seen = aiattr.effective_evidence(conn, cid)
     assert [c for c, _, _, _ in seen] == ["git", "pr", "pr"]
     assert "evil[bot]" not in {raw for _, _, raw, _ in seen}
 
@@ -538,9 +560,10 @@ def test_pr_evidence_fills_where_git_evidence_is_silent(tmp_path, repo):
         OBSERVED_AT,
     )
     conn.commit()
-    eff = prsweep.effective_attribution(conn, cid)
+    eff = aiattr.resolve(conn, cid).attribution
     assert eff.verdict == "yes"
     assert eff.harness == "claude" and eff.model == "Opus 4.8"
+    assert aiattr.resolve(conn, cid).channel == "pr"  # no git rows: pr is the resolved channel
 
 
 # ---------------------------------------------------------------------------
@@ -623,9 +646,9 @@ def test_squash_plausibility_never_trusts_none_on_none(tmp_path, repo, fetch_log
     assert all(r[7] == 0 for r in rows)  # and NOT suspicious
     # no false trust: nothing is attached to any walked commit
     assert (
-        conn.execute(
-            "SELECT COUNT(*) c FROM pr_evidence WHERE commit_id IS NOT NULL"
-        ).fetchone()["c"]
+        conn.execute("SELECT COUNT(*) c FROM pr_evidence WHERE commit_id IS NOT NULL").fetchone()[
+            "c"
+        ]
         == 0
     )
 
@@ -675,7 +698,7 @@ def test_cli_pr_sweep_verb(tmp_path, repo, monkeypatch, capsys):
     conn.close()
 
     t = FakeTransport([pr(5, body="Generated with Codex.\n", head="claude/feature")])
-    monkeypatch.setattr(prsweep, "default_transport", lambda url: t(url))
+    monkeypatch.setattr(prsource, "default_transport", lambda url: t(url))
     cli.main(["pr-sweep", "--db", str(db), "--after-pr", "0"])
     out = capsys.readouterr().out
     assert "pr-sweep" in out and "1 PR" in out
@@ -691,3 +714,65 @@ def test_cli_pr_sweep_requires_non_negative_bound(tmp_path, repo):
     cli.main(["init", str(repo), "--db", str(db)])
     with pytest.raises(SystemExit):
         cli.main(["pr-sweep", "--db", str(db), "--after-pr", "-1"])
+
+
+def test_cli_pr_sweep_fails_explicitly_on_sweep_error(tmp_path, repo, monkeypatch):
+    # configuration errors stay explicit through run(): pr-sweep still exits
+    # with the error — SweepError is never laundered into a clean stop
+    commit_files(repo, "init", {"a.txt": "a\n"})
+    db = tmp_path / "cli.db"
+    cli.main(["init", str(repo), "--db", str(db)])
+
+    def boom(*_a, **_k):
+        raise prsweep.SweepError("no GitHub origin")
+
+    monkeypatch.setattr(prsweep, "sweep_increment", boom)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["pr-sweep", "--db", str(db)])
+    assert "error" in str(exc.value) and "no GitHub origin" in str(exc.value)
+
+
+def test_cli_pr_sweep_operational_failure_is_a_clean_unavailable_notice(
+    tmp_path, repo, monkeypatch, capsys
+):
+    # an expected operational failure is a clean stop now: a visible notice
+    # carrying the detail, exit 0 — never a traceback, never a failure exit
+    commit_files(repo, "init", {"a.txt": "a\n"})
+    db = tmp_path / "cli.db"
+    cli.main(["init", str(repo), "--db", str(db)])
+    monkeypatch.setattr(prsweep, "_github_repo", lambda _conn: ("dahep", "coding-stats"))
+
+    def boom(*_a, **_k):
+        raise ValueError("bad API body")
+
+    monkeypatch.setattr(prsource, "default_transport", boom)
+    cli.main(["pr-sweep", "--db", str(db)])  # exits cleanly: no SystemExit
+    out = capsys.readouterr().out
+    assert "::notice::pr-sweep unavailable" in out
+    assert "bad API body" in out  # useful detail
+    assert "pr-sweep: 0 PRs recorded" in out  # listing failed before the prefix
+
+
+def test_cli_pr_sweep_never_launders_runtime_errors(tmp_path, repo, monkeypatch):
+    commit_files(repo, "init", {"a.txt": "a\n"})
+    db = tmp_path / "cli.db"
+    cli.main(["init", str(repo), "--db", str(db)])
+    monkeypatch.setattr(prsweep, "_github_repo", lambda _conn: ("dahep", "coding-stats"))
+
+    def boom(*_a, **_k):
+        raise RuntimeError("invariant broken")
+
+    monkeypatch.setattr(prsource, "default_transport", boom)
+    with pytest.raises(RuntimeError, match="invariant broken"):
+        cli.main(["pr-sweep", "--db", str(db)])
+
+
+def test_unavailable_notice_preserves_prefix_counts_and_sanitizes_detail(capsys):
+    res = prsweep.SweepResult(1, 2, 0, 1, 1, prsweep.STOP_UNAVAILABLE, "bad\n::error::injected")
+    cli._report_sweep(res)
+    out = capsys.readouterr().out
+    assert "pr-sweep: 1 PRs recorded (2 rows, 0 suspicious)" in out
+    assert "watermark 1, the next run resumes" in out
+    assert "watermark 1 kept" not in out
+    assert "bad ::error::injected" in out
+    assert "\n::error::injected" not in out

@@ -83,11 +83,14 @@ are recorded for audit and never contribute to any verdict or identity.
 - `aiattr.matches(CommitFacts)` / `aiattr.attribute(...)` — git channel
   (rules over author/committer names and emails plus message text);
   rows land in `ai_evidence` + `ai_attribution`, re-derived on recompute.
-- `aiattr.pr_matches(...)` / `pr_attribution(...)` — PR channel; rows land
-  in `pr_evidence` (channel `pr`, recorded once per (PR, commit, rule),
-  replaced per PR on re-runs).
-- `prsweep.effective_attribution(...)` — channel-precedence resolution:
-  git-first, strongest tier wins for the verdict, suspicious rows excluded.
+- `aiattr.pr_matches(...)` — PR channel; rows land in `pr_evidence`
+  (channel `pr`, recorded once per (PR, commit, rule), replaced per PR on
+  re-runs).
+- `aiattr.resolve(...)` (row view: `effective_evidence`; the summary is
+  `resolve(...).attribution`) — channel-precedence resolution, owned by the
+  aiattr leaf: git-first, strongest tier wins for the verdict, suspicious
+  rows excluded — ONE evidence read per commit carrying the attribution,
+  the resolved channel and the channel-tagged rows.
 - Ranking (`aiattr.RULE_RANK`) orders evidence 1–6 for harness/model
   attribution and report display; the verdict needs only the tier.
 

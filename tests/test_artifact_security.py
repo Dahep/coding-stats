@@ -17,7 +17,7 @@ import pytest
 
 from coding_stats import artifact, recovery
 from coding_stats.cli import main
-from conftest import commit_files, run, store_dir
+from conftest import commit_files, rechecksum, run, store_dir, strip_tables
 
 
 class Scripted:
@@ -49,18 +49,9 @@ def _updated_repo(tmp_path) -> Path:
     return repo
 
 
-def _rechecksum(data: bytes) -> bytes:
-    """Recompute the embedded digest like an attacker would (unkeyed)."""
-    m = re.search(rb"^-- digest:(?: [0-9a-f]+)?$", data, re.M)
-    assert m is not None
-    blanked = data[: m.start()] + b"-- digest:" + data[m.end() :]
-    digest = hashlib.sha256(blanked).hexdigest()
-    return blanked.replace(b"-- digest:\n", f"-- digest: {digest}\n".encode(), 1)
-
-
 def _hostile_artifact(repo: Path, payload: str) -> bytes:
     art = store_dir(repo) / "coding-stats.sql"
-    return _rechecksum(art.read_bytes() + ("\n" + payload + "\n").encode())
+    return rechecksum(art.read_bytes() + ("\n" + payload + "\n").encode())
 
 
 HOSTILE = [
@@ -109,27 +100,6 @@ def test_recovery_rebuild_refuses_hostile_anchor(tmp_path):
     old.close()
 
 
-def _drop_tables(data: bytes, *tables: str) -> bytes:
-    """Artifact bytes with the named tables' bodies removed, digest
-    re-stamped — crafted content VERIFIES (the test_ai_attribution_artifact
-    crafting pattern)."""
-    text = data.decode("utf-8")
-    out: list[str] = []
-    skipping = False
-    for line in text.splitlines(keepends=True):
-        if any(line.startswith(f"CREATE TABLE {t} ") for t in tables):
-            skipping = True
-            continue
-        if skipping:
-            if line.strip() == ");":
-                skipping = False
-            continue
-        if any(line.startswith(f"INSERT INTO {t} ") for t in tables):
-            continue
-        out.append(line)
-    return _rechecksum("".join(out).encode("utf-8"))
-
-
 @pytest.mark.parametrize("table", ["commits", "features", "commit_verdicts"])
 def test_materialize_refuses_an_artifact_missing_a_core_table(tmp_path, table):
     # shape completion is for post-step-3 tables only: a CORE table is never
@@ -137,7 +107,7 @@ def test_materialize_refuses_an_artifact_missing_a_core_table(tmp_path, table):
     repo = _updated_repo(tmp_path)
     art = store_dir(repo) / "coding-stats.sql"
     assert artifact.verify(art) is None
-    mutilated = _drop_tables(art.read_bytes(), table)
+    mutilated = strip_tables(art.read_bytes(), table)
     assert artifact.verify_bytes(mutilated) is None  # the digest is not the guard
     conn = sqlite3.connect(":memory:")
     try:
@@ -160,3 +130,53 @@ def test_benign_artifact_materializes_with_curated_shape(tmp_path):
         assert cols == list(spec), name
     assert conn.execute("SELECT COUNT(*) c FROM features").fetchone()["c"] == 1
     conn.close()
+
+
+def test_conftest_crafting_helpers_keep_crafted_bytes_identical():
+    """The shared conftest crafting helpers re-seat the digest byte-identically
+    to the per-suite formulas they replace (blank -> append -> sha256 ->
+    restamp), and strip_tables removes exactly the named table's body — a
+    table name never strips its namesakes. Crafted artifacts keep their
+    exact bytes through the consolidation."""
+    content = (
+        "-- coding-stats artifact\n"
+        "-- format: 1\n"
+        "-- schema-step: 8\n"
+        "-- repository-key: local:x@main\n"
+        "-- covered-through: \n"
+        f"-- digest: {'ab' * 32}\n"
+        "CREATE TABLE commits (\n"
+        "        id INTEGER\n"
+        "        );\n"
+        "CREATE TABLE commits_features (\n"
+        "        commit_id INTEGER\n"
+        "        );\n"
+        "INSERT INTO commits (id) VALUES (1);\n"
+        "INSERT INTO commits_features (commit_id) VALUES (1);\n"
+    )
+
+    def legacy_reseat(text: str, needle: str) -> bytes:
+        """The per-suite formula these helpers replace (frozen reference):
+        blank the digest, append the needle, re-stamp over the tampered text."""
+        digest = re.search(r"^-- digest: ([0-9a-f]+)$", text, re.M).group(1)
+        blanked = text.replace(f"-- digest: {digest}", "-- digest:", 1)
+        tampered = blanked + needle
+        restamped = hashlib.sha256(tampered.encode()).hexdigest()
+        return tampered.replace("-- digest:", f"-- digest: {restamped}", 1).encode()
+
+    needle = "INSERT INTO commits (id) VALUES (999999);\n"
+    assert rechecksum(content.encode() + needle.encode()) == legacy_reseat(content, needle)
+
+    kept = (
+        "-- coding-stats artifact\n"
+        "-- format: 1\n"
+        "-- schema-step: 8\n"
+        "-- repository-key: local:x@main\n"
+        "-- covered-through: \n"
+        f"-- digest: {'ab' * 32}\n"
+        "CREATE TABLE commits_features (\n"
+        "        commit_id INTEGER\n"
+        "        );\n"
+        "INSERT INTO commits_features (commit_id) VALUES (1);\n"
+    )
+    assert strip_tables(content.encode(), "commits") == legacy_reseat(kept, "")

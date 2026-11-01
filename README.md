@@ -91,7 +91,7 @@ uv run coding-stats update  --db ~/.coding-stats/coding-stats.db [--detect-pr]  
 uv run coding-stats report  --db ~/.coding-stats/coding-stats.db --json --charts [--html out.html]
 uv run coding-stats ci init [--branch main] [--no-report] [--detect-pr] [--upgrade]  # in the target repo
 uv run coding-stats ci land --branch main                              # landing verb
-uv run coding-stats pr-sweep --db db [--full | --after-pr N] [--max-prs K]  # PR-channel plumbing face
+uv run coding-stats pr-sweep --db db [--full | --after-pr N | --skip-pr N | --unskip-pr N] [--max-prs K]  # PR-channel plumbing face
 uv run coding-stats migrate . --data-branch     # ADR-0003 store -> the Data branch
 uv run coding-stats gather --db union.db ~/dotfiles ~/.config-repo     # union of artifacts
 ```
@@ -202,20 +202,32 @@ workflow is a drift edit like any other.
   action runs:
   `git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"`.
 - **Disclosure** — whenever the mode is on, the run prints
-  `GitHub-sourced (PR-channel) evidence present`; the Artifact carries the
-  evidence rows and the watermark, and report/Pages output renders the same
-  line wherever PR-channel rows contribute.
-- **Full-history backfill** — the `pr-backfill: full` passthrough re-sweeps
-  the whole PR numbering (same merge-date machinery, sharing the same
-  marker — later push runs continue after it), for explicit
-  `workflow_dispatch` callers:
+  `GitHub-sourced (PR-channel) evidence present`; every sweep face records
+  the disclosure as a marker row (`pr_disclosure`: one row per repository,
+  a row meaning the PR tier has run) before it lists any PRs, so the
+  Artifact carries the marker beside the evidence rows and the watermark,
+  and report/Pages output renders the line whenever the tier has run — even
+  on a run that recorded zero non-suspicious evidence rows. Artifacts from
+  before the marker existed disclose on their non-suspicious PR-channel
+  rows instead.
+- **History backfill (batched)** — the `pr-backfill: full` passthrough
+  backfills the unincorporated PR history for explicit `workflow_dispatch`
+  callers: the increment's resume machinery (merged PRs past the marker,
+  oldest merge first), bounded at 250 PRs per invocation. Each dispatch
+  sweeps up to 250 PRs, ends cleanly at the cap or at the end of history,
+  and `ci land` persists that disjoint chunk with the watermark — the next
+  identical dispatch continues past it (never restarting at PR 1) until
+  history is caught up, so a timeout never loses unlanded progress. It
+  never re-records history below the marker: the explicit re-sweep of
+  already-incorporated history is the direct `pr-sweep --full` plumbing
+  face (uncapped by default):
 
 ```yaml
 on:
   workflow_dispatch:
     inputs:
       pr-backfill:
-        description: "full = re-sweep the entire PR history"
+        description: "full = backfill the unincorporated PR history (250 per run)"
         default: ""
 jobs:
   update:
@@ -223,6 +235,19 @@ jobs:
     #   detect-pr: "true"
     #   pr-backfill: ${{ inputs.pr-backfill }}
 ```
+- **Operator skip** — a permanently unprocessable PR (unwalkable,
+  unmappable) would stall every run at it; `pr-sweep --skip-pr N` marks it
+  and `--unskip-pr N` clears the mark. Marking records ONLY one audit-only
+  `operator-skip` evidence row (suspicious, never attribution, the PR's
+  other rows untouched) and never moves the marker itself — the next
+  ordered run advances past the marked PR when it reaches it. This is safe:
+  the marker never jumps over earlier unprocessed PRs (advancement happens
+  strictly in processing order), and the skip row is audit-only. After the
+  marker has passed a PR, clearing its skip does not make increments/backfills
+  select it again: run `pr-sweep --full` to re-record that PR. Skip marks are
+  working-DB state; CI uses a throwaway DB, so persist a local mark by running
+  `coding-stats update --db <db>` to serialize it and `coding-stats ci land`
+  to land the Artifact before expecting CI to resume past the wedged PR.
 
 Spec: [ADR-0007](docs/adr/0007-pr-channel-attribution.md); the detection
 rules themselves: [the commit-attribution

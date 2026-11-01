@@ -10,10 +10,8 @@ import os
 import subprocess
 
 from coding_stats import gitwalk
-from conftest import make_db, run
+from conftest import TRAILER_LINE, TRAILER_VALUE, make_db, run
 
-TRAILER_VALUE = "Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
-TRAILER_LINE = f"Co-authored-by: {TRAILER_VALUE}"
 SQUASH_MSG = (
     "feat: add the thing (#123)\n"
     "\n"
@@ -73,8 +71,14 @@ def evidence(conn):
         " ORDER BY c.walk_index, e.rule, e.raw"
     ):
         out.setdefault(r["sha"], []).append((r["rule"], r["raw"], r["verdict"]))
-    rank = {"co-authored-by": 1, "agent-email": 2, "name-suffix": 3, "body-signature": 4,
-            "tool-trailer": 5, "branch-prefix": 6}
+    rank = {
+        "co-authored-by": 1,
+        "agent-email": 2,
+        "name-suffix": 3,
+        "body-signature": 4,
+        "tool-trailer": 5,
+        "branch-prefix": 6,
+    }
     return {sha: sorted(rows, key=lambda t: (rank[t[0]], t[1])) for sha, rows in out.items()}
 
 

@@ -8,12 +8,11 @@ skill-stats layout to coding-stats (ADR-0005)."""
 import argparse
 import json
 import sqlite3
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
-from . import ci, datastore, db, gitwalk, identity, prsweep
+from . import aiattr, ci, datastore, db, gitwalk, identity, prsource, prsweep
 from .classify import DEFAULT_MODEL, SESSION_DIR, Session, classify_pending
 from .lineage import close_lineage
 from .targets import annotate_all
@@ -95,9 +94,13 @@ def main(argv: list[str] | None = None) -> None:
         choices=("full",),
         default=None,
         metavar="full",
-        help="explicit full-history PR sweep (the workflow_dispatch passthrough"
-        " `pr-backfill: full`): the same watermark machinery walked to the"
-        " beginning of the PR numbering",
+        help="batched history backfill (the workflow_dispatch passthrough"
+        " `pr-backfill: full`): oldest-unincorporated merged PRs past the"
+        " watermark — the increment's resume machinery at 250 PRs per"
+        " invocation (DEFAULT_BACKFILL_CAP). Each run lands one disjoint chunk"
+        " and its watermark, and the next identical dispatch continues past it"
+        " (never restarting at PR 1) until history is caught up. NOT a re-sweep:"
+        " history below the marker is the direct `pr-sweep --full` face's job",
     )
 
     ci_grp = sub.add_parser("ci", help="CI scaffold: workflow rendering + artifact landing")
@@ -114,7 +117,7 @@ def main(argv: list[str] | None = None) -> None:
     ci_init.add_argument(
         "--detect-pr",
         action="store_true",
-        help="render the ADR-0007 clause 1 opt-in: detect-pr: \"true\" on the"
+        help='render the ADR-0007 clause 1 opt-in: detect-pr: "true" on the'
         " action plus pull-requests: read on the update job",
     )
     ci_init.add_argument("--upgrade", action="store_true", help="overwrite a drifted workflow")
@@ -143,7 +146,8 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         metavar="N",
         help="explicit lower bound: record PRs with number > N (N >= 0;"
-        " records without advancing the watermark above the gap below the bound)",
+        " a positive bound never advances the resume marker — only bound 0/full"
+        " claims coverage past the gap below the bound)",
     )
     bound.add_argument(
         "--full",
@@ -151,7 +155,31 @@ def main(argv: list[str] | None = None) -> None:
         help="full-history sweep (explicit operator invocation): re-sweep every"
         " merged PR from the beginning of the numbering, oldest first by merge"
         " date (ties by PR number), sharing the watermark (later push runs"
-        " continue after it)",
+        " continue after it) — the explicit re-sweep face (history below the"
+        " marker included), uncapped unless --max-prs is given. NOT the CI"
+        " backfill: update --pr-backfill full is the batched"
+        " oldest-unincorporated-history face instead",
+    )
+    bound.add_argument(
+        "--skip-pr",
+        type=int,
+        default=None,
+        metavar="N",
+        help="mark PR N to skip (the operator override for a permanently"
+        " unprocessable PR that would stall every run at it): records ONLY an"
+        " audit-only operator-skip row (suspicious, never attribution) and never"
+        " touches the PR's other rows. It does NOT move the marker — the next"
+        " ordered run advances past N when it reaches it, so the marker never"
+        " jumps over earlier unprocessed PRs; the row is audit-only",
+    )
+    bound.add_argument(
+        "--unskip-pr",
+        type=int,
+        default=None,
+        metavar="N",
+        help="clear PR N's operator skip (deletes only the operator-skip row):"
+        " later runs process it normally while it is at/past the resume marker;"
+        " once the marker has passed N, run pr-sweep --full to record it again",
     )
     sweep_p.add_argument(
         "--max-prs",
@@ -312,18 +340,34 @@ def main(argv: list[str] | None = None) -> None:
         print(f"walked {n} new commits (total {total})")
     elif args.cmd == "pr-sweep":
         assert repo_dir is not None, "run init first"
-        branch = str(settings.get("branch") or "")
-        try:
-            if args.full:
-                res = prsweep.sweep_full(conn, repo_dir, branch, max_prs=args.max_prs)
-            elif args.after_pr is not None:
-                res = prsweep.sweep(conn, repo_dir, branch, args.after_pr, max_prs=args.max_prs)
-            else:
-                cap = prsweep.DEFAULT_RUN_CAP if args.max_prs is None else args.max_prs
-                res = prsweep.sweep_increment(conn, repo_dir, branch, max_prs=cap)
-        except prsweep.SweepError as exc:
-            sys.exit(f"error: {exc}")
-        _report_sweep(res)
+        if args.skip_pr is not None or args.unskip_pr is not None:
+            # operator skip/unskip: one audit-only row recorded or cleared.
+            # The marker is never moved here — the next ordered run advances
+            # past a marked PR when it reaches it (never jumping over earlier
+            # unprocessed PRs), and the row is audit-only.
+            try:
+                if args.skip_pr is not None:
+                    prsweep.skip_pr(conn, args.skip_pr)
+                    print(f"pr-sweep: PR {args.skip_pr} marked to skip (audit-only)")
+                else:
+                    prsweep.unskip_pr(conn, args.unskip_pr)
+                    print(f"pr-sweep: PR {args.unskip_pr} skip cleared")
+            except prsweep.SweepError as exc:
+                sys.exit(f"error: {exc}")
+        else:
+            branch = str(settings.get("branch") or "")
+            try:
+                res = prsweep.run(
+                    conn,
+                    repo_dir,
+                    branch,
+                    after_pr=args.after_pr,
+                    full=args.full,
+                    max_prs=args.max_prs,
+                )
+            except prsweep.SweepError as exc:
+                sys.exit(f"error: {exc}")
+            _report_sweep(res)
     elif args.cmd == "classify":
         assert repo_dir is not None, "run init first"
         SESSION_DIR.mkdir(parents=True, exist_ok=True)
@@ -391,14 +435,28 @@ def _report_sweep(res: prsweep.SweepResult) -> None:
         f" watermark {res.watermark}"
     )
     if res.stop is not None:
+        # every stop label is referenced from its owner: the run-policy
+        # labels (cap, walk-stale, fetch-failed, unavailable) live in
+        # prsweep; the HTTP-classified ones in prsource
         notices = {
             prsweep.STOP_CAP: "processing cap reached",
-            prsweep.STOP_RATE_LIMIT: "rate limit exhausted",
-            prsweep.STOP_INTERRUPTED: "interrupted",
+            prsource.STOP_RATE_LIMIT: "rate limit exhausted",
+            prsource.STOP_INTERRUPTED: "interrupted",
             prsweep.STOP_WALK_STALE: "waiting for the walk to catch up",
             prsweep.STOP_FETCH: "a PR head fetch failed (transient git failure)",
         }
-        if res.stop == prsweep.STOP_FORBIDDEN:
+        if res.stop == prsweep.STOP_UNAVAILABLE:
+            # exception text is untrusted, potentially multiline input to a
+            # workflow command: keep the notice on one line
+            detail = " ".join(
+                "".join(ch if ch.isprintable() else " " for ch in (res.detail or "")).split()
+            )
+            suffix = f" ({detail})" if detail else ""
+            print(
+                f"::notice::pr-sweep unavailable{suffix}; watermark {res.watermark},"
+                " the next run resumes past it"
+            )
+        elif res.stop == prsource.STOP_FORBIDDEN:
             # a permissions failure is NOT a rate limit and does not "resume":
             # the notice names the permission that is missing
             print(
@@ -441,8 +499,12 @@ def _run_update(
     ADR-0007 clause 1 (ticket #37): the opt-in PR tier — ``--detect-pr``
     runs the watermark-driven PR-channel increment after the deterministic
     stages and before serialization (so the evidence rows and the watermark
-    ride the artifact), ``--pr-backfill full`` is the explicit full-history
-    face sharing the same watermark. Detection-only: no LLM calls. The off
+    ride the artifact), ``--pr-backfill full`` is the BATCHED backfill face:
+    oldest-unincorporated history past the shared watermark at
+    ``DEFAULT_BACKFILL_CAP`` PRs per invocation, each run landing a disjoint
+    chunk (never a restart at PR 1, never a re-sweep below the marker — the
+    direct ``pr-sweep --full`` face owns that re-sweep) until history is
+    caught up. Detection-only: no LLM calls. The off
     default runs exactly this pipeline, unchanged."""
     import os as _os
 
@@ -587,25 +649,34 @@ def _run_update(
     # enters it at all (no API call, no disclosure).
     if args.detect_pr or args.pr_backfill:
         try:
-            if args.pr_backfill == "full":
-                res = prsweep.sweep_full(conn, repo_dir, branch)
+            if args.pr_backfill:
+                # UPDATE's --pr-backfill full: the BATCHED backfill face —
+                # DEFAULT_BACKFILL_CAP PRs of oldest-unincorporated history
+                # per invocation (never a restart at PR 1, never a re-sweep
+                # below the marker: each dispatch continues past the landed
+                # chunk until history is caught up). The named cap is the
+                # update path's per-invocation bound.
+                res = prsweep.sweep_backfill(
+                    conn, repo_dir, branch, max_prs=prsweep.DEFAULT_BACKFILL_CAP
+                )
             else:
-                res = prsweep.sweep_increment(conn, repo_dir, branch)
-        except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as exc:
-            # best-effort like classification (Q13): an unavailable PR tier
-            # never fails the deterministic pipeline; the watermark is
-            # untouched and a later update resumes past it. ValueError/
-            # KeyError cover malformed API bodies, SubprocessError covers git
-            # failures. KeyboardInterrupt is deliberately NOT caught — an
-            # interrupt is the sweep's own stop condition (and otherwise
-            # stays the operator's).
+                res = prsweep.run(conn, repo_dir, branch)
+        except prsweep.SweepError as exc:
+            # best-effort like classification (Q13): a configuration the PR
+            # tier cannot run against (no GitHub origin, no Target branch)
+            # never fails the deterministic pipeline. Expected operational
+            # failures never reach here — prsweep.run converts them into a
+            # STOP_UNAVAILABLE result, reported below without cli catching
+            # any exception family. KeyboardInterrupt is deliberately NOT
+            # caught — an interrupt is the sweep's own stop condition (and
+            # otherwise stays the operator's).
             print(
                 f"WARNING: pr-sweep unavailable ({exc}); no PR-channel evidence"
                 " recorded this run — a later update resumes past the watermark"
             )
         else:
             _report_sweep(res)
-        print(f"::notice::{prsweep.DISCLOSURE_LINE}")
+        print(f"::notice::{aiattr.DISCLOSURE_LINE}")
 
     if not args.no_serialize:
         path = artifact.write(conn, store_dir)

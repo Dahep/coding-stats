@@ -66,6 +66,7 @@ def _project(conn: sqlite3.Connection) -> sqlite3.Connection:
     _copy_verdicts(conn, out, commit_map)
     _copy_attribution(conn, out, commit_map)
     _copy_watermarks(conn, out)
+    _copy_disclosure(conn, out)
     _copy_features(conn, out, commit_map)
     _copy_links(conn, out, commit_map)
     _repoint_dropped_features(conn, out, commit_map)
@@ -206,10 +207,17 @@ def _copy_watermarks(conn: sqlite3.Connection, out: sqlite3.Connection) -> None:
     derived here."""
     for r in conn.execute("SELECT * FROM pr_watermark ORDER BY repo_id"):
         out.execute(
-            "INSERT INTO pr_watermark (repo_id, last_pr_number, last_merged_at)"
-            " VALUES (?, ?, ?)",
+            "INSERT INTO pr_watermark (repo_id, last_pr_number, last_merged_at) VALUES (?, ?, ?)",
             (r["repo_id"], r["last_pr_number"], r["last_merged_at"]),
         )
+
+
+def _copy_disclosure(conn: sqlite3.Connection, out: sqlite3.Connection) -> None:
+    """The PR-tier disclosure marker rides the projection per repository too
+    (ADR-0007 clause 5): recorded state like the watermark — copied
+    verbatim, never derived here — one row per repo whose PR tier has run."""
+    for r in conn.execute("SELECT repo_id FROM pr_disclosure ORDER BY repo_id"):
+        out.execute("INSERT INTO pr_disclosure (repo_id) VALUES (?)", (r["repo_id"],))
 
 
 def _copy_attribution(

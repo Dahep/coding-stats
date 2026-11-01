@@ -89,10 +89,18 @@ inputs:
     default: "false"
   pr-backfill:
     description: >-
-      Explicit full-history PR sweep passthrough (the workflow_dispatch
-      shape: pr-backfill: full): the same watermark machinery walked to the
-      beginning of the PR numbering. Shares the detect-pr mode's permission
-      scope — the "pull-requests: read" detect-pr adds to the caller.
+      Explicit history-backfill passthrough (the workflow_dispatch shape:
+      pr-backfill: full): batched oldest-unincorporated history — the same
+      watermark machinery as the increment (merged PRs past the resume
+      marker, oldest merge first), bounded at 250 PRs per invocation. Each
+      run sweeps up to 250 PRs, ends cleanly at the cap or at the end of
+      history, and the artifact lands that disjoint chunk with the watermark
+      — a timeout never loses unlanded progress, and the next identical
+      dispatch continues past the landed chunk (never restarting at PR 1)
+      until history is caught up. It never re-records history below the
+      marker: that explicit re-sweep is the direct `pr-sweep --full` verb.
+      Shares the detect-pr mode's permission scope — the "pull-requests:
+      read" detect-pr adds to the caller.
     required: false
     default: ""
 

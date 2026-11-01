@@ -615,6 +615,29 @@ def _step_7(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE pr_watermark ADD COLUMN last_merged_at TEXT")
 
 
+def _step_8(conn: sqlite3.Connection) -> None:
+    """PR-channel disclosure marker (ADR-0007 clause 5, CONTEXT.md
+    "PR-channel disclosure marker").
+
+    The recorded mode state of the PR tier: ONE row per repository, a row
+    meaning the PR tier has RUN against it — nothing else (no enabled
+    boolean, no timestamps). Every sweep face records it before listing any
+    PRs, so a run that finds zero non-suspicious rows — or dies
+    operationally right after — still leaves disclosure on: reports must
+    never lose the fact that GitHub-sourced evidence was consulted. Recorded
+    state exactly like the ``pr_evidence`` rows and the watermark: it rides
+    the Artifact, survives partial recompute and gather unchanged, and is
+    never removed. ``IF NOT EXISTS`` for the same replay reason as steps
+    4-6 (artifact.materialize completes a pre-step-8 artifact's missing
+    known table before this step runs on the replayed DB)."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS pr_disclosure (
+               repo_id INTEGER NOT NULL REFERENCES repositories(id),
+               PRIMARY KEY (repo_id)
+           )"""
+    )
+
+
 SCHEMA_STEPS: list[Step] = [
     STEP_0_SQL,  # 0: initial schema
     _step_1,  # 1: repository identity, repo-scoped commits, prefixed feature ids
@@ -624,4 +647,5 @@ SCHEMA_STEPS: list[Step] = [
     _step_5,  # 5: PR-channel evidence rows — ADR-0007 clauses 3-5 (ticket #35)
     _step_6,  # 6: PR sweep watermark — ADR-0007 clause 2 (ticket #36)
     _step_7,  # 7: PR sweep watermark re-keyed by merge date (2026-10-30 ruling)
+    _step_8,  # 8: PR-channel disclosure marker — ADR-0007 clause 5
 ]
