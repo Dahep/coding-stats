@@ -431,6 +431,8 @@ def run(plan: Plan, repo: Path, no_classify: bool = False) -> list[str]:
                 no_lineage=False,
                 no_report=False,
                 no_serialize=False,
+                detect_pr=False,
+                pr_backfill=None,
             ),
             legacy_store=True,
         )

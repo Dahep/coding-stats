@@ -4,7 +4,7 @@ import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 
-from .schema import SCHEMA_STEPS
+from .schema import RUNS_DDL, SCHEMA_STEPS
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -25,7 +25,23 @@ def connect(path: Path) -> sqlite3.Connection:
             conn.executescript(step)
             conn.execute(f"CREATE TABLE {tablename} (ok)")
             conn.commit()
+    _ensure_machine_local(conn)
     return conn
+
+
+def _ensure_machine_local(conn: sqlite3.Connection) -> None:
+    """Re-create the machine-local tables a restored DB shape needs. The
+    artifact excludes ``runs`` entirely (ADR-0006), yet the working shape
+    references it (``features.created_run_id REFERENCES runs(id)``): a seeded
+    or migrated DB that carries the step markers but skipped step 0's DDL
+    dies on its next ``features`` DML under FK enforcement — without this
+    check even a NULL ``created_run_id`` fails to find the parent table. Idempotent."""
+    has = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'runs'"
+    ).fetchone()
+    if not has:
+        conn.execute(RUNS_DDL)
+        conn.commit()
 
 
 def _apply_migration(

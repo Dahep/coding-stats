@@ -10,7 +10,7 @@ import pytest
 
 from coding_stats.cli import main
 from coding_stats.metrics import churn_per_feature, snapshot
-from conftest import commit_files, run, store_worktree
+from conftest import commit_files, rechecksum, run, store_worktree
 
 
 class Scripted:
@@ -352,8 +352,6 @@ def test_union_sampling_complete_is_least_complete(tmp_path):
 
 
 def test_preflight_rejects_multi_repository_artifact(tmp_path):
-    from test_artifact_security import _rechecksum
-
     repo = _repo_with_artifact(
         tmp_path,
         "alpha-repo",
@@ -365,7 +363,7 @@ def test_preflight_rejects_multi_repository_artifact(tmp_path):
         "\nINSERT INTO repositories (id, repo_key, slug, branch, clone_url, added_at)"
         " VALUES (99, 'local:other@main', 'other', 'main', NULL, '');\n"
     )
-    art.write_bytes(_rechecksum(art.read_bytes() + stray.encode()))
+    art.write_bytes(rechecksum(art.read_bytes() + stray.encode()))
     union = tmp_path / "union.db"
     with pytest.raises(SystemExit) as excinfo:
         main(["gather", "--db", str(union), str(repo)])
@@ -376,8 +374,6 @@ def test_preflight_rejects_multi_repository_artifact(tmp_path):
 
 
 def test_preflight_rejects_stray_foreign_commit_id(tmp_path):
-    from test_artifact_security import _rechecksum
-
     repo = _repo_with_artifact(
         tmp_path,
         "alpha-repo",
@@ -389,7 +385,7 @@ def test_preflight_rejects_stray_foreign_commit_id(tmp_path):
         "\nINSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output,"
         " model, run_id, classified_at) VALUES (999, 'fix', 'r', 'raw', 'm', NULL, 'd');\n"
     )
-    art.write_bytes(_rechecksum(art.read_bytes() + stray.encode()))
+    art.write_bytes(rechecksum(art.read_bytes() + stray.encode()))
     union = tmp_path / "union.db"
     with pytest.raises(SystemExit) as excinfo:
         main(["gather", "--db", str(union), str(repo)])
@@ -418,8 +414,6 @@ def test_gather_dest_not_coding_stats_database(tmp_path):
 
 
 def test_gather_malformed_artifact_clean_error(tmp_path):
-    from test_artifact_security import _rechecksum
-
     repo = _repo_with_artifact(
         tmp_path,
         "alpha-repo",
@@ -427,7 +421,7 @@ def test_gather_malformed_artifact_clean_error(tmp_path):
         ['{"k":"new","title":"one","about":"x","why":"y"}'],
     )
     art = repo / ".coding-stats" / "coding-stats.sql"
-    art.write_bytes(_rechecksum(art.read_bytes() + b"\nINSERT INTO features (id\n"))
+    art.write_bytes(rechecksum(art.read_bytes() + b"\nINSERT INTO features (id\n"))
     union = tmp_path / "union.db"
     with pytest.raises(SystemExit) as excinfo:
         main(["gather", "--db", str(union), str(repo)])

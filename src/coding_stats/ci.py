@@ -49,13 +49,25 @@ class Landing:
     detail: str
 
 
-def render_workflow(branch: str, report: bool = True) -> str:
+def render_workflow(branch: str, report: bool = True, detect_pr: bool = False) -> str:
     """The CALLER workflow adopted in a Target repo (ADR-0006 clause 5):
     a `uses: Dahep/coding-stats@v1` update job (which lands on the Data
     branch `coding-stats/<branch>`) plus a report job triggered on the
     cadence the caller keeps scheduling. Tracked branches are the
-    workflow's own `on.push.branches` filter."""
+    workflow's own `on.push.branches` filter.
+
+    ``detect_pr`` renders the ADR-0007 clause 1 opt-in: the update job
+    passes `detect-pr: "true"` to the action AND gains exactly one
+    permission more — `pull-requests: read`, the PR-tier list API. The off
+    render (the default) is byte-identical to the git-only workflow: no
+    detect-pr input, no pull-requests permission anywhere."""
     b = _yaml_scalar(branch)
+    detect_perms = (
+        "\n      pull-requests: read  # detect-pr only: the PR-tier list API" if detect_pr else ""
+    )
+    detect_input = (
+        '\n          detect-pr: "true"  # opt-in PR tier (ADR-0007 clause 1)' if detect_pr else ""
+    )
     report_job = """
   # Reports render on their own cadence (the store holds only the SQL
   # artifact). This job's permissions: checkout/fetch need contents: read;
@@ -103,7 +115,7 @@ jobs:
       group: coding-${{{{ github.workflow }}}}-${{{{ github.ref_name }}}}
       cancel-in-progress: false
     permissions:
-      contents: write  # the landing commit is the only write (GITHUB_TOKEN)
+      contents: write  # the landing commit is the only write (GITHUB_TOKEN){detect_perms}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -113,7 +125,7 @@ jobs:
       - uses: Dahep/coding-stats@v1
         with:
           opencode-api-key: ${{{{ secrets.OPENCODE_API_KEY }}}}
-          openrouter-api-key: ${{{{ secrets.OPENROUTER_API_KEY }}}}
+          openrouter-api-key: ${{{{ secrets.OPENROUTER_API_KEY }}}}{detect_input}
 {report_job if report else ""}"""
 
 
@@ -134,6 +146,7 @@ def init(
     branch: str,
     report: bool = True,
     upgrade: bool = False,
+    detect_pr: bool = False,
 ) -> list[str]:
     """Write the caller workflow. Identical content is an idempotent
     assertion ('up to date'); drifted content refuses with a diff summary
@@ -141,7 +154,7 @@ def init(
     anything is written — a refusal never leaves a half-written file."""
     datastore.validate_ref(branch)
     plan = [
-        (WORKFLOW_REL, render_workflow(branch, report=report)),
+        (WORKFLOW_REL, render_workflow(branch, report=report, detect_pr=detect_pr)),
     ]
     drifted = []
     for rel, content in plan:
