@@ -379,4 +379,14 @@ def test_ci_dogfood_workflow_is_the_generated_caller_workflow():
     # normalize the single per-repo opt-in on BOTH sides, then compare whole
     for doc in (got, rendered):
         doc["jobs"]["report"]["steps"][-1]["with"]["deploy-pages"] = "normalized"
+    # this repo's own OpenCode sign-in (console service account via GitHub
+    # OIDC) replaces the OPENCODE_API_KEY secret; strip it back to the template
+    update = got["jobs"]["update"]
+    assert update["permissions"].pop("id-token") == "write"
+    steps = update["steps"]
+    assert [s.get("id") for s in steps if "id" in s] == ["opencode-signin"]
+    update["steps"] = [s for s in steps if s.get("id") != "opencode-signin" and "run" not in s]
+    (action,) = [s for s in update["steps"] if s.get("uses") == "Dahep/coding-stats@v1"]
+    assert action["with"]["opencode-api-key"] == "${{ env.OPENCODE_API_KEY }}"
+    action["with"]["opencode-api-key"] = "${{ secrets.OPENCODE_API_KEY }}"
     assert got == rendered
