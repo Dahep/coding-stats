@@ -1,6 +1,9 @@
 # ADR 0001: LLM-based feature classification via opencode CLI
 
-## Status: accepted
+## Status: accepted — the rolling-session clause is superseded by
+ADR-0009 (stateless per-commit classification and the verdict ladder). The
+rest of this ADR stays in force: LLM classification via the opencode CLI,
+the chronological "new or existing" framing, resumability.
 
 ## Context & decision
 

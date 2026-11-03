@@ -12,18 +12,42 @@ A Target repo's identity across machines and clones: clone URL plus the reposito
 **Feature id**:
 A Feature's identifier, globally unique: it names its repository and the Target branch that first classified it. A Feature reached by several Target branches through Shared commits keeps one id.
 
+**Enhancement**:
+A Commit verdict for a commit that extends an existing Feature, linked to that Feature's root Feature — never to another Enhancement. Not counted in features/year; fixes to an Enhancement's lines count against the root Feature.
+_Avoid_: improvement, feature (the old catch-all verdict)
+
 **Fix**:
-A commit that modifies lines belonging to existing commits (of a Feature or of another Fix) without adding a Feature.
+A Commit verdict for a commit that repairs (subtype `repair`) or reverts (subtype `revert`) lines belonging to existing commits of a Feature or another Fix, without adding a Feature.
 _Avoid_: bugfix, patch
 
 **Fix lineage**:
-The relation formed by fixes that target other fixes. A Fix is attributed to every Feature its chain reaches: the Fixes it targets and, transitively, the original Feature(s) — a fix may target several units and so reach several features. Metrics count each Fix once per Feature it reaches.
+The relation formed by fixes that target other commits. A Fix is attributed to every Feature its chain reaches: targets resolve through any Feature link (defining, enhancement or fix commits), blame skips Refactor and Cleanup commits (a link through one is resolved by inheritance), and a fix may reach several Features. Metrics count each Fix once per Feature it reaches.
+
+**Embedded fix**:
+Repair work inside a Feature or Enhancement commit that rewrites at least a threshold number of another Feature's lines: it counts as a Fix of that Feature.
+_Avoid_: hidden fix, drive-by fix
+
+**Area**:
+One of `product`, `test`, `build` or `docs` — the classification of each changed file, from ordered path rules: repo rules first, then built-in defaults, first match wins, with unmatched paths counted as `product`.
+_Avoid_: component, zone
+
+**Upkeep fix**:
+A Fix hit in a `test`, `build` or `docs` file, recorded per Area whichever commit wrote the lines. Reported as its own rates — never in fixes/feature and never as uncovered.
+_Avoid_: maintenance fix
+
+**Fix event**:
+A product-area `fix`-verdict commit (either subtype) or an Embedded fix, counted once per Feature it reaches and dated by its Landing date. The unit of fixes/feature.
+_Avoid_: fix count
+
+**Landing date**:
+When a commit landed on the Target branch — the committer date, the closest git fact about landing (a fast-forward or merge keeps the original date, so it is a proxy). All time bucketing — fixes/feature windows, features/year — uses it, never the author date a rebase preserves.
+_Avoid_: merge date (a PR-tier term), author date
 
 **Feature attribution**:
-The mapping of a commit onto a Feature: directly (the commit defines the feature) or via blame (the commit touches the feature's lines).
+The mapping of a commit onto a Feature: directly (the commit defines the feature) or via a blame hit on the feature's lines.
 
 **Commit verdict**:
-The single LLM-assigned class of a commit: Feature, Fix, Refactor, Revert, or Cleanup. Blame evidence feeds it, but exactly one verdict drives which metrics count the commit.
+The single class a commit is classified into, through the classification ladder (ADR-0009): `feature`, `enhancement`, `fix` (subtype `repair` or `revert`), `refactor`, `cleanup` or `chore` (subtype `docs`, `build`, `test`, `deps` or `other`), plus the system verdicts `merge` and `unknown`. Blame evidence is a hint supplied to the model, never the verdict; every verdict records the source it was obtained from.
 _Avoid_: commit type, category
 
 **AI attribution**:
@@ -46,13 +70,33 @@ _Avoid_: enabled flag, disclosure mode
 A Commit verdict for a change that restructures existing Feature lines without defect repair intent.
 _Avoid_: clean-up, rewrite
 
+**Chore**:
+A Commit verdict for upkeep that changes no product behaviour: docs, build/CI, tests, dependencies (subtypes `docs`, `build`, `test`, `deps`, `other`). It counts as neither a Feature nor a Fix, is never blamed as a fixing commit, is never skipped by blame (a hit lands on the Chore commit itself, which belongs to no Feature), and its lines are unowned; a commit mixing upkeep with functional change takes the functional verdict.
+_Avoid_: maintenance, housekeeping
+
 **Revert**:
-A Commit verdict for a change that undoes an earlier commit (or fixes a revert). A Revert is never counted as a Fix.
+The `revert` subtype of the Fix verdict: a change that undoes an earlier commit. Its target comes from the `This reverts commit <sha>` message line when present, falling back to blame.
 _Avoid_: rollback, undo
+
+**Re-land**:
+A revert of a Revert. It takes on the original commit's verdict and Feature links and is never a Fix.
+_Avoid_: reland, reapply
 
 **Cleanup**:
 A Commit verdict for formatting/whitespace/non-semantic changes.
 _Avoid_: style change, lint commit
+
+**Unowned lines**:
+Lines at the tip owned by walked commits that belong to no Feature, broken down by Commit verdict. Distinct from unattributed lines, which are owned by commits outside the walk.
+_Avoid_: orphan lines
+
+**Provenance**:
+How a decision was obtained, recorded on the decision itself: a verdict's source in its ladder, a fix-to-Feature link's resolution (direct, adjacency, inherited, revert-message) with the Area of each hit. The audit reads nothing else.
+_Avoid_: metadata, source info
+
+**Edge case**:
+A recorded decision the audit lists for review: commits `unknown` after every ladder step, heuristic or fallback-model verdicts, fixes reaching no Feature (the uncovered fixes), non-standard fix resolutions, Reverts, unowned tip lines, near-threshold Embedded fixes.
+_Avoid_: anomaly, outlier
 
 ### opencode domain
 

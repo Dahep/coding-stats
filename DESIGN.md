@@ -14,34 +14,59 @@ matplotlib scripts over SQL queries. Build git-only phase first.
 - **Walk scope**: `main` only (or the Target branch). Squash-merged branch
   commits appear once, as the main-branch squash commit. Patch-equivalent
   commits on main are reconciled via patch-id.
-- **Commit verdict**: each commit is classified once, by the LLM rolling walk:
-  `feature | fix | refactor | revert | cleanup` (+ `merge` kind for merges).
-  Mechanical blame detection of line-deletion is the *evidence*, not the
-  verdict; formatting-only changes classify as `cleanup`, reverts as `revert`
-  (never as fix). Feature metrics (features/year, fixes/feature) count only
-  `feature`-verdict commits in the numerator of features/year; fixes are
-  `fix`-verdict commits.
-- **Feature**: coherent unit of change; LLM-classified. Rolling job via opencode
-  CLI: walk commits chronologically on main, ask "new feature or existing one?",
-  checkpoint/resumable; only new commits classified. Most dotfiles features = 1
-  commit; schema is many-to-many anyway (a commit may define multiple features;
-  a commit may both define a feature and be a fix's target).
-- **Fix**: a `fix`-verdict commit that modifies lines belonging to existing
-  commits (of a feature or another fix). Detection: deletion/rewrite lines vs
-  parent (merge commits use first parent on the Target branch), blamed
-  (`blame -w -C`) at the parent to a commit that defines a feature or a fix.
-- **Targets**: a fix may target several commits. Tables:
+- **Commit verdict**: each commit is classified once, into
+  `feature | enhancement | fix (repair | revert) | refactor | cleanup |
+  chore (docs | build | test | deps | other)` plus the system verdicts
+  `merge | unknown` — stateless per-commit calls in walk order through
+  the classification ladder (ADR-0009: message rules → primary model with
+  one corrective re-ask → later runs: reduced prompt, then fallback model
+  → Conventional Commits prefix → `unknown` with the failure reason).
+  Mechanical blame
+  detection of line-deletion is the *evidence*, not the verdict; every
+  verdict records the source it was obtained from. Feature metrics
+  (features/year) count `feature`-verdict commits; `enhancement` extends
+  one and links to its root; `chore` (docs, build/CI, tests, deps upkeep)
+  counts as neither a Feature nor a Fix and its lines are unowned — blame
+  never skips it (unlike Refactor/Cleanup, a hit lands on the Chore commit
+  and resolves to no Feature), and repairing a defect in upkeep is a `fix`
+  (an Upkeep fix by Area), never left inside `chore`.
+- **Feature**: coherent unit of change; LLM-classified (stateless, resumable
+  via the `unknown` backlog). Most dotfiles features = 1 commit; schema is
+  many-to-many anyway (a commit may define multiple features; a commit may
+  both define a feature and be a fix's target).
+- **Fix**: a `fix`-verdict commit (subtype `repair` or `revert`) that
+  modifies lines belonging to existing commits (of a feature or another
+  fix). Detection: deletion/rewrite lines vs parent (merge commits use
+  first parent on the Target branch), blamed (`blame -w -C`) at the parent
+  to a commit that defines or enhances a feature or is a fix; insert-only
+  fixes match through the lines next to the insertion (adjacency). Reverts
+  are fixes of subtype `revert`, aimed at the commit named in the `This
+  reverts commit <sha>` message line (falling back to blame); a revert of
+  a Revert is a Re-land — the original commit's verdict and links, and
+  the re-landing itself never counted as a fix. Feature or Enhancement
+  commits that rewrite at least a threshold of another Feature's lines
+  are Embedded fixes of it (Refactor, Cleanup and Chore never count as
+  fixes, direct or embedded). Blame skips Cleanup and
+  Refactor commits, inheriting the Features of the lines they replaced.
+  Fixes split by Area (product / test / build / docs, from ordered path
+  rules): only product-area hits reach Features; `test`, `build` and
+  `docs` fixes
+  are Upkeep fixes of their Area, never in fixes/feature, never uncovered.
+- **Targets**: a fix may target several commits (folded into the derive
+  stage with the lineage and live-lines stages below). Tables:
   `fix_touches(fix_commit_id, source_commit_id)` raw blame hits (commit
   granularity, no line ranges), and
   `fix_targets(fix_commit_id, target_commit_id)` many-to-many.
-- **Lineage**: a fix that targets a fix is attributed transitively: to each fix
-  it targets and up-chain to the original feature(s).
-  `fixes_features` precomputed transitive closure so queries avoid recursive
-  CTEs. Metrics count a fix once per feature it reaches.
+- **Lineage**: a fix that targets a non-feature commit is attributed
+  transitively: through any Feature link (defines, enhancement, fix) and
+  up-chain to the original feature(s) — a Refactor or Cleanup in the chain
+  resolves by inheritance to the Features of the lines it replaced.
+  `fixes_features` precomputed transitive closure so queries avoid
+  recursive CTEs. Metrics count a fix once per feature it reaches.
 - **Identity**: feature id assigned once at creation (keyed to defining
-  commits); canonical title locked, later titles kept as history. Incremental
-  runs only classify new commits. Raw LLM verdicts stored per commit for
-  auditability.
+  commits); canonical title locked, later titles kept as history.
+  Incremental runs only classify new commits. Raw LLM verdicts stored per
+  commit for auditability.
 - **User metrics**: dropped for now (single human, 5 author-strings). Author
 - normalization is out of scope.
 
@@ -154,11 +179,21 @@ matplotlib scripts over SQL queries. Build git-only phase first.
   the features the fix targets (via fix lineage); a commit claimed by two
   features counts its lines in both. History: full-sweep backfill of the
   curve at adoption, sampled past a size cap.
-- **Update verb**: `coding-stats update` = verify digest → walk → classify →
-  detect → lineage → live-lines (backfill + tip) → report → serialize +
-  digest, with flags (`--no-classify` etc.) trimming stages for dev/debug.
-  Stage subcommands remain plumbing. Lineage runs before live-lines: fix
-  lines accrue to features through the closure, which must exist first.
+- **Update verb**: `coding-stats update` = verify digest → walk → seed (a
+  fresh working DB's Seeding from sibling Data branches — ADR-0006: Shared
+  commits' classifications reused, classified once; a fresh DB's restore
+  from its own Artifact happens before the walk and is not Seeding) →
+  classify → derive → PR tier (the `detect-pr` face, off by default: off
+  is exactly today's pipeline) → report → serialize + digest,
+  with flags (`--no-classify` etc.) trimming stages for dev/debug. Stage
+  subcommands
+  remain plumbing. Derive (ADR-0008, #48) is the single deterministic stage
+  rebuilding the blame-derived state from scratch — fix attribution,
+  lineage, areas, and the tip's live-lines accounting (the sampled
+  live-lines history stays append-only: forward samples every update,
+  historical samples from the adoption backfill) — so it runs after
+  classify and before anything consumes it; the PR tier runs after derive
+  and before serialize.
 - **Feature size**: per-feature `live_lines` = blame at the Target-branch
   tip, every line owned by exactly one commit; fix-owned lines accrue to
   the features the fix targets (via fix lineage); a commit claimed by two
@@ -185,7 +220,10 @@ matplotlib scripts over SQL queries. Build git-only phase first.
   dropped with a visible neutral status (excluding by fast-forward check);
   superseded runs never block the pushes they trail and never rewrite
   history. Deterministic stages always run; classification best-effort with
-  the backlog marked and reprocessed by a later run; artifact lands as a
+  the backlog marked and reprocessed by a later run (ADR-0009's exit
+  policy: a provided-but-rejected key fails the run after the Artifact
+  lands, a missing key stays green with a visible backlog, transient
+  failures warn); artifact lands as a
   distinct commit parented on the push, pushed with `GITHUB_TOKEN` (ring
   closed by exclusion); report also uploaded as an Actions artifact; Pages
   publishing gated on public/paid repos.
