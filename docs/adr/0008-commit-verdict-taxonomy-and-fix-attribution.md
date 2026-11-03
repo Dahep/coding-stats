@@ -30,9 +30,12 @@ source).
 1. **Chore is upkeep that changes no product behaviour** — docs,
    build/CI config, tests, dependencies (`chore` subtypes `docs`, `build`,
    `test`, `deps`, `other`). It counts as neither a Feature nor a Fix, is
-   never blamed as a fixing commit, and its lines are unowned. A commit
-   that mixes upkeep with functional change takes the functional verdict:
-   `chore` never hides a Feature, Enhancement or Fix.
+   never blamed as a fixing commit, and is never skipped by blame (unlike
+   Refactor and Cleanup, blame passes through it), and its lines are
+   unowned. A commit that mixes upkeep with functional change takes the
+   functional verdict: `chore` never hides a Feature, Enhancement or Fix.
+   Adding or maintaining upkeep is `chore`; repairing a defect in it is a
+   `fix` — an Upkeep fix by Area (decision 6), never left inside `chore`.
 2. **An Enhancement extends an existing Feature and links to that Feature's
    root Feature** — never to another Enhancement, so Features never form
    trees. It is not counted in features/year; fixes to an Enhancement's
@@ -44,8 +47,10 @@ source).
    target comes from the `This reverts commit <sha>` line when present
    (blame cannot find it when the reverted change only deleted lines),
    falling back to blame for hand-written reverts. A revert of a Revert is
-   a **Re-land**: it takes on the original commit's verdict and links and
-   is never a fix, so re-landing does not inflate fix counts. Reverts made
+   a **Re-land**: it takes on the original commit's verdict and links, and
+   the re-landing itself is never counted as a fix — the counts it rejoins
+   are the original commit's, so re-landing does not inflate fix counts.
+   Reverts made
    for non-quality reasons still count — the `revert` subtype keeps them
    separable, and #51 lists them for review.
 4. **Fixes after Refactor or Cleanup count against the original Feature.**
@@ -65,8 +70,9 @@ source).
    Each changed file belongs to one **Area** — `product`, `test`, `build`
    or `docs` — from ordered path rules: repo rules first, then built-in
    defaults, with unmatched paths counted as `product`. Only product-area
-   fix hits reach Features; hits in test, CI or docs files are **Upkeep
-   fixes** of their Area, whichever commit wrote the lines. Upkeep fixes
+   fix hits reach Features; hits in `test`, `build` or `docs` files are
+   **Upkeep fixes** of their Area, whichever commit wrote the lines.
+   Upkeep fixes
    are reported as their own rates, never in fixes/feature and never as
    uncovered — a broken test or workflow is not a defect of the Feature,
    and this keeps tests written in separate commits counting the same way
@@ -81,7 +87,8 @@ source).
 ## Considered Options
 
 - **Keeping Reverts outside fix counts** (the prior ruling): threw away the
-  loudest quality signal; a rollback is a defect of what was rolled back.
+  loudest quality signal — reverting a change is the response to its
+  defect.
 - **Folding docs/build/CI/test commits into `cleanup` or `refactor`**:
   rejected because those commits are new content, not cosmetic rewrites of
   existing lines — and Cleanup/Refactor are skipped by blame, which would

@@ -36,18 +36,18 @@ A Fix hit in a `test`, `build` or `docs` file, recorded per Area whichever commi
 _Avoid_: maintenance fix
 
 **Fix event**:
-A `fix`-verdict commit (either subtype) or an Embedded fix, counted once per Feature it reaches and dated by its Landing date. The unit of fixes/feature.
+A product-area `fix`-verdict commit (either subtype) or an Embedded fix, counted once per Feature it reaches and dated by its Landing date. The unit of fixes/feature.
 _Avoid_: fix count
 
 **Landing date**:
-When a commit landed on the Target branch (the committer date). All time bucketing — fixes/feature windows, features/year — uses it, never the author date a rebase preserves.
+When a commit landed on the Target branch — the committer date, the closest git fact about landing (a fast-forward or merge keeps the original date, so it is a proxy). All time bucketing — fixes/feature windows, features/year — uses it, never the author date a rebase preserves.
 _Avoid_: merge date (a PR-tier term), author date
 
 **Feature attribution**:
 The mapping of a commit onto a Feature: directly (the commit defines the feature) or via blame (the commit touches the feature's lines).
 
 **Commit verdict**:
-The single class a commit is classified into: `feature`, `enhancement`, `fix` (subtype `repair` or `revert`), `refactor`, `cleanup` or `chore` (subtype `docs`, `build`, `test`, `deps` or `other`), plus the system verdicts `merge` and `unknown`. Blame evidence is a hint supplied to the classifier, never the verdict; every verdict records the source it was obtained from.
+The single class a commit is classified into: `feature`, `enhancement`, `fix` (subtype `repair` or `revert`), `refactor`, `cleanup` or `chore` (subtype `docs`, `build`, `test`, `deps` or `other`), plus the system verdicts `merge` and `unknown`. Blame evidence is a hint supplied to the model, never the verdict; every verdict records the source it was obtained from.
 _Avoid_: commit type, category
 
 **AI attribution**:
@@ -75,7 +75,7 @@ A Commit verdict for upkeep that changes no product behaviour: docs, build/CI, t
 _Avoid_: maintenance, housekeeping
 
 **Revert**:
-A Commit verdict for a change that undoes an earlier commit — the `revert` subtype of Fix. Its target comes from the `This reverts commit <sha>` message line when present, falling back to blame.
+The `revert` subtype of the Fix verdict: a change that undoes an earlier commit. Its target comes from the `This reverts commit <sha>` message line when present, falling back to blame.
 _Avoid_: rollback, undo
 
 **Re-land**:
@@ -95,7 +95,7 @@ How a decision was obtained, recorded on the decision itself: a verdict's source
 _Avoid_: metadata, source info
 
 **Edge case**:
-A non-standard decision the pipeline records for audit: commits `unknown` after every ladder step, heuristic or fallback-model verdicts, fixes reaching no Feature, non-standard fix resolutions, Reverts, unowned tip lines, near-threshold Embedded fixes. Listed by the audit verb with counts and per-case detail.
+A non-standard decision the pipeline records for audit: commits `unknown` after every ladder step, heuristic or fallback-model verdicts, fixes reaching no Feature, non-standard fix resolutions, Reverts, unowned tip lines, near-threshold Embedded fixes.
 _Avoid_: anomaly, outlier
 
 ### opencode domain

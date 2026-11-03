@@ -19,40 +19,45 @@ permanently, because the next run retries the same commit first
 dogfood CI classified 0 commits since #31 unnoticed); and a single
 unparsable reply lost a commit's classification for good.
 
-**Classification is stateless.** Each commit is one fresh LLM call, in
+1. **Classification is stateless.** Each commit is one fresh LLM call, in
 walk order. The prompt carries the Feature registry (ordered by recent
 activity, with Features named by the evidence always included), the blame
 evidence, and a diff under a per-file budget (the budget is never spent
 entirely on a lockfile or generated file). The rolling session and its
 stored id are dropped.
 
-The **verdict ladder** drives `unknown` as close to zero as possible while
-recording how every verdict was obtained. In this order:
+2. **The verdict ladder** drives `unknown` as close to zero as possible
+while recording how every verdict was obtained. Steps 1–2 run in the
+commit's first run; a commit that exhausts them is stored `unknown` and
+retried on a later run by steps 3–4, after which the tail (5–6) applies.
+In this order:
 
-1. **Rules** — revert and re-land from the message (`git revert` writes the
-   reverted sha into the message; no LLM call), and the empty-diff `merge`
-   system verdict.
-2. **Primary model**, with one corrective re-ask naming the exact problem
-   (missing field, unknown id, bad JSON) — a fixable mistake is fixed
-   within the same run, and one bad reply never blocks later commits.
-3. **Reduced prompt on a later run** — summary, message and evidence, no
-   diff body — retrying `unknown` commits.
-4. **Fallback model** — one model's blind spot is not every model's.
-5. **Conventional Commits message-prefix heuristic** — `feat`, `fix`,
+   1. **Rules** — revert and re-land from the message (`git revert` writes
+   the reverted sha into the message; no LLM call), and the empty-diff
+   `merge` system verdict.
+   2. **Primary model**, with one corrective re-ask naming the exact
+   problem (missing field, unknown id, bad JSON) — a fixable mistake is
+   fixed within the same run, and one bad reply never blocks later
+   commits.
+   3. **Reduced prompt on a later run** — summary, message and evidence,
+   no diff body — retrying `unknown` commits.
+   4. **Fallback model** — one model's blind spot is not every model's.
+   5. **Conventional Commits message-prefix heuristic** — `feat`, `fix`,
    `revert`, `refactor`, `perf`, `style`, and `docs`/`build`/`ci`/`test`/
    `deps`/`chore` → `chore` subtypes.
-6. **`unknown`**, with the failure reason, attempts and last raw reply
+   6. **`unknown`**, with the failure reason, attempts and last raw reply
    stored for the audit (#51).
 
-Every verdict records its source (`rule`, primary model, fallback model,
-heuristic, system).
+Every verdict records its source; the recorded column refines these ladder
+steps to #49's source vocabulary (`rule-revert`, `rule-reland`, `llm`,
+`llm-reduced`, `llm-fallback`, `heuristic-prefix`, `system`).
 
-The **exit policy**: only transport and auth failures stop classification.
-A key that was provided but rejected fails the CI run after the Artifact
-lands — rejected keys are loud (a `::error::` naming the auth problem),
-while a missing key stays green with a visible backlog notice, and
-transient failures warn. The deterministic stages always complete and the
-Artifact always lands before any such failure.
+3. **The exit policy**: only transport and auth failures stop
+classification. A key that was provided but rejected fails the CI run
+after the Artifact lands — rejected keys are loud (a `::error::` naming
+the auth problem), while a missing key stays green with a visible backlog
+notice, and transient failures warn. The deterministic stages always
+complete and the Artifact always lands before any such failure.
 
 ## Considered Options
 

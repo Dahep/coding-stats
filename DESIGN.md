@@ -17,10 +17,11 @@ matplotlib scripts over SQL queries. Build git-only phase first.
 - **Commit verdict**: each commit is classified once, into
   `feature | enhancement | fix (repair | revert) | refactor | cleanup |
   chore (docs | build | test | deps | other)` plus the system verdicts
-  `merge | unknown` — stateless per-commit calls in walk order through the
-  verdict ladder (ADR-0009: message rules → primary model with one
-  corrective re-ask → reduced prompt → fallback model → Conventional
-  Commits prefix → `unknown` with the failure reason). Mechanical blame
+  `merge | unknown` — stateless per-commit calls in walk order through
+  the classification ladder (ADR-0009: message rules → primary model with
+  one corrective re-ask → later runs: reduced prompt, then fallback model
+  → Conventional Commits prefix → `unknown` with the failure reason).
+  Mechanical blame
   detection of line-deletion is the *evidence*, not the verdict; every
   verdict records the source it was obtained from. Feature metrics
   (features/year) count `feature`-verdict commits; `enhancement` extends
@@ -38,12 +39,15 @@ matplotlib scripts over SQL queries. Build git-only phase first.
   fixes match through the lines next to the insertion (adjacency). Reverts
   are fixes of subtype `revert`, aimed at the commit named in the `This
   reverts commit <sha>` message line (falling back to blame); a revert of
-  a Revert is a Re-land — the original commit's verdict and links, never a
-  fix. Non-fix commits that rewrite at least a threshold of another
-  Feature's lines are Embedded fixes of it. Blame skips Cleanup and
+  a Revert is a Re-land — the original commit's verdict and links, and
+  the re-landing itself never counted as a fix. Feature or Enhancement
+  commits that rewrite at least a threshold of another Feature's lines
+  are Embedded fixes of it (Refactor, Cleanup and Chore never count as
+  fixes, direct or embedded). Blame skips Cleanup and
   Refactor commits, inheriting the Features of the lines they replaced.
   Fixes split by Area (product / test / build / docs, from ordered path
-  rules): only product-area hits reach Features; test, CI and docs fixes
+  rules): only product-area hits reach Features; `test`, `build` and
+  `docs` fixes
   are Upkeep fixes of their Area, never in fixes/feature, never uncovered.
 - **Targets**: a fix may target several commits. Tables:
   `fix_touches(fix_commit_id, source_commit_id)` raw blame hits (commit
@@ -171,14 +175,19 @@ matplotlib scripts over SQL queries. Build git-only phase first.
   the features the fix targets (via fix lineage); a commit claimed by two
   features counts its lines in both. History: full-sweep backfill of the
   curve at adoption, sampled past a size cap.
-- **Update verb**: `coding-stats update` = verify digest → walk → seed →
-  classify → derive → PR tier → serialize + digest, with flags
-  (`--no-classify` etc.) trimming stages for dev/debug. Stage subcommands
+- **Update verb**: `coding-stats update` = verify digest → walk → seed (a
+  fresh working DB; a restored one re-enters through Partial recompute) →
+  classify → derive → PR tier (the `detect-pr` face, off by default: off
+  runs exactly the deterministic pipeline) → report → serialize + digest,
+  with flags (`--no-classify` etc.) trimming stages for dev/debug. Stage
+  subcommands
   remain plumbing. Derive (ADR-0008, #48) is the single deterministic stage
-  rebuilding all blame-derived state from scratch — fix attribution,
-  lineage, areas, live-lines — so it runs after classify and before
-  anything consumes it; the PR tier runs after derive and before
-  serialize.
+  rebuilding the blame-derived state from scratch — fix attribution,
+  lineage, areas, and the tip's live-lines accounting (the sampled
+  live-lines history stays append-only: forward samples every update,
+  historical samples from the adoption backfill) — so it runs after
+  classify and before anything consumes it; the PR tier runs after derive
+  and before serialize.
 - **Feature size**: per-feature `live_lines` = blame at the Target-branch
   tip, every line owned by exactly one commit; fix-owned lines accrue to
   the features the fix targets (via fix lineage); a commit claimed by two
