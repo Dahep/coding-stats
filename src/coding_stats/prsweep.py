@@ -35,8 +35,8 @@ import re
 import sqlite3
 import subprocess
 import urllib.error
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -733,6 +733,33 @@ def _pr_rows(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest)
     records suspicious rows for it and never claims past it — the evidence
     is not lost, the next run after a newer walk redoes it."""
     signals = aiattr.pr_matches(pr.body or "", pr.author_login, pr.author_is_bot, pr.head_ref)
+    mapped = _map_landing(conn, repo, branch, pr)  # the git/API work lives there
+    hits = _detect_heads(repo, mapped.head_commits, mapped.attach)
+    return _assemble(conn, mapped.anchor, hits, signals, mapped.suspicious)
+
+
+@dataclass(frozen=True)
+class _Mapping:
+    """One PR's landing map — the single result of the squash/rebase
+    decision tree: the anchor the evidence attaches at, whether the rows
+    are suspicious, the head commits to detect on, and each head's
+    attachment (a head absent from the map falls back to the anchor in
+    ``_assemble``)."""
+
+    anchor: int | None
+    suspicious: bool
+    head_commits: Sequence[str] = ()
+    attach: dict[str, int] = field(default_factory=dict)
+
+
+def _map_landing(
+    conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest
+) -> _Mapping:
+    """The squash/rebase mapping decision tree, producing ONE ``_Mapping``
+    (raising ``WalkStale`` where required): where the evidence attaches,
+    whether it is suspicious, and which head commits to detect on. Behavior
+    is identical across squash, merge, rebase, suspicious, unmapped and
+    walk-stale evidence."""
     landed = _locate_landing(conn, pr.number)
     if (
         landed is None
@@ -749,13 +776,11 @@ def _pr_rows(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest)
         if kind == "merge":
             # plain merge: skipped entirely by the fetch — the identical
             # commits are already in the repo; record once from them
-            hits = _detect_heads(
-                repo, _merge_head_commits(repo, walk.sha), attach_all=walk.commit_id
-            )
-            return _assemble(conn, walk.commit_id, hits, signals, suspicious=False)
+            heads = _merge_head_commits(repo, walk.sha)
+            return _Mapping(walk.commit_id, False, heads, dict.fromkeys(heads, walk.commit_id))
         tip = fetch_head_ref(repo, pr.number)
         if tip is None:
-            return _assemble(conn, None, [], signals, suspicious=True)
+            return _Mapping(None, True)
         base = gitwalk.merge_base(repo, tip, branch)
         aggregate = gitwalk.patch_id_for_range(repo, base, tip) if base else None
         if not base or (
@@ -765,35 +790,23 @@ def _pr_rows(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest)
         ):
             # not plausibly the PR's merge head (post-merge force-push or a
             # squash subject that named the wrong commit)
-            return _assemble(
-                conn,
-                None,
-                _detect_heads(repo, _safe_range(repo, base, tip)),
-                signals,
-                suspicious=True,
-            )
+            return _Mapping(None, True, _safe_range(repo, base, tip))
         if aggregate is None or walk.subject_patch_id is None:
             # empty diffs carry no patch-id: None on None is NOT a match —
             # no false trust. Genuinely unmapped per the squash strategy, but
             # not suspicious: recorded unattached, never attributed
-            return _assemble(
-                conn,
-                None,
-                _detect_heads(repo, _safe_range(repo, base, tip)),
-                signals,
-                suspicious=False,
-            )
-        hits = _detect_heads(repo, gitwalk.list_range(repo, base, tip), attach_all=walk.commit_id)
-        return _assemble(conn, walk.commit_id, hits, signals, suspicious=False)
+            return _Mapping(None, False, _safe_range(repo, base, tip))
+        heads = gitwalk.list_range(repo, base, tip)
+        return _Mapping(walk.commit_id, False, heads, dict.fromkeys(heads, walk.commit_id))
 
     # rebase-merged (or an unrecognised landing): map the fetched head by
     # patch-id — the rebase twins keep each head commit's patch
     tip = fetch_head_ref(repo, pr.number)
     if tip is None:
-        return _assemble(conn, None, [], signals, suspicious=True)
+        return _Mapping(None, True)
     base = gitwalk.merge_base(repo, tip, branch)
     if base is None:
-        return _assemble(conn, None, [], signals, suspicious=True)
+        return _Mapping(None, True)
     head = gitwalk.list_range(repo, base, tip)
     twins: dict[str, _Walked] = {}
     mapping_failed = False
@@ -812,11 +825,11 @@ def _pr_rows(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest)
         if not has_content:
             # the head carries no patchable content (empty diffs): nothing to
             # map — genuinely unmapped, not suspicious, never a false trust
-            return _assemble(conn, None, _detect_heads(repo, head), signals, suspicious=False)
+            return _Mapping(None, False, head)
         if pr.landing_sha is not None:
             # the landing is walked (checked above) yet nothing maps: a
             # genuinely unmappable head (post-merge force-push) — suspicious
-            return _assemble(conn, None, _detect_heads(repo, head), signals, suspicious=True)
+            return _Mapping(None, True, head)
         # nothing names the PR and nothing maps: its landing cannot be shown
         # to be walked — wait for the walk rather than lose the evidence
         raise WalkStale(
@@ -825,10 +838,9 @@ def _pr_rows(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest)
         )
     if mapping_failed:
         # some head commits map but not all: mapped-but-parentage-failed
-        return _assemble(conn, None, _detect_heads(repo, head), signals, suspicious=True)
+        return _Mapping(None, True, head)
     anchor = max(twins.values(), key=lambda w: w.walk_index).commit_id
-    hits = _detect_heads(repo, head, attach={hc: w.commit_id for hc, w in twins.items()})
-    return _assemble(conn, anchor, hits, signals, suspicious=False)
+    return _Mapping(anchor, False, head, {hc: w.commit_id for hc, w in twins.items()})
 
 
 def _safe_range(repo: Path, base: str | None, tip: str) -> list[str]:
@@ -860,14 +872,15 @@ def _twin_by_patch_id(conn: sqlite3.Connection, patch_id: str) -> _Walked | None
 def _detect_heads(
     repo: Path,
     head_commits: Sequence[str],
-    attach: dict[str, int] | None = None,
-    attach_all: int | None = None,
+    attach: Mapping[str, int],
 ) -> list[tuple[int | None, aiattr.Match]]:
     """Rule-table detection over head commits (#34's engine on the head
-    commits' own facts), each match carried toward its mapped commit id."""
+    commits' own facts), each match carried toward its mapped commit id —
+    ONE per-head attachment map (a head absent from it falls back to the
+    anchor in ``_assemble``)."""
     hits: list[tuple[int | None, aiattr.Match]] = []
     for hc in head_commits:
-        cid = (attach or {}).get(hc) if attach is not None else attach_all
+        cid = attach.get(hc)
         for m in aiattr.matches(gitwalk.commit_facts(repo, hc)):
             hits.append((cid, m))
     return hits
