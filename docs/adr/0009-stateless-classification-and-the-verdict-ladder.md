@@ -52,6 +52,13 @@ Every verdict records its source; the recorded column refines these ladder
 steps to #49's source vocabulary (`rule-revert`, `rule-reland`, `llm`,
 `llm-reduced`, `llm-fallback`, `heuristic-prefix`, `system`).
 
+An `unknown` verdict is RETRY-PENDING until the ladder is exhausted and
+TERMINAL after step 6 — distinguished by the stored attempts and failure
+reason. Within a later run the retries run in the listed order (reduced
+prompt first, then the fallback model, then the heuristic tail); a commit
+never attempted for lack of a key is the exit policy's backlog, not an
+`unknown` — it has no failure reason to store.
+
 3. **The exit policy**: only transport and auth failures stop
 classification. A key that was provided but rejected fails the CI run
 after the Artifact lands — rejected keys are loud (a `::error::` naming

@@ -26,7 +26,10 @@ matplotlib scripts over SQL queries. Build git-only phase first.
   verdict records the source it was obtained from. Feature metrics
   (features/year) count `feature`-verdict commits; `enhancement` extends
   one and links to its root; `chore` (docs, build/CI, tests, deps upkeep)
-  counts as neither a Feature nor a Fix and its lines are unowned.
+  counts as neither a Feature nor a Fix and its lines are unowned — blame
+  never skips it (unlike Refactor/Cleanup, a hit lands on the Chore commit
+  and resolves to no Feature), and repairing a defect in upkeep is a `fix`
+  (an Upkeep fix by Area), never left inside `chore`.
 - **Feature**: coherent unit of change; LLM-classified (stateless, resumable
   via the `unknown` backlog). Most dotfiles features = 1 commit; schema is
   many-to-many anyway (a commit may define multiple features; a commit may
@@ -49,7 +52,8 @@ matplotlib scripts over SQL queries. Build git-only phase first.
   rules): only product-area hits reach Features; `test`, `build` and
   `docs` fixes
   are Upkeep fixes of their Area, never in fixes/feature, never uncovered.
-- **Targets**: a fix may target several commits. Tables:
+- **Targets**: a fix may target several commits (folded into the derive
+  stage with the lineage and live-lines stages below). Tables:
   `fix_touches(fix_commit_id, source_commit_id)` raw blame hits (commit
   granularity, no line ranges), and
   `fix_targets(fix_commit_id, target_commit_id)` many-to-many.
@@ -176,9 +180,11 @@ matplotlib scripts over SQL queries. Build git-only phase first.
   features counts its lines in both. History: full-sweep backfill of the
   curve at adoption, sampled past a size cap.
 - **Update verb**: `coding-stats update` = verify digest → walk → seed (a
-  fresh working DB; a restored one re-enters through Partial recompute) →
+  fresh working DB's Seeding from sibling Data branches — ADR-0006: Shared
+  commits' classifications reused, classified once; a fresh DB's restore
+  from its own Artifact happens before the walk and is not Seeding) →
   classify → derive → PR tier (the `detect-pr` face, off by default: off
-  runs exactly the deterministic pipeline) → report → serialize + digest,
+  is exactly today's pipeline) → report → serialize + digest,
   with flags (`--no-classify` etc.) trimming stages for dev/debug. Stage
   subcommands
   remain plumbing. Derive (ADR-0008, #48) is the single deterministic stage

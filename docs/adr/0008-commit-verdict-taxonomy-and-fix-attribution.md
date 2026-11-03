@@ -20,27 +20,27 @@ invisible. The decisions below restate the taxonomy and fix attribution;
 they are recorded before the implementation specs so their implementers work
 against settled vocabulary.
 
-The verdicts are **`feature`, `enhancement`, `fix` (subtype `repair` or
-`revert`), `refactor`, `cleanup` and `chore` (subtype `docs`, `build`,
-`test`, `deps` or `other`)**, plus the system verdicts **`merge`** and
-**`unknown`**. Blame evidence is a hint supplied to the model, never the
-verdict; and every verdict records how it was obtained (ADR-0009's verdict
-source).
-
-1. **Chore is upkeep that changes no product behaviour** — docs,
+1. **Verdict vocabulary.** The verdicts are **`feature`, `enhancement`,
+   `fix` (subtype `repair` or `revert`), `refactor`, `cleanup` and
+   `chore` (subtype `docs`, `build`, `test`, `deps` or `other`)**, plus
+   the system verdicts **`merge`** and **`unknown`**. Blame evidence is a
+   hint supplied to the model, never the verdict; and every verdict
+   records how it was obtained (ADR-0009's verdict source).
+2. **Chore is upkeep that changes no product behaviour** — docs,
    build/CI config, tests, dependencies (`chore` subtypes `docs`, `build`,
    `test`, `deps`, `other`). It counts as neither a Feature nor a Fix, is
    never blamed as a fixing commit, and is never skipped by blame (unlike
-   Refactor and Cleanup, blame passes through it), and its lines are
-   unowned. A commit that mixes upkeep with functional change takes the
-   functional verdict: `chore` never hides a Feature, Enhancement or Fix.
-   Adding or maintaining upkeep is `chore`; repairing a defect in it is a
-   `fix` — an Upkeep fix by Area (decision 6), never left inside `chore`.
-2. **An Enhancement extends an existing Feature and links to that Feature's
+   Refactor and Cleanup): a hit lands on the Chore commit itself, which
+   belongs to no Feature — hence its lines are unowned. A commit that
+   mixes upkeep with functional change takes the functional verdict:
+   `chore` never hides a Feature, Enhancement or Fix. Adding or
+   maintaining upkeep is `chore`; repairing a defect in it is a `fix` —
+   an Upkeep fix by Area (decision 7), never left inside `chore`.
+3. **An Enhancement extends an existing Feature and links to that Feature's
    root Feature** — never to another Enhancement, so Features never form
    trees. It is not counted in features/year; fixes to an Enhancement's
    lines count against the root Feature it links to.
-3. **Reverts are Fixes** (subtype `revert`). This supersedes CONTEXT.md's
+4. **Reverts are Fixes** (subtype `revert`). This supersedes CONTEXT.md's
    "a Revert is never counted as a Fix" and DESIGN.md's "reverts as
    `revert` (never as fix)": a Revert usually means the reverted change was
    defective — exactly the quality signal the tool exists to measure. The
@@ -49,24 +49,26 @@ source).
    falling back to blame for hand-written reverts. A revert of a Revert is
    a **Re-land**: it takes on the original commit's verdict and links, and
    the re-landing itself is never counted as a fix — the counts it rejoins
-   are the original commit's, so re-landing does not inflate fix counts.
+   are the original commit's, so re-landing does not inflate the Feature's
+   fix events.
    Reverts made
    for non-quality reasons still count — the `revert` subtype keeps them
    separable, and #51 lists them for review.
-4. **Fixes after Refactor or Cleanup count against the original Feature.**
+5. **Fixes after Refactor or Cleanup count against the original Feature.**
    Blame skips Refactor and Cleanup commits; where git still credits a line
    to one (moved files, split helpers, rewritten blocks), the Refactor or
    Cleanup commit takes on the Features of the lines it replaced
    (**inherited resolution**), and a fix to those lines attributes through
    it.
-5. **Embedded fixes.** A Feature or Enhancement commit that rewrites at
+6. **Embedded fixes.** A Feature or Enhancement commit that rewrites at
    least a threshold number of another Feature's lines counts as a fix of
-   that Feature — the squash-merge norm hides repair work inside feature
+   that Feature (the threshold's value is #48's to set) — the squash-merge
+   norm hides repair work inside feature
    PRs, and a minimum threshold keeps incidental contact with shared files
    (imports, registries, configs) from creating fake fixes. A commit's
    edits to its own Feature's lines are ordinary feature evolution, never
    a fix.
-6. **The verdict states intent and never location: any repair is a `fix`.**
+7. **The verdict states intent and never location: any repair is a `fix`.**
    Each changed file belongs to one **Area** — `product`, `test`, `build`
    or `docs` — from ordered path rules: repo rules first, then built-in
    defaults, with unmatched paths counted as `product`. Only product-area
@@ -78,7 +80,7 @@ source).
    and this keeps tests written in separate commits counting the same way
    as tests written with the Feature. The effective rules ride the
    Artifact.
-7. **Every resolution is recorded with its provenance** — direct,
+8. **Every resolution is recorded with its provenance** — direct,
    adjacency (insert-only fixes, matched through the lines next to the
    insertion), inherited (through a named Refactor/Cleanup commit),
    revert-message — plus the Area of each hit and the hit-line count, so
@@ -86,8 +88,8 @@ source).
 
 ## Considered Options
 
-- **Keeping Reverts outside fix counts** (the prior ruling): threw away the
-  loudest quality signal — reverting a change is the response to its
+- **Keeping Reverts outside the fix events** (the prior ruling): threw away
+  the loudest quality signal — reverting a change is the response to its
   defect.
 - **Folding docs/build/CI/test commits into `cleanup` or `refactor`**:
   rejected because those commits are new content, not cosmetic rewrites of
@@ -109,12 +111,9 @@ source).
 
 ## Consequences
 
-- The verdict vocabulary, subtypes and fix attribution rules are the
-  contract for #48 (deterministic derive) and #49 (classification); #50
-  consumes them (fix events, landing dates, upkeep rates); #51 audits the
-  provenance.
-- CONTEXT.md's Revert entry changes meaning; downstream text and metrics
-  that treated Reverts as non-fixes are updated with this ADR.
+- CONTEXT.md's Revert entry now means the fix subtype; metrics that count
+  Reverts as non-fixes change with #48–#50 (until then the recorded
+  verdicts keep the pre-ADR shape).
 - Blame skipping Refactor/Cleanup plus inherited resolution makes derived
   attribution deterministic and run-history-independent: the derive stage
   (#48) rebuilds it from scratch every run.

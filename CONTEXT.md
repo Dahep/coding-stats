@@ -28,7 +28,7 @@ Repair work inside a Feature or Enhancement commit that rewrites at least a thre
 _Avoid_: hidden fix, drive-by fix
 
 **Area**:
-One of `product`, `test`, `build` or `docs` — the classification of each changed file, from ordered path rules: repo rules first, then built-in defaults, with unmatched paths counted as `product`. The Commit verdict states intent and never location: any repair is a Fix.
+One of `product`, `test`, `build` or `docs` — the classification of each changed file, from ordered path rules: repo rules first, then built-in defaults, first match wins, with unmatched paths counted as `product`.
 _Avoid_: component, zone
 
 **Upkeep fix**:
@@ -44,10 +44,10 @@ When a commit landed on the Target branch — the committer date, the closest gi
 _Avoid_: merge date (a PR-tier term), author date
 
 **Feature attribution**:
-The mapping of a commit onto a Feature: directly (the commit defines the feature) or via blame (the commit touches the feature's lines).
+The mapping of a commit onto a Feature: directly (the commit defines the feature) or via a blame hit on the feature's lines.
 
 **Commit verdict**:
-The single class a commit is classified into: `feature`, `enhancement`, `fix` (subtype `repair` or `revert`), `refactor`, `cleanup` or `chore` (subtype `docs`, `build`, `test`, `deps` or `other`), plus the system verdicts `merge` and `unknown`. Blame evidence is a hint supplied to the model, never the verdict; every verdict records the source it was obtained from.
+The single class a commit is classified into, through the classification ladder (ADR-0009): `feature`, `enhancement`, `fix` (subtype `repair` or `revert`), `refactor`, `cleanup` or `chore` (subtype `docs`, `build`, `test`, `deps` or `other`), plus the system verdicts `merge` and `unknown`. Blame evidence is a hint supplied to the model, never the verdict; every verdict records the source it was obtained from.
 _Avoid_: commit type, category
 
 **AI attribution**:
@@ -71,7 +71,7 @@ A Commit verdict for a change that restructures existing Feature lines without d
 _Avoid_: clean-up, rewrite
 
 **Chore**:
-A Commit verdict for upkeep that changes no product behaviour: docs, build/CI, tests, dependencies (subtypes `docs`, `build`, `test`, `deps`, `other`). It counts as neither a Feature nor a Fix, is never blamed as a fixing commit, and its lines are unowned; a commit mixing upkeep with functional change takes the functional verdict.
+A Commit verdict for upkeep that changes no product behaviour: docs, build/CI, tests, dependencies (subtypes `docs`, `build`, `test`, `deps`, `other`). It counts as neither a Feature nor a Fix, is never blamed as a fixing commit, is never skipped by blame (a hit lands on the Chore commit itself, which belongs to no Feature), and its lines are unowned; a commit mixing upkeep with functional change takes the functional verdict.
 _Avoid_: maintenance, housekeeping
 
 **Revert**:
@@ -95,7 +95,7 @@ How a decision was obtained, recorded on the decision itself: a verdict's source
 _Avoid_: metadata, source info
 
 **Edge case**:
-A non-standard decision the pipeline records for audit: commits `unknown` after every ladder step, heuristic or fallback-model verdicts, fixes reaching no Feature, non-standard fix resolutions, Reverts, unowned tip lines, near-threshold Embedded fixes.
+A recorded decision the audit lists for review: commits `unknown` after every ladder step, heuristic or fallback-model verdicts, fixes reaching no Feature (the uncovered fixes), non-standard fix resolutions, Reverts, unowned tip lines, near-threshold Embedded fixes.
 _Avoid_: anomaly, outlier
 
 ### opencode domain
