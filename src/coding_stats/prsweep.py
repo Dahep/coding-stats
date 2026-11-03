@@ -156,8 +156,10 @@ def replace_pr_rows(
     replaced wholesale (by PR number), never extended into duplicates.
     Recorded, never re-derived: no recompute ever rebuilds these rows.
     Row uniqueness is owned by the producer: ``_assemble`` already dedupes
-    per (commit, rule, raw); storage stays a dumb sink guarded by the
-    table's UNIQUE constraint. Returns the stored count."""
+    per (commit, rule, raw) — including the NULL-commit suspicious rows the
+    table's UNIQUE constraint cannot see (SQLite: NULLs are distinct) — and
+    storage stays a dumb sink behind that constraint. Returns the stored
+    count."""
     repo_id = identity.repo_id_for(conn)
     conn.execute(
         "DELETE FROM pr_evidence WHERE repo_id = ? AND pr_number = ?", (repo_id, pr_number)
@@ -739,7 +741,7 @@ def _pr_rows(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest)
 
 
 @dataclass(frozen=True)
-class _Mapping:
+class _LandingMap:
     """One PR's landing map — the single result of the squash/rebase
     decision tree: the anchor the evidence attaches at, whether the rows
     are suspicious, the head commits to detect on, and each head's
@@ -752,8 +754,8 @@ class _Mapping:
     attach: dict[str, int] = field(default_factory=dict)
 
 
-def _map_landing(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest) -> _Mapping:
-    """The squash/rebase mapping decision tree, producing ONE ``_Mapping``
+def _map_landing(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest) -> _LandingMap:
+    """The squash/rebase mapping decision tree, producing ONE ``_LandingMap``
     (raising ``WalkStale`` where required): where the evidence attaches,
     whether it is suspicious, and which head commits to detect on. Behavior
     is identical across squash, merge, rebase, suspicious, unmapped and
@@ -775,10 +777,10 @@ def _map_landing(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequ
             # plain merge: skipped entirely by the fetch — the identical
             # commits are already in the repo; record once from them
             heads = _merge_head_commits(repo, walk.sha)
-            return _Mapping(walk.commit_id, False, heads, dict.fromkeys(heads, walk.commit_id))
+            return _LandingMap(walk.commit_id, False, heads, dict.fromkeys(heads, walk.commit_id))
         tip = fetch_head_ref(repo, pr.number)
         if tip is None:
-            return _Mapping(None, True)
+            return _LandingMap(None, True)
         base = gitwalk.merge_base(repo, tip, branch)
         aggregate = gitwalk.patch_id_for_range(repo, base, tip) if base else None
         if not base or (
@@ -788,23 +790,23 @@ def _map_landing(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequ
         ):
             # not plausibly the PR's merge head (post-merge force-push or a
             # squash subject that named the wrong commit)
-            return _Mapping(None, True, _safe_range(repo, base, tip))
+            return _LandingMap(None, True, _safe_range(repo, base, tip))
         if aggregate is None or walk.subject_patch_id is None:
             # empty diffs carry no patch-id: None on None is NOT a match —
             # no false trust. Genuinely unmapped per the squash strategy, but
             # not suspicious: recorded unattached, never attributed
-            return _Mapping(None, False, _safe_range(repo, base, tip))
+            return _LandingMap(None, False, _safe_range(repo, base, tip))
         heads = gitwalk.list_range(repo, base, tip)
-        return _Mapping(walk.commit_id, False, heads, dict.fromkeys(heads, walk.commit_id))
+        return _LandingMap(walk.commit_id, False, heads, dict.fromkeys(heads, walk.commit_id))
 
     # rebase-merged (or an unrecognised landing): map the fetched head by
     # patch-id — the rebase twins keep each head commit's patch
     tip = fetch_head_ref(repo, pr.number)
     if tip is None:
-        return _Mapping(None, True)
+        return _LandingMap(None, True)
     base = gitwalk.merge_base(repo, tip, branch)
     if base is None:
-        return _Mapping(None, True)
+        return _LandingMap(None, True)
     head = gitwalk.list_range(repo, base, tip)
     twins: dict[str, _Walked] = {}
     mapping_failed = False
@@ -823,11 +825,11 @@ def _map_landing(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequ
         if not has_content:
             # the head carries no patchable content (empty diffs): nothing to
             # map — genuinely unmapped, not suspicious, never a false trust
-            return _Mapping(None, False, head)
+            return _LandingMap(None, False, head)
         if pr.landing_sha is not None:
             # the landing is walked (checked above) yet nothing maps: a
             # genuinely unmappable head (post-merge force-push) — suspicious
-            return _Mapping(None, True, head)
+            return _LandingMap(None, True, head)
         # nothing names the PR and nothing maps: its landing cannot be shown
         # to be walked — wait for the walk rather than lose the evidence
         raise WalkStale(
@@ -836,9 +838,9 @@ def _map_landing(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequ
         )
     if mapping_failed:
         # some head commits map but not all: mapped-but-parentage-failed
-        return _Mapping(None, True, head)
+        return _LandingMap(None, True, head)
     anchor = max(twins.values(), key=lambda w: w.walk_index).commit_id
-    return _Mapping(anchor, False, head, {hc: w.commit_id for hc, w in twins.items()})
+    return _LandingMap(anchor, False, head, {hc: w.commit_id for hc, w in twins.items()})
 
 
 def _safe_range(repo: Path, base: str | None, tip: str) -> list[str]:
@@ -893,11 +895,12 @@ def _assemble(
 ) -> list[PrRow]:
     """The PR's row set: head matches at their mapped shas plus PR-level
     signals at the PR's landing — THE one dedup owner of row uniqueness
-    (per (commit, rule, raw), here alone: storage never dedupes again, its
-    UNIQUE constraint is the last guard) and — the storage side of channel
-    precedence — never doubling a match the walk already recorded at the
-    same commit ("recorded once, not twice"). Suspicious rows keep no
-    commit: recorded, marked, never attributed."""
+    (per (commit, rule, raw), here alone: storage never dedupes again, and
+    the table's UNIQUE constraint cannot even see NULL-commit suspicious
+    rows — SQLite treats NULLs as distinct) and — the storage side of
+    channel precedence — never doubling a match the walk already recorded
+    at the same commit ("recorded once, not twice"). Suspicious rows keep
+    no commit: recorded, marked, never attributed."""
     rows: list[PrRow] = []
     for cid, m in head_hits:
         rows.append(

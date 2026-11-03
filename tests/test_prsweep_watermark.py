@@ -17,8 +17,9 @@ ruling replaces the PR-number key of ticket #36).
 
 This suite owns the run-machinery scenarios (interrupt/resume, disjoint
 increments, clean stops, the shared full-history watermark, the contiguous-
-claim invariant, replace-not-duplicate on resume); the merge-date marker's
-own semantics live in test_pr_watermark.py. Builders live in conftest.py.
+claim invariant, replace-not-duplicate on resume) and the CLI faces (the
+stop-notice face and the face flags); the merge-date marker's own semantics
+live in test_pr_watermark.py. Builders live in conftest.py.
 """
 
 import sqlite3
@@ -623,8 +624,11 @@ def test_the_increment_window_reaches_low_numbers_that_merged_late(tmp_path, rep
 
 # ---------------------------------------------------------------------------
 # CLI faces (the one #37 wires into the update pipeline): the increment
-# default, the stop-notice face — the ONE canonical home for visible-notice
-# coverage — and the --full / --after-pr flags sharing the watermark
+# default, the stop-notice face — the ONE canonical home for the
+# run-machinery stop notices (cap / rate-limit / forbidden; the
+# unavailable notice's sanitization and prefix accounting keep their own
+# dedicated suites) — and the --full / --after-pr flags sharing the
+# watermark
 # ---------------------------------------------------------------------------
 
 
@@ -657,22 +661,29 @@ def read_watermark(db):
 
 def test_cli_pr_sweep_stop_notice_is_never_a_failure(tmp_path, repo, monkeypatch, capsys):
     # the canonical CLI stop-notice face: every stop condition ends the run
-    # with a ::notice:: on stdout and exit 0 — the rate limit (the API
-    # budget gone before anything ran) and the run's own processing cap
+    # with a ::notice:: on stdout and exit 0 — the rate limit (the
+    # transport's own RateLimited exception, the shape production raises)
+    # and the run's own processing cap
     db = cli_sweep_db(tmp_path, repo, [1, 2, 3])
 
     def limited(url):
-        # genuine exhaustion: 403 with the rate budget at zero
-        raise urllib.error.HTTPError(url, 403, "rate limited", {"X-RateLimit-Remaining": "0"}, None)
+        raise prsource.RateLimited("rate limit exhausted")
 
-    for transport, argv, fragment, watermark in [
-        (limited, [], "rate limit exhausted", 0),
-        (FakeTransport(pr_list_rows(1, 2, 3)), ["--max-prs", "2"], "processing cap reached", 2),
+    for transport, argv, fragment, recorded, watermark in [
+        (limited, [], "rate limit exhausted", 0, 0),
+        (
+            FakeTransport(pr_list_rows(1, 2, 3)),
+            ["--max-prs", "2"],
+            "processing cap reached",
+            2,
+            2,
+        ),
     ]:
         monkeypatch.setattr(prsource, "default_transport", lambda url, t=transport: t(url))
         cli.main(["pr-sweep", "--db", str(db), *argv])  # no failure exit
         out = capsys.readouterr().out
         assert "::notice::pr-sweep stopped" in out and fragment in out
+        assert f"{recorded} PRs recorded" in out
         assert "next run resumes" in out
         assert read_watermark(db) == watermark
 
