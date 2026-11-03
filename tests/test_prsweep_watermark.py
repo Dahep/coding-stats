@@ -17,8 +17,9 @@ ruling replaces the PR-number key of ticket #36).
 
 This suite owns the run-machinery scenarios (interrupt/resume, disjoint
 increments, clean stops, the shared full-history watermark, the contiguous-
-claim invariant, replace-not-duplicate on resume); the merge-date marker's
-own semantics live in test_pr_watermark.py. Builders live in conftest.py.
+claim invariant, replace-not-duplicate on resume) and the CLI faces (the
+stop-notice face and the face flags); the merge-date marker's own semantics
+live in test_pr_watermark.py. Builders live in conftest.py.
 """
 
 import sqlite3
@@ -84,28 +85,45 @@ class PrSpy:
 # ---------------------------------------------------------------------------
 
 
-def test_interrupted_run_resumes_at_the_first_pr_above_the_watermark(tmp_path, repo, monkeypatch):
-    conn, shas = primed_sweep_db(tmp_path, repo, [1, 2, 3, 4, 5])
+def test_interrupted_run_resumes_by_merge_date_with_zero_skips(tmp_path, repo, monkeypatch):
+    # THE canonical interrupt/resume scenario, in merge-date order (NOT
+    # number order: #3 merged first, then #2, then #1): a mid-run
+    # interruption leaves a contiguous date-ordered prefix, the marker
+    # tracks it, and the resume processes the first candidate past the
+    # marker — zero skipped PRs, zero duplicated rows.
+    conn, shas = primed_sweep_db(tmp_path, repo, [1, 2, 3])
+    t1, t2, t3 = (
+        "2026-10-25T12:00:00+00:00",
+        "2026-10-23T12:00:00+00:00",
+        "2026-10-21T12:00:00+00:00",
+    )
+    rows = [
+        pr(3, body="Generated with Codex.\n", head="claude/f3", merged_at=t3),
+        pr(2, body="Generated with Codex.\n", head="claude/f2", merged_at=t2),
+        pr(1, body="Generated with Codex.\n", head="claude/f1", merged_at=t1),
+    ]
     spy = PrSpy(monkeypatch)
     spy.abort_after = 2  # the third PR's processing dies mid-flight
 
     res = prsweep.sweep_increment(
-        conn, repo, "main", transport=FakeTransport(pr_list_rows(1, 2, 3, 4, 5)), now=OBSERVED_AT
+        conn, repo, "main", transport=FakeTransport(rows), now=OBSERVED_AT
     )
     assert res.stop == prsource.STOP_INTERRUPTED  # clean stop, never a failure
-    assert res.processed == 2 and spy.log == [1, 2]
-    assert res.watermark == 2 == prsweep.watermark(conn)  # contiguous prefix
-    assert rows_per_pr(conn) == {1: 3, 2: 3}
+    assert res.processed == 2 and spy.log == [3, 2]  # merge-date order: #3 then #2
+    assert res.watermark == 2 == prsweep.watermark(conn)  # the contiguous prefix
+    assert prsweep.resume_key(conn) == (t2, 2)
+    assert rows_per_pr(conn) == {2: 3, 3: 3}
 
     spy.abort_after = None
     spy.log.clear()
     res2 = prsweep.sweep_increment(
-        conn, repo, "main", transport=FakeTransport(pr_list_rows(1, 2, 3, 4, 5)), now=OBSERVED_AT
+        conn, repo, "main", transport=FakeTransport(rows), now=OBSERVED_AT
     )
-    assert res2.stop is None and res2.processed == 3
-    assert spy.log == [3, 4, 5]  # resumes at the first PR past the marker
-    assert prsweep.watermark(conn) == 5
-    assert rows_per_pr(conn) == {1: 3, 2: 3, 3: 3, 4: 3, 5: 3}  # zero skipped
+    assert res2.stop is None and res2.processed == 1
+    assert spy.log == [1]  # #1 exactly: skipping nothing
+    assert prsweep.resume_key(conn) == (t1, 1)
+    assert prsweep.watermark(conn) == 1  # the marker PR's own number
+    assert rows_per_pr(conn) == {1: 3, 2: 3, 3: 3}  # zero skipped
     assert duplicate_rows(conn) == []  # zero duplicated evidence rows
 
 
@@ -605,7 +623,12 @@ def test_the_increment_window_reaches_low_numbers_that_merged_late(tmp_path, rep
 
 
 # ---------------------------------------------------------------------------
-# CLI face: the increment mode (the one #37 wires into the update pipeline)
+# CLI faces (the one #37 wires into the update pipeline): the increment
+# default, the stop-notice face — the ONE canonical home for the
+# run-machinery stop notices (cap / rate-limit / forbidden; the
+# unavailable notice's sanitization and prefix accounting keep their own
+# dedicated suites) — and the --full / --after-pr flags sharing the
+# watermark
 # ---------------------------------------------------------------------------
 
 
@@ -628,16 +651,81 @@ def test_cli_pr_sweep_default_is_the_increment_face(tmp_path, repo, monkeypatch,
     assert "2 PRs" in out and "watermark 5" in out
 
 
+def read_watermark(db):
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    wm = prsweep.watermark(conn)
+    conn.close()
+    return wm
+
+
 def test_cli_pr_sweep_stop_notice_is_never_a_failure(tmp_path, repo, monkeypatch, capsys):
+    # the canonical CLI stop-notice face: every stop condition ends the run
+    # with a ::notice:: on stdout and exit 0 — the rate limit (the
+    # transport's own RateLimited exception, the shape production raises)
+    # and the run's own processing cap
     db = cli_sweep_db(tmp_path, repo, [1, 2, 3])
-    monkeypatch.setattr(
-        prsource, "default_transport", lambda url: FakeTransport(pr_list_rows(1, 2, 3))(url)
-    )
-    cli.main(["pr-sweep", "--db", str(db), "--max-prs", "2"])  # clean stop, exit 0
+
+    def limited(url):
+        raise prsource.RateLimited("rate limit exhausted")
+
+    for transport, argv, fragment, recorded, watermark in [
+        (limited, [], "rate limit exhausted", 0, 0),
+        (
+            FakeTransport(pr_list_rows(1, 2, 3)),
+            ["--max-prs", "2"],
+            "processing cap reached",
+            2,
+            2,
+        ),
+    ]:
+        monkeypatch.setattr(prsource, "default_transport", lambda url, t=transport: t(url))
+        cli.main(["pr-sweep", "--db", str(db), *argv])  # no failure exit
+        out = capsys.readouterr().out
+        assert "::notice::pr-sweep stopped" in out and fragment in out
+        assert f"{recorded} PRs recorded" in out
+        assert "next run resumes" in out
+        assert read_watermark(db) == watermark
+
+
+def test_cli_forbidden_notice_names_the_permission_not_the_rate_limit(
+    tmp_path, repo, monkeypatch, capsys
+):
+    # "Resource not accessible by integration" is a PERMISSION failure, not
+    # rate-limit exhaustion: the notice names the missing permission, never
+    # claims a rate limit and never promises a resume
+    db = cli_sweep_db(tmp_path, repo, [1])
+
+    def denied(url):
+        raise urllib.error.HTTPError(url, 403, "Resource not accessible by integration", {}, None)
+
+    monkeypatch.setattr(prsource, "default_transport", denied)
+    cli.main(["pr-sweep", "--db", str(db)])  # a clean stop, never a failure exit
     out = capsys.readouterr().out
-    assert "2 PRs" in out
-    assert "pr-sweep stopped" in out and "cap" in out
-    assert "next run resumes" in out
+    assert "::notice::" in out
+    assert "pull-requests: read" in out  # the notice names the permission
+    assert "rate limit exhausted" not in out
+    assert "next run resumes" not in out
+
+
+def test_cli_full_flag_re_sweeps_from_the_beginning(tmp_path, repo, monkeypatch, capsys):
+    db = cli_sweep_db(tmp_path, repo, [1, 2])
+    t = FakeTransport(pr_list_rows(1, 2))
+    monkeypatch.setattr(prsource, "default_transport", lambda url: t(url))
+
+    cli.main(["pr-sweep", "--db", str(db), "--after-pr", "1"])  # adoption bound
+    assert read_watermark(db) == 0  # the gap below the bound is never claimed
+    conn = sqlite3.connect(db)
+    assert {r[1] for r in pr_rows(conn)} == {2}  # only the bound's own candidates
+    conn.close()
+
+    cli.main(["pr-sweep", "--db", str(db), "--full"])  # operator's full-history sweep
+    out = capsys.readouterr().out
+    assert "2 PRs recorded" in out
+    conn = sqlite3.connect(db)
+    assert {r[1] for r in pr_rows(conn)} == {1, 2}
+    conn.close()
+    assert read_watermark(db) == 2  # shared watermark: contiguous now
 
 
 def test_cli_pr_sweep_rejects_full_with_after_pr(tmp_path, repo):
@@ -670,23 +758,32 @@ def _thirty_prs():
     return [pr(n) for n in range(30, 0, -1)]  # API order: descending number
 
 
-def test_run_selects_the_increment_face_and_defaults_to_the_run_cap(tmp_path, repo, monkeypatch):
+def test_run_honours_the_cap_and_rejects_full_with_after_pr(tmp_path, repo, monkeypatch):
+    # the cap binds whichever face runs — the default increment face at its
+    # DEFAULT_RUN_CAP, an explicit max_prs on the full face — and the full
+    # and --after-pr faces stay mutually exclusive
     conn = make_db(tmp_path / "w.db", repo)
     githubize(conn)
     log = _counting_rows(monkeypatch)
-    res = prsweep.run(conn, repo, "main", transport=FakeTransport(_thirty_prs()), now=OBSERVED_AT)
+    t = FakeTransport(_thirty_prs())
+    res = prsweep.run(conn, repo, "main", transport=t, now=OBSERVED_AT)
     assert log == list(range(1, 26))  # the increment face caps at 25 by default
     assert res.stop == prsweep.STOP_CAP and res.processed == 25
     assert res.watermark == 25  # the marker moved per incorporated PR
+
+    log.clear()
+    res = prsweep.run(conn, repo, "main", full=True, max_prs=2, transport=t, now=OBSERVED_AT)
+    assert log == [1, 2] and res.stop == prsweep.STOP_CAP
+    with pytest.raises(prsweep.SweepError):
+        prsweep.run(conn, repo, "main", after_pr=1, full=True, transport=t, now=OBSERVED_AT)
 
 
 def test_run_full_face_is_the_uncapped_full_history_sweep(tmp_path, repo, monkeypatch):
     conn = make_db(tmp_path / "w.db", repo)
     githubize(conn)
     log = _counting_rows(monkeypatch)
-    res = prsweep.run(
-        conn, repo, "main", full=True, transport=FakeTransport(_thirty_prs()), now=OBSERVED_AT
-    )
+    t = FakeTransport(_thirty_prs())
+    res = prsweep.run(conn, repo, "main", full=True, transport=t, now=OBSERVED_AT)
     assert log == list(range(1, 31))  # unlimited by default
     assert res.stop is None and res.processed == 30
 
@@ -695,37 +792,10 @@ def test_run_after_pr_face_is_the_uncapped_bounded_sweep(tmp_path, repo, monkeyp
     conn = make_db(tmp_path / "w.db", repo)
     githubize(conn)
     log = _counting_rows(monkeypatch)
-    res = prsweep.run(
-        conn, repo, "main", after_pr=27, transport=FakeTransport(_thirty_prs()), now=OBSERVED_AT
-    )
+    t = FakeTransport(_thirty_prs())
+    res = prsweep.run(conn, repo, "main", after_pr=27, transport=t, now=OBSERVED_AT)
     assert log == [28, 29, 30]  # the number bound selects, unlimited by default
     assert res.stop is None and res.watermark == 0  # the gap below the bound: never claimed
-
-
-def test_run_honours_an_explicit_cap_and_rejects_full_with_after_pr(tmp_path, repo, monkeypatch):
-    conn = make_db(tmp_path / "w.db", repo)
-    githubize(conn)
-    log = _counting_rows(monkeypatch)
-    res = prsweep.run(
-        conn,
-        repo,
-        "main",
-        full=True,
-        max_prs=2,
-        transport=FakeTransport(_thirty_prs()),
-        now=OBSERVED_AT,
-    )
-    assert log == [1, 2] and res.stop == prsweep.STOP_CAP
-    with pytest.raises(prsweep.SweepError):
-        prsweep.run(
-            conn,
-            repo,
-            "main",
-            after_pr=1,
-            full=True,
-            transport=FakeTransport(_thirty_prs()),
-            now=OBSERVED_AT,
-        )
 
 
 def test_run_converts_operational_failures_into_a_stop_naming_the_detail(tmp_path, repo):

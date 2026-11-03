@@ -402,14 +402,21 @@ def _finalize(hits: list[_Hit]) -> Attribution:
     return Attribution(verdict, harness, model, tuple(h.evidence for h in ranked))
 
 
+def _ranked_matches(hits: list[_Hit]) -> tuple[Match, ...]:
+    """The ranked hits projected to the public Match shape — the one shared
+    tail of both public match functions (git and PR channels read the same
+    rule-table representation)."""
+    return tuple(
+        Match(h.evidence.rule, h.evidence.raw, h.evidence.verdict, h.harness, h.model)
+        for h in _ranked(hits)
+    )
+
+
 def matches(facts: CommitFacts) -> tuple[Match, ...]:
     """Every rule-table match of one commit's facts, deduped and ranked,
     each carrying the identity its raw string names. The per-row view behind
     attribute()'s per-commit summary."""
-    return tuple(
-        Match(h.evidence.rule, h.evidence.raw, h.evidence.verdict, h.harness, h.model)
-        for h in _ranked(_hits(facts))
-    )
+    return _ranked_matches(_hits(facts))
 
 
 def attribute(facts: CommitFacts) -> Attribution:
@@ -455,10 +462,7 @@ def pr_matches(
             author_harness = _collapse(author_login).lower() or "bot"
         if author_harness is not None:
             hits.append(_hit(RULE_NAME_SUFFIX, author_login, author_harness))
-    return tuple(
-        Match(h.evidence.rule, h.evidence.raw, h.evidence.verdict, h.harness, h.model)
-        for h in _ranked(hits)
-    )
+    return _ranked_matches(hits)
 
 
 def record(conn: sqlite3.Connection, commit_id: int, facts: CommitFacts) -> Attribution:

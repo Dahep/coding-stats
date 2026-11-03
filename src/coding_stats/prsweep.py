@@ -35,8 +35,8 @@ import re
 import sqlite3
 import subprocess
 import urllib.error
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -155,18 +155,17 @@ def replace_pr_rows(
     the replace-not-duplicate rule of ticket #35: a partially-recorded PR is
     replaced wholesale (by PR number), never extended into duplicates.
     Recorded, never re-derived: no recompute ever rebuilds these rows.
-    Returns the stored count."""
+    Row uniqueness is owned by the producer: ``_assemble`` already dedupes
+    per (commit, rule, raw) — including the NULL-commit suspicious rows the
+    table's UNIQUE constraint cannot see (SQLite: NULLs are distinct) — and
+    storage stays a dumb sink behind that constraint. Returns the stored
+    count."""
     repo_id = identity.repo_id_for(conn)
     conn.execute(
         "DELETE FROM pr_evidence WHERE repo_id = ? AND pr_number = ?", (repo_id, pr_number)
     )
     stored = 0
-    seen: set[tuple[int | None, str, str]] = set()
     for r in rows:
-        key = (r.commit_id, r.rule, r.raw)
-        if key in seen:
-            continue
-        seen.add(key)
         conn.execute(
             "INSERT INTO pr_evidence (repo_id, pr_number, commit_id, rule, raw, verdict,"
             " harness, model, channel, observed_at, suspicious)"
@@ -700,8 +699,9 @@ def _locate_landing(conn: sqlite3.Connection, number: int) -> tuple[str, _Walked
     the head-parentage check below (an edited squash subject mapping the
     wrong commit is caught there)."""
     for w in _walked_by_title(conn, f"% (#{number})"):
-        if re.search(rf"\(#{number}\)$", w.title):
-            return "squash", w
+        # the LIKE pattern already anchors the ``(#N)`` suffix — no second
+        # regex check to imply a discrimination it does not make
+        return "squash", w
     for w in _walked_by_title(conn, f"Merge pull request #{number} from %"):
         return "merge", w
     return None
@@ -735,6 +735,31 @@ def _pr_rows(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest)
     records suspicious rows for it and never claims past it — the evidence
     is not lost, the next run after a newer walk redoes it."""
     signals = aiattr.pr_matches(pr.body or "", pr.author_login, pr.author_is_bot, pr.head_ref)
+    mapped = _map_landing(conn, repo, branch, pr)  # the git/API work lives there
+    hits = _detect_heads(repo, mapped.head_commits, mapped.attach)
+    return _assemble(conn, mapped.anchor, hits, signals, mapped.suspicious)
+
+
+@dataclass(frozen=True)
+class _LandingMap:
+    """One PR's landing map — the single result of the squash/rebase
+    decision tree: the anchor the evidence attaches at, whether the rows
+    are suspicious, the head commits to detect on, and each head's
+    attachment (a head absent from the map falls back to the anchor in
+    ``_assemble``)."""
+
+    anchor: int | None
+    suspicious: bool
+    head_commits: Sequence[str] = ()
+    attach: dict[str, int] = field(default_factory=dict)
+
+
+def _map_landing(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest) -> _LandingMap:
+    """The squash/rebase mapping decision tree, producing ONE ``_LandingMap``
+    (raising ``WalkStale`` where required): where the evidence attaches,
+    whether it is suspicious, and which head commits to detect on. Behavior
+    is identical across squash, merge, rebase, suspicious, unmapped and
+    walk-stale evidence."""
     landed = _locate_landing(conn, pr.number)
     if (
         landed is None
@@ -751,13 +776,11 @@ def _pr_rows(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest)
         if kind == "merge":
             # plain merge: skipped entirely by the fetch — the identical
             # commits are already in the repo; record once from them
-            hits = _detect_heads(
-                repo, _merge_head_commits(repo, walk.sha), attach_all=walk.commit_id
-            )
-            return _assemble(conn, walk.commit_id, hits, signals, suspicious=False)
+            heads = _merge_head_commits(repo, walk.sha)
+            return _LandingMap(walk.commit_id, False, heads, dict.fromkeys(heads, walk.commit_id))
         tip = fetch_head_ref(repo, pr.number)
         if tip is None:
-            return _assemble(conn, None, [], signals, suspicious=True)
+            return _LandingMap(None, True)
         base = gitwalk.merge_base(repo, tip, branch)
         aggregate = gitwalk.patch_id_for_range(repo, base, tip) if base else None
         if not base or (
@@ -767,35 +790,23 @@ def _pr_rows(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest)
         ):
             # not plausibly the PR's merge head (post-merge force-push or a
             # squash subject that named the wrong commit)
-            return _assemble(
-                conn,
-                None,
-                _detect_heads(repo, _safe_range(repo, base, tip)),
-                signals,
-                suspicious=True,
-            )
+            return _LandingMap(None, True, _safe_range(repo, base, tip))
         if aggregate is None or walk.subject_patch_id is None:
             # empty diffs carry no patch-id: None on None is NOT a match —
             # no false trust. Genuinely unmapped per the squash strategy, but
             # not suspicious: recorded unattached, never attributed
-            return _assemble(
-                conn,
-                None,
-                _detect_heads(repo, _safe_range(repo, base, tip)),
-                signals,
-                suspicious=False,
-            )
-        hits = _detect_heads(repo, gitwalk.list_range(repo, base, tip), attach_all=walk.commit_id)
-        return _assemble(conn, walk.commit_id, hits, signals, suspicious=False)
+            return _LandingMap(None, False, _safe_range(repo, base, tip))
+        heads = gitwalk.list_range(repo, base, tip)
+        return _LandingMap(walk.commit_id, False, heads, dict.fromkeys(heads, walk.commit_id))
 
     # rebase-merged (or an unrecognised landing): map the fetched head by
     # patch-id — the rebase twins keep each head commit's patch
     tip = fetch_head_ref(repo, pr.number)
     if tip is None:
-        return _assemble(conn, None, [], signals, suspicious=True)
+        return _LandingMap(None, True)
     base = gitwalk.merge_base(repo, tip, branch)
     if base is None:
-        return _assemble(conn, None, [], signals, suspicious=True)
+        return _LandingMap(None, True)
     head = gitwalk.list_range(repo, base, tip)
     twins: dict[str, _Walked] = {}
     mapping_failed = False
@@ -814,11 +825,11 @@ def _pr_rows(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest)
         if not has_content:
             # the head carries no patchable content (empty diffs): nothing to
             # map — genuinely unmapped, not suspicious, never a false trust
-            return _assemble(conn, None, _detect_heads(repo, head), signals, suspicious=False)
+            return _LandingMap(None, False, head)
         if pr.landing_sha is not None:
             # the landing is walked (checked above) yet nothing maps: a
             # genuinely unmappable head (post-merge force-push) — suspicious
-            return _assemble(conn, None, _detect_heads(repo, head), signals, suspicious=True)
+            return _LandingMap(None, True, head)
         # nothing names the PR and nothing maps: its landing cannot be shown
         # to be walked — wait for the walk rather than lose the evidence
         raise WalkStale(
@@ -827,10 +838,9 @@ def _pr_rows(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest)
         )
     if mapping_failed:
         # some head commits map but not all: mapped-but-parentage-failed
-        return _assemble(conn, None, _detect_heads(repo, head), signals, suspicious=True)
+        return _LandingMap(None, True, head)
     anchor = max(twins.values(), key=lambda w: w.walk_index).commit_id
-    hits = _detect_heads(repo, head, attach={hc: w.commit_id for hc, w in twins.items()})
-    return _assemble(conn, anchor, hits, signals, suspicious=False)
+    return _LandingMap(anchor, False, head, {hc: w.commit_id for hc, w in twins.items()})
 
 
 def _safe_range(repo: Path, base: str | None, tip: str) -> list[str]:
@@ -862,14 +872,15 @@ def _twin_by_patch_id(conn: sqlite3.Connection, patch_id: str) -> _Walked | None
 def _detect_heads(
     repo: Path,
     head_commits: Sequence[str],
-    attach: dict[str, int] | None = None,
-    attach_all: int | None = None,
+    attach: Mapping[str, int],
 ) -> list[tuple[int | None, aiattr.Match]]:
     """Rule-table detection over head commits (#34's engine on the head
-    commits' own facts), each match carried toward its mapped commit id."""
+    commits' own facts), each match carried toward its mapped commit id —
+    ONE per-head attachment map (a head absent from it falls back to the
+    anchor in ``_assemble``)."""
     hits: list[tuple[int | None, aiattr.Match]] = []
     for hc in head_commits:
-        cid = (attach or {}).get(hc) if attach is not None else attach_all
+        cid = attach.get(hc)
         for m in aiattr.matches(gitwalk.commit_facts(repo, hc)):
             hits.append((cid, m))
     return hits
@@ -883,10 +894,13 @@ def _assemble(
     suspicious: bool,
 ) -> list[PrRow]:
     """The PR's row set: head matches at their mapped shas plus PR-level
-    signals at the PR's landing, deduped per (commit, rule, raw) and — the
-    storage side of channel precedence — never doubling a match the walk
-    already recorded at the same commit ("recorded once, not twice").
-    Suspicious rows keep no commit: recorded, marked, never attributed."""
+    signals at the PR's landing — THE one dedup owner of row uniqueness
+    (per (commit, rule, raw), here alone: storage never dedupes again, and
+    the table's UNIQUE constraint cannot even see NULL-commit suspicious
+    rows — SQLite treats NULLs as distinct) and — the storage side of
+    channel precedence — never doubling a match the walk already recorded
+    at the same commit ("recorded once, not twice"). Suspicious rows keep
+    no commit: recorded, marked, never attributed."""
     rows: list[PrRow] = []
     for cid, m in head_hits:
         rows.append(

@@ -227,6 +227,34 @@ def test_squash_pr_recovers_evidence_the_walk_would_miss(tmp_path, repo, fetch_l
     assert eff.model == "Opus 4.8 (1M context)"
 
 
+def test_squash_landing_selects_the_suffix_match_not_a_similar_number(tmp_path, repo, fetch_log):
+    # the title lookup anchors the ``(#N)`` suffix: a decoy landing whose
+    # title embeds a similar number (#55) is never selected for PR 5 — the
+    # evidence lands at the real ``(#5)`` squash subject alone
+    start_remote(tmp_path, repo)
+    run(repo, "checkout", "-b", "claude/feature")
+    h1 = commit_files(repo, f"feat: core work\n\n{TRAILER_LINE}\n", {"b.txt": "b\n"})
+    push_head_ref(repo, h1, 5)
+    run(repo, "checkout", "main")
+    run(repo, "branch", "-D", "claude/feature")
+    decoy = commit_files(repo, "feat: the work (#55)", {"d.txt": "d\n"})
+    squash = commit_files(repo, "feat: the work (#5)", {"b.txt": "b\n"})
+
+    conn = make_db(tmp_path / "w.db", repo)
+    gitwalk.walk(repo, conn, "main")
+    githubize(conn)
+    t = FakeTransport([pr(5, body="Assisted-by: codex:gpt-5\n", head="claude/feature")])
+    res = prsweep.sweep(conn, repo, "main", 0, transport=t, now=OBSERVED_AT)
+    assert res.processed == 1 and res.stop is None
+
+    assert rows_at(conn, squash) == {
+        ("co-authored-by", TRAILER_VALUE, "yes", "pr", 0),
+        ("tool-trailer", "codex:gpt-5", "yes", "pr", 0),
+        ("branch-prefix", "claude/feature", "possible", "pr", 0),
+    }
+    assert rows_at(conn, decoy) == set()
+
+
 def test_squash_pr_rows_carry_channel_observed_at_and_pr_number(tmp_path, repo, fetch_log):
     start_remote(tmp_path, repo)
     run(repo, "checkout", "-b", "claude/feature")
