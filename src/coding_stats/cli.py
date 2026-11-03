@@ -426,6 +426,34 @@ def _pending_count(conn: sqlite3.Connection) -> int:
     )
 
 
+# The stop-notice policy: ONE table entry per stop reason — the notice body
+# (after "pr-sweep ": its face plus message) plus its resume wording. Every
+# resumable stop promises the same resume; forbidden keeps its distinct
+# wording as data — a permissions failure is NOT a rate limit and does not
+# resume, so its message names the missing permission and the watermark is
+# only "kept". The unavailable body is its own face (no "stopped:" prefix)
+# and carries the {detail} sanitization marker.
+_STOP_NOTICES: dict[str, tuple[str, str]] = {
+    prsweep.STOP_CAP: ("stopped: processing cap reached", ", the next run resumes past it"),
+    prsource.STOP_RATE_LIMIT: ("stopped: rate limit exhausted", ", the next run resumes past it"),
+    prsource.STOP_INTERRUPTED: ("stopped: interrupted", ", the next run resumes past it"),
+    prsweep.STOP_WALK_STALE: (
+        "stopped: waiting for the walk to catch up",
+        ", the next run resumes past it",
+    ),
+    prsweep.STOP_FETCH: (
+        "stopped: a PR head fetch failed (transient git failure)",
+        ", the next run resumes past it",
+    ),
+    prsource.STOP_FORBIDDEN: (
+        "stopped: the GitHub token cannot read pull requests (403 Resource"
+        " not accessible by integration) — grant `pull-requests: read`",
+        " kept",
+    ),
+    prsweep.STOP_UNAVAILABLE: ("unavailable{detail}", ", the next run resumes past it"),
+}
+
+
 def _report_sweep(res: prsweep.SweepResult) -> None:
     """The pr-sweep outcome, printed once per run — shared by the `pr-sweep`
     verb and the update verb's PR tier so both faces report identically."""
@@ -435,40 +463,15 @@ def _report_sweep(res: prsweep.SweepResult) -> None:
         f" watermark {res.watermark}"
     )
     if res.stop is not None:
-        # every stop label is referenced from its owner: the run-policy
-        # labels (cap, walk-stale, fetch-failed, unavailable) live in
-        # prsweep; the HTTP-classified ones in prsource
-        notices = {
-            prsweep.STOP_CAP: "processing cap reached",
-            prsource.STOP_RATE_LIMIT: "rate limit exhausted",
-            prsource.STOP_INTERRUPTED: "interrupted",
-            prsweep.STOP_WALK_STALE: "waiting for the walk to catch up",
-            prsweep.STOP_FETCH: "a PR head fetch failed (transient git failure)",
-        }
-        if res.stop == prsweep.STOP_UNAVAILABLE:
-            # exception text is untrusted, potentially multiline input to a
-            # workflow command: keep the notice on one line
-            detail = " ".join(
-                "".join(ch if ch.isprintable() else " " for ch in (res.detail or "")).split()
-            )
-            suffix = f" ({detail})" if detail else ""
-            print(
-                f"::notice::pr-sweep unavailable{suffix}; watermark {res.watermark},"
-                " the next run resumes past it"
-            )
-        elif res.stop == prsource.STOP_FORBIDDEN:
-            # a permissions failure is NOT a rate limit and does not "resume":
-            # the notice names the permission that is missing
-            print(
-                f"::notice::pr-sweep stopped: the GitHub token cannot read pull"
-                f" requests (403 Resource not accessible by integration) — grant"
-                f" `pull-requests: read`; watermark {res.watermark} kept"
-            )
-        else:
-            print(
-                f"::notice::pr-sweep stopped: {notices[res.stop]}; watermark"
-                f" {res.watermark}, the next run resumes past it"
-            )
+        # the one sanitization point (only unavailable's body carries
+        # {detail}): exception text is untrusted, potentially multiline
+        # input to a workflow command — keep the notice on one line
+        detail = " ".join(
+            "".join(ch if ch.isprintable() else " " for ch in (res.detail or "")).split()
+        )
+        suffix = f" ({detail})" if detail else ""
+        body, resume = _STOP_NOTICES[res.stop]
+        print(f"::notice::pr-sweep {body.format(detail=suffix)}; watermark {res.watermark}{resume}")
 
 
 def _run_update(
