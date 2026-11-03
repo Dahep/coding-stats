@@ -752,9 +752,7 @@ class _Mapping:
     attach: dict[str, int] = field(default_factory=dict)
 
 
-def _map_landing(
-    conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest
-) -> _Mapping:
+def _map_landing(conn: sqlite3.Connection, repo: Path, branch: str, pr: PullRequest) -> _Mapping:
     """The squash/rebase mapping decision tree, producing ONE ``_Mapping``
     (raising ``WalkStale`` where required): where the evidence attaches,
     whether it is suspicious, and which head commits to detect on. Behavior
