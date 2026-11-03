@@ -471,7 +471,10 @@ def _report_sweep(res: prsweep.SweepResult) -> None:
         )
         suffix = f" ({detail})" if detail else ""
         body, resume = _STOP_NOTICES[res.stop]
-        print(f"::notice::pr-sweep {body.format(detail=suffix)}; watermark {res.watermark}{resume}")
+        print(
+            f"::notice::pr-sweep {body.format(detail=suffix)};"
+            f" watermark {res.watermark}{resume}"
+        )
 
 
 def _run_update(

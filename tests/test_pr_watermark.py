@@ -1,7 +1,6 @@
 """Watermark-driven per-increment PR backfill: the merge-date marker's own
 semantics (ticket #36, ADR-0007 clause 2, re-keyed by merge date per the
-2026-10-30 user ruling), plus the transport/HTTP stop classification and
-the CLI notice faces.
+2026-10-30 user ruling), plus the transport/HTTP stop classification.
 
 The resume marker — the (merged_at, number) tuple of the last INCORPORATED
 PR — rides the Artifact with the recorded evidence rows (``pr_watermark``:
@@ -17,7 +16,8 @@ never laundered into "rate limit exhausted".
 
 The run-machinery scenarios (interrupt/resume, disjoint increments, clean
 stops, the shared full-history watermark, the contiguous-claim invariant)
-live in test_prsweep_watermark.py. Builders live in conftest.py.
+and the CLI faces (stop notices, face flags) live in
+test_prsweep_watermark.py. Builders live in conftest.py.
 """
 
 import io
@@ -26,11 +26,10 @@ from pathlib import Path
 
 import pytest
 
-from coding_stats import cli, gitwalk, prsource, prsweep
+from coding_stats import gitwalk, prsource, prsweep
 from conftest import (
     OBSERVED_AT,
     FakeTransport,
-    cli_sweep_db,
     land_squash_prs,
     pr,
     pr_list_rows,
@@ -46,11 +45,6 @@ def row_numbers(conn):
 def assert_no_duplicate_rows(conn):
     rows = pr_rows(conn)
     assert len(rows) == len({(r[1], r[2], r[3]) for r in rows})
-
-
-class LimitedTransport:
-    def __call__(self, url):
-        raise prsource.RateLimited("rate limit exhausted")
 
 
 # ---------------------------------------------------------------------------
@@ -119,47 +113,6 @@ def test_equal_merge_dates_tie_break_by_pr_number(tmp_path, repo):
     assert res.processed == 0  # nothing is newer than (t, 9)
     assert prsweep.resume_key(conn) == (t, 9)
     assert row_numbers(conn) == {7, 8, 9}
-    assert_no_duplicate_rows(conn)
-
-
-def test_interrupted_run_resumes_by_merge_date_with_zero_skips(tmp_path, repo, monkeypatch):
-    # merge-date order is NOT number order here: #3 merged first, then #2,
-    # then #1 — the marker tracks merge dates, so interruption and resume
-    # follow that order and skip nothing
-    conn, _ = primed_sweep_db(tmp_path, repo, [1, 2, 3])
-    t1, t2, t3 = (
-        "2026-10-25T12:00:00+00:00",
-        "2026-10-23T12:00:00+00:00",
-        "2026-10-21T12:00:00+00:00",
-    )
-    rows = [
-        pr(3, body="Generated with Codex.\n", head="claude/f3", merged_at=t3),
-        pr(2, body="Generated with Codex.\n", head="claude/f2", merged_at=t2),
-        pr(1, body="Generated with Codex.\n", head="claude/f1", merged_at=t1),
-    ]
-    orig = prsweep.fetch_head_ref
-
-    def interrupting(r, n):
-        if n == 1:  # the third PR in merge-date order: dies mid-flight
-            raise KeyboardInterrupt
-        return orig(r, n)
-
-    monkeypatch.setattr(prsweep, "fetch_head_ref", interrupting)
-    res = prsweep.sweep_increment(
-        conn, repo, "main", transport=FakeTransport(rows), now=OBSERVED_AT
-    )
-    assert res.stop == prsource.STOP_INTERRUPTED  # clean stop, never a failure
-    assert res.processed == 2  # merge-date order: #3 (10-21) then #2 (10-23)
-    assert row_numbers(conn) == {2, 3}
-    assert prsweep.resume_key(conn) == (t2, 2)  # the contiguous date-ordered prefix
-
-    monkeypatch.setattr(prsweep, "fetch_head_ref", orig)
-    res2 = prsweep.sweep_increment(
-        conn, repo, "main", transport=FakeTransport(rows), now=OBSERVED_AT
-    )
-    assert res2.stop is None and res2.processed == 1  # #1 exactly: skipping nothing
-    assert row_numbers(conn) == {1, 2, 3}
-    assert prsweep.resume_key(conn) == (t1, 1)
     assert_no_duplicate_rows(conn)
 
 
@@ -273,76 +226,3 @@ def test_head_fetch_never_prompts_interactively(monkeypatch):
     assert cmd[3] == "fetch"
     assert kw.get("env", {}).get("GIT_TERMINAL_PROMPT") == "0"
     assert kw.get("stdin") is sp.DEVNULL
-
-
-# ---------------------------------------------------------------------------
-# CLI faces: visible stop notices (exit 0), forbidden names the permission,
-# and the --full / --after-pr faces share the watermark
-# ---------------------------------------------------------------------------
-
-
-def read_watermark(db):
-    import sqlite3
-
-    conn = sqlite3.connect(db)
-    conn.row_factory = sqlite3.Row
-    wm = prsweep.watermark(conn)
-    conn.close()
-    return wm
-
-
-def _cli_rows(db):
-    import sqlite3
-
-    conn = sqlite3.connect(db)
-    out = [
-        (r[0], r[1], r[2])
-        for r in conn.execute(
-            "SELECT pr_number, rule, raw FROM pr_evidence ORDER BY pr_number, rule, raw"
-        )
-    ]
-    conn.close()
-    return out
-
-
-def test_cli_forbidden_notice_names_the_permission_not_the_rate_limit(
-    tmp_path, repo, monkeypatch, capsys
-):
-    db = cli_sweep_db(tmp_path, repo, [1])
-
-    def denied(url):
-        raise urllib.error.HTTPError(url, 403, "Resource not accessible by integration", {}, None)
-
-    monkeypatch.setattr(prsource, "default_transport", denied)
-    cli.main(["pr-sweep", "--db", str(db)])  # a clean stop, never a failure exit
-    out = capsys.readouterr().out
-    assert "::notice::" in out
-    assert "pull-requests: read" in out  # the notice names the permission
-    assert "rate limit exhausted" not in out
-    assert "next run resumes" not in out
-
-
-def test_cli_rate_limit_stop_notice_is_visible_and_exit_zero(tmp_path, repo, monkeypatch, capsys):
-    db = cli_sweep_db(tmp_path, repo, [1, 2])
-    monkeypatch.setattr(prsource, "default_transport", lambda url: LimitedTransport()(url))
-    cli.main(["pr-sweep", "--db", str(db)])  # no failure exit
-    out = capsys.readouterr().out
-    assert "::notice::" in out and "rate limit" in out
-    assert read_watermark(db) == 0
-
-
-def test_cli_full_flag_re_sweeps_from_the_beginning(tmp_path, repo, monkeypatch, capsys):
-    db = cli_sweep_db(tmp_path, repo, [1, 2])
-    t = FakeTransport(pr_list_rows(1, 2))
-    monkeypatch.setattr(prsource, "default_transport", lambda url: t(url))
-
-    cli.main(["pr-sweep", "--db", str(db), "--after-pr", "1"])  # adoption bound
-    assert read_watermark(db) == 0  # the gap below the bound is never claimed
-    conn_rows = _cli_rows(db)
-    assert {r[0] for r in conn_rows} == {2}
-
-    cli.main(["pr-sweep", "--db", str(db), "--full"])  # operator's full-history sweep
-    out = capsys.readouterr().out
-    assert "2 PRs recorded" in out
-    assert {r[0] for r in _cli_rows(db)} == {1, 2}
-    assert read_watermark(db) == 2  # shared watermark: contiguous now
