@@ -700,8 +700,9 @@ def _locate_landing(conn: sqlite3.Connection, number: int) -> tuple[str, _Walked
     the head-parentage check below (an edited squash subject mapping the
     wrong commit is caught there)."""
     for w in _walked_by_title(conn, f"% (#{number})"):
-        if re.search(rf"\(#{number}\)$", w.title):
-            return "squash", w
+        # the LIKE pattern already anchors the ``(#N)`` suffix — no second
+        # regex check to imply a discrimination it does not make
+        return "squash", w
     for w in _walked_by_title(conn, f"Merge pull request #{number} from %"):
         return "merge", w
     return None
