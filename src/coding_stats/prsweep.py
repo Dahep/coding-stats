@@ -155,18 +155,15 @@ def replace_pr_rows(
     the replace-not-duplicate rule of ticket #35: a partially-recorded PR is
     replaced wholesale (by PR number), never extended into duplicates.
     Recorded, never re-derived: no recompute ever rebuilds these rows.
-    Returns the stored count."""
+    Row uniqueness is owned by the producer: ``_assemble`` already dedupes
+    per (commit, rule, raw); storage stays a dumb sink guarded by the
+    table's UNIQUE constraint. Returns the stored count."""
     repo_id = identity.repo_id_for(conn)
     conn.execute(
         "DELETE FROM pr_evidence WHERE repo_id = ? AND pr_number = ?", (repo_id, pr_number)
     )
     stored = 0
-    seen: set[tuple[int | None, str, str]] = set()
     for r in rows:
-        key = (r.commit_id, r.rule, r.raw)
-        if key in seen:
-            continue
-        seen.add(key)
         conn.execute(
             "INSERT INTO pr_evidence (repo_id, pr_number, commit_id, rule, raw, verdict,"
             " harness, model, channel, observed_at, suspicious)"
@@ -884,10 +881,12 @@ def _assemble(
     suspicious: bool,
 ) -> list[PrRow]:
     """The PR's row set: head matches at their mapped shas plus PR-level
-    signals at the PR's landing, deduped per (commit, rule, raw) and — the
-    storage side of channel precedence — never doubling a match the walk
-    already recorded at the same commit ("recorded once, not twice").
-    Suspicious rows keep no commit: recorded, marked, never attributed."""
+    signals at the PR's landing — THE one dedup owner of row uniqueness
+    (per (commit, rule, raw), here alone: storage never dedupes again, its
+    UNIQUE constraint is the last guard) and — the storage side of channel
+    precedence — never doubling a match the walk already recorded at the
+    same commit ("recorded once, not twice"). Suspicious rows keep no
+    commit: recorded, marked, never attributed."""
     rows: list[PrRow] = []
     for cid, m in head_hits:
         rows.append(
