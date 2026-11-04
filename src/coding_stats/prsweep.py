@@ -486,6 +486,70 @@ def _run(
     return SweepResult(processed, rows_n, suspicious_n, requests, watermark(conn), stop, detail)
 
 
+def _run_face(
+    conn: sqlite3.Connection,
+    repo: Path,
+    branch: str,
+    *,
+    resume: bool,
+    after_pr: int = 0,
+    transport: Transport | None = None,
+    now: str | None = None,
+    max_prs: int | None = None,
+) -> SweepResult:
+    """The one shared sweep behaviour the public faces alias — the run
+    machinery ``_run`` at one argument choice of the mode matrix:
+    **filter by the resume marker? x claim coverage?**
+
+    - Filter ON (``resume=True``, hence ``after_pr=0``): a complete
+      listing window; candidates are merged PRs whose (merged_at, number)
+      tuple is newer than the resume marker, processed oldest first by
+      merge date (ties by PR number). Filtering by the marker claims
+      contiguous coverage: the marker advances over every incorporated
+      PR (one per-PR transaction).
+    - Filter OFF (``resume=False``): candidates are merged PRs with
+      number > ``after_pr``; the walk stops at the number bound. Coverage
+      is claimed — the marker advances — only when ``after_pr == 0``
+      (the full history): a positive bound leaves every number below it
+      unexamined, and a lower-numbered PR can merge after the marker, so
+      claiming past that gap would make a later increment skip it
+      forever ("zero skipped PRs" stays true and a later increment walks
+      the gap).
+
+    Three live cells behind the five ADR-0007 clause 2 names, each face a
+    one-line alias differing only in its per-run cap (the caps are defined
+    once, in the module constants above; every face signature default
+    consumes its own):
+
+    - bounded (``sweep`` at a positive bound): filter OFF, never claims —
+      the resume marker never moves.
+    - full (``sweep_full``): filter OFF, claims — the explicit RE-SWEEP of
+      history already incorporated (replace-not-duplicate keeps it clean,
+      the marker never regresses while history below it is re-recorded);
+      uncapped by default.
+    - increment (``sweep_increment``) and the batched CI backfill
+      (``sweep_backfill``): filter ON, claims — the backfill BATCHED: one
+      disjoint chunk of oldest-unincorporated history per invocation,
+      never a restart at PR 1 and never a re-sweep below the marker.
+
+    ``max_prs`` (a per-run cap — a stop condition, never a failure), the
+    listing-failure and walk-stale stops, and the operator-skip pass-over
+    are ``_run``'s, shared unchanged by every face. A negative bound is
+    invalid in any mode (``SweepError`` before any effect)."""
+    if after_pr < 0:
+        raise SweepError(f"--after-pr must be >= 0 (got {after_pr})")
+    return _run(
+        conn,
+        repo,
+        branch,
+        after_pr=after_pr,
+        resume=resume,
+        transport=transport,
+        now=now,
+        max_prs=max_prs,
+    )
+
+
 def sweep(
     conn: sqlite3.Connection,
     repo: Path,
@@ -496,26 +560,14 @@ def sweep(
     now: str | None = None,
     max_prs: int | None = None,
 ) -> SweepResult:
-    """One channel-pr sweep run over merged PRs with number > ``after_pr``
-    — the ``--after-pr`` bounded face (``sweep_full`` is this at bound 0),
-    keyed by PR NUMBER: its bound is a number and the walk stops at it.
-    A positive bound NEVER advances the resume marker (only bound 0/full
-    may claim coverage): the numbers below the bound are unexamined, and a
-    lower-numbered PR can merge after the marker — the next increment picks
-    both gaps up.
-    Run after the walk: the mapping reads the walked commits, and a PR whose
-    landing is not walked yet stops the run AT that PR (``STOP_WALK_STALE`` —
-    waiting for the walk): nothing is recorded for it, the marker never
-    claims past it, and the next run after a newer walk redoes it
-    (replace-per-PR)."""
-    if after_pr < 0:
-        raise SweepError(f"--after-pr must be >= 0 (got {after_pr})")
-    return _run(
+    """The ``--after-pr`` bounded face (``_run_face``, filter OFF): a
+    positive bound never advances the resume marker."""
+    return _run_face(
         conn,
         repo,
         branch,
-        after_pr=after_pr,
         resume=False,
+        after_pr=after_pr,
         transport=transport,
         now=now,
         max_prs=max_prs,
@@ -531,16 +583,13 @@ def sweep_increment(
     now: str | None = None,
     max_prs: int | None = DEFAULT_RUN_CAP,
 ) -> SweepResult:
-    """The watermark-driven per-increment run (the push-run face): merged
-    PRs whose (merged_at, number) tuple is newer than the resume marker,
-    oldest first by merge date (ties by PR number), capped per run. The next
-    run — push run or full-history sweep — resumes automatically past
-    wherever this one's marker stopped."""
-    return _run(
+    """The watermark-driven per-increment run (the push-run face;
+    ``_run_face``, filter ON) at the per-run ``DEFAULT_RUN_CAP`` — the
+    next run resumes automatically past wherever its marker stopped."""
+    return _run_face(
         conn,
         repo,
         branch,
-        after_pr=0,
         resume=True,
         transport=transport,
         now=now,
@@ -557,21 +606,15 @@ def sweep_backfill(
     now: str | None = None,
     max_prs: int | None = DEFAULT_BACKFILL_CAP,
 ) -> SweepResult:
-    """The CI backfill face (UPDATE's ``--pr-backfill full``): BATCHED
-    oldest-unincorporated history, NOT a re-sweep. The increment's resume
-    machinery at the per-invocation CI cap (``DEFAULT_BACKFILL_CAP``):
-    candidates are the merged PRs newer than the resume marker, oldest first
-    by merge date (ties by PR number), operator skips included — so every
-    dispatch lands one disjoint chunk, the marker advances over it, and the
-    next identical dispatch continues past it (never restarting at PR 1)
-    until history is caught up. History BELOW the marker is never
-    re-recorded here: that explicit re-sweep is the ``sweep_full`` face
-    (``pr-sweep --full``, uncapped by default)."""
-    return _run(
+    """The CI backfill face (UPDATE's ``--pr-backfill full``;
+    ``_run_face``, filter ON): the increment's run BATCHED at
+    ``DEFAULT_BACKFILL_CAP`` per invocation — one disjoint chunk of
+    oldest-unincorporated history per dispatch, never a re-sweep below
+    the marker (that explicit re-sweep is ``sweep_full``)."""
+    return _run_face(
         conn,
         repo,
         branch,
-        after_pr=0,
         resume=True,
         transport=transport,
         now=now,
@@ -588,20 +631,15 @@ def sweep_full(
     now: str | None = None,
     max_prs: int | None = None,
 ) -> SweepResult:
-    """The full-history sweep (explicit operator invocation): the same
-    merge-date walk sharing the resume marker, merely walked further — its
-    listing continues past the number bound until the beginning of the PR
-    numbering (or a stop condition), so the whole history is re-swept
-    (replace-not-duplicate keeps it clean, and the marker never regresses
-    while history below it is re-recorded). Later push runs continue after
-    the shared marker. NOT the CI backfill: update's ``--pr-backfill full``
-    is the batched ``sweep_backfill`` face (oldest-unincorporated history
-    only, ``DEFAULT_BACKFILL_CAP`` per invocation)."""
-    return _run(
+    """The full-history sweep (explicit operator invocation, uncapped by
+    default; ``_run_face``, filter OFF at bound 0): the RE-SWEEP — history
+    below the shared resume marker is re-recorded (replace-not-duplicate)
+    while the marker never regresses. NOT the CI backfill: update's
+    ``--pr-backfill full`` is the batched ``sweep_backfill`` face."""
+    return _run_face(
         conn,
         repo,
         branch,
-        after_pr=0,
         resume=False,
         transport=transport,
         now=now,
@@ -621,12 +659,13 @@ def run(
     now: str | None = None,
 ) -> SweepResult:
     """THE pr-sweep entry point (the one the CLI verbs call): selects the
-    increment / ``--full`` full-history / ``--after-pr`` bounded face.
-    Default caps live HERE: the increment face caps at ``DEFAULT_RUN_CAP``
-    (a few PRs per push run); the full and bounded faces are unlimited
-    unless ``max_prs`` says otherwise. The CI backfill (update's
-    ``--pr-backfill full``) is NOT one of these faces: it is the batched
-    ``sweep_backfill`` face at ``DEFAULT_BACKFILL_CAP`` per invocation.
+    ``--full`` full-history / ``--after-pr`` bounded / default increment
+    face and passes ``max_prs`` through; with none given, ``run`` omits it
+    so the increment face consumes its own default (``DEFAULT_RUN_CAP``,
+    defined once in the constants block above — never restated here). The
+    CI backfill (update's ``--pr-backfill full``) is NOT one of these
+    faces: it is the batched ``sweep_backfill`` face at
+    ``DEFAULT_BACKFILL_CAP`` per invocation.
 
     The shared run machinery converts expected API/git/OS failures to
     ``STOP_UNAVAILABLE`` at the phase that owns the counters, so an
@@ -638,14 +677,12 @@ def run(
         return sweep_full(conn, repo, branch, transport=transport, now=now, max_prs=max_prs)
     if after_pr is not None:
         return sweep(conn, repo, branch, after_pr, transport=transport, now=now, max_prs=max_prs)
-    return sweep_increment(
-        conn,
-        repo,
-        branch,
-        transport=transport,
-        now=now,
-        max_prs=DEFAULT_RUN_CAP if max_prs is None else max_prs,
-    )
+    if max_prs is None:
+        # the default cap is the increment face's own signature default:
+        # omitting the argument is how run() consumes it (stated once,
+        # never restated here)
+        return sweep_increment(conn, repo, branch, transport=transport, now=now)
+    return sweep_increment(conn, repo, branch, transport=transport, now=now, max_prs=max_prs)
 
 
 def _github_repo(conn: sqlite3.Connection) -> tuple[str, str]:
