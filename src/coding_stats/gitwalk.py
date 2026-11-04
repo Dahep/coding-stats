@@ -51,7 +51,7 @@ def is_store_path(path: str) -> bool:
     return STORE_DIR_NAME in parts or _LEGACY_STORE_DIR_NAME in parts
 
 
-def _unquote_git_path(token: str) -> str:
+def unquote_git_path(token: str) -> str:
     """Decode one C-quoted git path token ('"a/x\\303\\244"') to a str path."""
     body = token[1:-1]
     out = bytearray()
@@ -93,7 +93,7 @@ def parse_diff_header(line: str) -> tuple[str, str] | None:
             m = _QUOTED_TOKEN_RE.match(rest, pos)
             if m is None:
                 return None
-            tokens.append(_unquote_git_path(m.group(0)))
+            tokens.append(unquote_git_path(m.group(0)))
             pos = m.end()
             if n == 0:
                 if rest[pos : pos + 1] != " ":

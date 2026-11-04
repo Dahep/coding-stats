@@ -1,13 +1,12 @@
-"""Blame evidence + fix target reduction + lineage closure tests."""
+"""Blame evidence + the derive stage's fix attribution/lineage closure tests."""
 
 import subprocess
 
 import pytest
 
 from coding_stats.blame import blame_deleted_lines, contiguous, delete_ranges
+from coding_stats.derive import annotate_fix, close_lineage, run_derive
 from coding_stats.gitwalk import walk
-from coding_stats.lineage import close_lineage
-from coding_stats.targets import annotate_all, annotate_fix
 from conftest import add_feature, commit_files, make_db, run
 
 
@@ -43,7 +42,7 @@ def test_blame_deleted_lines(repo, shas):
     assert blame_deleted_lines(repo, shas["c7"]) == {}
 
 
-def test_annotate_fix_then_annotate_all(repo, shas, db):
+def test_derive_annotates_and_targets(repo, shas, db):
     for key in ("c3", "c5"):
         db.execute(
             "INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output, model,"
@@ -53,6 +52,8 @@ def test_annotate_fix_then_annotate_all(repo, shas, db):
         )
     db.commit()
 
+    # the granular annotation keeps its shape: one fix commit's rows, then a
+    # full derive pass over both fixes
     annotate_fix(repo, db, shas["c3"], 1)
     touches = db.execute(
         "SELECT c.sha, t.hit_lines FROM fix_touches t"
@@ -62,8 +63,8 @@ def test_annotate_fix_then_annotate_all(repo, shas, db):
     ).fetchall()
     assert [(r["sha"], r["hit_lines"]) for r in touches] == [(shas["c1"], 1)]
 
-    n = annotate_all(repo, db)
-    assert n == 2
+    res = run_derive(db, repo)
+    assert res.fixes_annotated == 2
     targets = {
         (f_sha, t_sha)
         for f_sha, t_sha in db.execute(
@@ -83,7 +84,7 @@ def test_refactor_and_whitespace_get_no_fix_rows(repo, shas, db):
             (shas[key], verdict),
         )
     db.commit()
-    assert annotate_all(repo, db) == 0
+    assert run_derive(db, repo).fixes_annotated == 0
     assert db.execute("SELECT COUNT(*) c FROM fix_touches").fetchone()["c"] == 0
 
 
@@ -106,9 +107,8 @@ def test_lineage_transitive_and_via(repo, shas, db):
     )
     db.commit()
 
-    annotate_all(repo, db)
-    added = close_lineage(db)
-    assert added == 2  # c3->F, c5->F
+    res = run_derive(db, repo)
+    assert res.closure_rows == 2  # c3->F, c5->F
 
     rows = {
         (r["fix"], r["feat"], r["via"])
@@ -132,10 +132,9 @@ def test_lineage_idempotent(repo, shas, db):
         (shas["c1"], feat_a),
     )
     db.commit()
-    annotate_all(repo, db)
-    close_lineage(db)
+    run_derive(db, repo)
     n_first = db.execute("SELECT COUNT(*) c FROM fixes_features").fetchone()["c"]
-    close_lineage(db)
+    close_lineage(db)  # a standalone closure re-run is idempotent too
     assert db.execute("SELECT COUNT(*) c FROM fixes_features").fetchone()["c"] == n_first
 
 
@@ -145,8 +144,7 @@ def test_lineage_requires_defines(tmp_path, repo, shas):
     walk(repo, conn, "main")
     _verdict_fix(conn, shas["c3"])
     conn.commit()
-    annotate_all(repo, conn)
-    assert close_lineage(conn) == 0
+    assert run_derive(conn, repo).closure_rows == 0
 
 
 def test_blame_ignores_store_paths(repo):
@@ -200,3 +198,56 @@ def test_blame_rename_into_store_contributes_no_fix_attribution(repo, shas=None)
     ).fetchall()
     assert [r["hit_lines"] for r in touches] == [1]
     conn.close()
+
+
+# ------------------------------------- derived-only rebuild (the derive stage) --
+
+
+def _derived_rows(conn):
+    touches = {tuple(r) for r in conn.execute("SELECT fix_commit_id, source_commit_id,"
+                                              " hit_lines FROM fix_touches")}
+    targets = {tuple(r) for r in conn.execute("SELECT fix_commit_id, target_commit_id"
+                                              " FROM fix_targets")}
+    reaches = {tuple(r) for r in conn.execute(
+        "SELECT fix_commit_id, feature_id, via_fix_commit_id FROM fixes_features")}
+    return touches, targets, reaches
+
+
+def test_derive_rerun_is_idempotent(repo, shas, db):
+    """The derive stage is deterministic: a second identical run leaves the
+    derived-only tables byte-identical (rebuild-from-scratch, Q11a)."""
+    _verdict_fix(db, shas["c3"])
+    _verdict_fix(db, shas["c5"])
+    feat_a = add_feature(db, "alpha", "x", "2026")
+    db.execute(
+        "INSERT INTO commits_features (commit_id, feature_id, role)"
+        " VALUES ((SELECT id FROM commits WHERE sha = ?), ?, 'defines')",
+        (shas["c1"], feat_a),
+    )
+    db.commit()
+    run_derive(db, repo)
+    first = _derived_rows(db)
+    res2 = run_derive(db, repo)
+    assert _derived_rows(db) == first
+    assert res2.fixes_annotated == 2 and res2.closure_rows == 2
+
+
+def test_raised_threshold_drops_stale_targets(repo, shas, db):
+    """Regression: re-deriving at a RAISED min_target_lines removes targets
+    that now fall below the threshold. The old append-only derivation kept
+    them forever (a prev-targets guard behind INSERT OR IGNORE), so a raised
+    threshold silently retained stale targets."""
+    _verdict_fix(db, shas["c3"])  # rewrites one line -> 1 hit on c1
+    db.commit()
+    run_derive(db, repo, min_target_lines=1)
+    assert db.execute("SELECT COUNT(*) c FROM fix_targets").fetchone()["c"] == 1
+
+    run_derive(db, repo, min_target_lines=2)
+    assert db.execute("SELECT COUNT(*) c FROM fix_targets").fetchone()["c"] == 0
+    # the raw hit rows stay threshold-independent
+    touches = db.execute(
+        """SELECT c.sha, t.hit_lines FROM fix_touches t JOIN commits c ON c.id = t.source_commit_id
+           JOIN commits f ON f.id = t.fix_commit_id WHERE f.sha = ?""",
+        (shas["c3"],),
+    ).fetchall()
+    assert [(r["sha"], r["hit_lines"]) for r in touches] == [(shas["c1"], 1)]

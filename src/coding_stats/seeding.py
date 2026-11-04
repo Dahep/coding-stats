@@ -17,8 +17,8 @@ Rules per ADR-0006 / ticket #22:
   ``classified_at``, ties broken by the lexicographic Repository key order —
   checking sources in (earliest-classified-at, key) order and taking the
   first cover of each sha is exactly that selection;
-- detect, lineage and live-lines still run on B afterwards: B's fix targets
-  and line counts come from its own blame, and B's walk order stays its own
+- the derive stage still runs on B afterwards: B's fix targets and line
+  counts come from its own blame, and B's walk order stays its own
   (seeding never re-derives, it only copies what classification decided).
 """
 
@@ -156,7 +156,8 @@ def _copy_commit(
     """Copy one seeded commit's verdict, defined/linked feature rows, and
     direct fix attribution. via_fix ids are re-anchored to our own commit
     ids when the referenced sha exists here (else NULL: no dangling ints —
-    the closure's deterministic re-derivation below extends what reproves)."""
+    critical when the update's derive stage is trimmed; an untrimmed run
+    clears and re-derives the closure from this branch's own blame)."""
     src_id = src.by_sha[sha]
     v = src.rows.execute("SELECT * FROM commit_verdicts WHERE commit_id = ?", (src_id,)).fetchone()
     if v is not None:

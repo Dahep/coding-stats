@@ -61,8 +61,7 @@ def test_snapshot_json_shape(classified):
 
 
 def test_populate_fix_rows_then_metrics(classified, repo, shas):
-    from coding_stats.lineage import close_lineage
-    from coding_stats.targets import annotate_all
+    from coding_stats.derive import annotate_all, close_lineage
 
     n = annotate_all(repo, classified)
     assert n == 2
@@ -107,9 +106,8 @@ def test_cli_report_text(classified, capsys):
 
 
 def test_rolling_and_timeline(classified, repo):
-    from coding_stats.lineage import close_lineage
+    from coding_stats.derive import annotate_all, close_lineage
     from coding_stats.metrics import features_timeline, fixes_rolling
-    from coding_stats.targets import annotate_all
 
     assert annotate_all(repo, classified) == 2
     close_lineage(classified)
@@ -217,9 +215,8 @@ def test_fix_events_count_per_reach(tmp_path):
         )
     conn.commit()
 
-    from coding_stats.lineage import close_lineage
+    from coding_stats.derive import annotate_all, close_lineage
     from coding_stats.metrics import features_timeline, fixes_rolling
-    from coding_stats.targets import annotate_all
 
     assert annotate_all(repo, conn) == 3  # three fix commits annotated; the
     # reach-less ones target nothing (an append deletes no lines), so the
@@ -257,10 +254,9 @@ def test_rolling_and_timeline_empty_db(tmp_path):
 
 
 def test_html_report(tmp_path, classified, repo):
+    from coding_stats.derive import annotate_all, close_lineage
     from coding_stats.htmlreport import write_report
-    from coding_stats.lineage import close_lineage
     from coding_stats.metrics import feature_ranking
-    from coding_stats.targets import annotate_all
 
     assert annotate_all(repo, classified) == 2
     close_lineage(classified)

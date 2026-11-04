@@ -14,30 +14,34 @@ See `DESIGN.md` (decisions) and `CONTEXT.md` (domain language).
    refactor | revert | cleanup`), checkpointed into SQLite per turn so runs
    are resumable. Raw LLM output is stored per commit for auditability; the
    single LLM verdict drives what metrics count (blame evidence never does).
-3. `detect` — for `fix`-verdict commits only: blame deleted/rewritten lines
-   at the first parent (`git blame -w -C --first-parent --porcelain`) and
-   record `fix_touches` (raw hits) and `fix_targets` (hits ≥
-   `min_target_lines`).
-4. `lineage` — `fixes_features` transitive closure: a fix of a fix is
-   attributed to every unit in its chain, each fix counted once per feature
-   it reaches (`via_fix_commit_id` marks the first intermediate fix).
-5. `report` — features/year, fixes/feature, churn per feature; text, JSON
+3. `derive` — the single deterministic stage (ADR-0008): for `fix`-verdict
+   commits only, blame deleted/rewritten lines at the first parent
+   (`git blame -w -C --first-parent --porcelain`) and record `fix_touches`
+   (raw hits) and `fix_targets` (hits ≥ `min_target_lines`); then
+   `fixes_features`, the transitive closure — a fix of a fix is attributed
+   to every unit in its chain, each fix counted once per feature it reaches
+   (`via_fix_commit_id` marks the first intermediate fix); then the tip's
+   live-lines accounting. All three derived tables are rebuilt from scratch
+   on every run: a raised `min_target_lines` on a later run drops the
+   targets that fall below it. The originary `detect`/`lineage` verbs were
+   folded in and deleted.
+4. `report` — features/year, fixes/feature, churn per feature; text, JSON
    (`--json`), matplotlib charts (`--charts`), and a self-contained HTML page
    (`--html [path]`: fix ranking, features-over-time, 1-month rolling
    fixes/feature, verdict mix, commit volume, churn).
-6. `update` — one orchestrating run: verify the artifact digest first (on
+5. `update` — one orchestrating run: verify the artifact digest first (on
    mismatch, partial recompute anchored at the newest self-verifying
    committed artifact version, full recompute when none verifies), then
-   `walk → classify → detect → lineage → live-lines → report → serialize` +
-   digest + verify. Default `--db coding-stats.db` on a machine; CI runs pass
+   `walk → classify → derive → report → serialize` +
+  digest + verify. Default `--db coding-stats.db` on a machine; CI runs pass
    `--db .coding-stats/working.db` — the CI working DB is throwaway (runs are
    stateless and the committed artifact is the store), so a fresh DB adopts
    the checkout's git repo and seeds itself from the artifact. Classification
    is best-effort: a backlog stays visible in the final line and reprocesses
    on a later run. One opt-in extra stage (ADR-0007 clause 1, `detect-pr`):
-   the watermark-driven PR-channel increment runs after `live-lines`, before
+   the watermark-driven PR-channel increment runs after `derive`, before
    `serialize` — see "PR-channel attribution (opt-in: `detect-pr`)" below.
-7. `migrate` — two one-time moves. From the legacy `skill-stats` layout
+6. `migrate` — two one-time moves. From the legacy `skill-stats` layout
    (ADR-0005): verifies the legacy artifact, reuses the machine-local DB
    when it corresponds (verdicts survive), relabels the repository key when
    the GitHub rename changed it, regenerates the store under
@@ -96,7 +100,7 @@ uv run coding-stats migrate . --data-branch     # ADR-0003 store -> the Data bra
 uv run coding-stats gather --db union.db ~/dotfiles ~/.config-repo     # union of artifacts
 ```
 
-The plumbing verbs (`walk`, `classify`, `detect`, `lineage`, `pr-sweep`)
+The plumbing verbs (`walk`, `classify`, `derive`, `pr-sweep`)
 remain available as stage subcommands of `update` for development and
 debugging.
 
