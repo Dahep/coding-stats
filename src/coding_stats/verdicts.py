@@ -25,8 +25,8 @@ consume it; it imports nothing back.
 
 # The recorded verdicts, exactly the set the schema CHECK accepts today
 # (the pre-ADR-0008 recorded shape; spec #49 adds ``enhancement`` and
-# ``chore``). Keep alphabetical-ish taxonomy order: the work verdicts, then
-# the system verdicts.
+# ``chore``). Keep taxonomy order: the work verdicts, then the system
+# verdicts.
 FEATURE = "feature"
 FIX = "fix"
 REFACTOR = "refactor"

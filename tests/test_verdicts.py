@@ -105,23 +105,39 @@ def test_live_db_accepts_exactly_the_recorded_verdicts(tmp_path):
 
 
 def test_merge_verdicts_render_in_the_donut(tmp_path, repo, shas):
-    """The live bug this run fixes, end to end: a merge verdict (classify
-    writes them for empty-diff merges) is a donut slice, and the center
-    total is the sum of the slices."""
+    """The live bug this run fixes, end to end: every commit classified (the
+    merge as classify writes them for empty-diff merges), every
+    schema-accepted verdict a slice, and the donut's center total equals the
+    sum of the slice counts — the old report listed six slices but labeled
+    their sum the commit total, so a repo with merge commits showed slices
+    that did not sum to the walked commit count."""
     from coding_stats import gitwalk, htmlreport
     from conftest import make_db
 
     conn = make_db(tmp_path / "m.db", repo)
     gitwalk.walk(repo, conn, "main")
-    conn.execute(
-        "INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output,"
-        " model, classified_at) VALUES ((SELECT id FROM commits WHERE sha = ?), ?,"
-        " 'empty diff vs first parent', '', 'm', 'x')",
-        (shas["c8"], verdicts.MERGE),
-    )
+    for key, verdict in (
+        ("c1", verdicts.FEATURE),
+        ("c2", verdicts.FEATURE),
+        ("c3", verdicts.FIX),
+        ("c4", verdicts.REFACTOR),
+        ("c5", verdicts.FIX),
+        ("c6", verdicts.FEATURE),
+        ("cr", verdicts.FEATURE),
+        ("c7", verdicts.FEATURE),
+        ("c8", verdicts.MERGE),  # the empty-diff merge classify writes
+    ):
+        conn.execute(
+            "INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output,"
+            " model, classified_at) VALUES ((SELECT id FROM commits WHERE sha = ?), ?,"
+            " 'x', '', 'm', 'x')",
+            (shas[key], verdict),
+        )
     conn.commit()
     page = htmlreport.build(conn)
     assert "merge &nbsp;<b>1</b>" in page  # the merge slice, labeled
+    assert 'class="donut-total">9</text>' in page  # center == all 9 classified commits
+    assert ">verdicts</text>" in page  # labeled what it is: verdict count
     conn.close()
 
 

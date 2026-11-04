@@ -455,7 +455,7 @@ def _hbars(
 
 
 def _donut(counts: list[tuple[str, int, str]]) -> str:
-    total = sum(n for _, n, _ in counts) or 1
+    total = sum(n for _, n, _ in counts)  # the center IS the slice sum
     r, cx, cy = 62, 90, 90
     circ = 2 * 3.1415926 * r
     segs: list[str] = []
@@ -463,7 +463,7 @@ def _donut(counts: list[tuple[str, int, str]]) -> str:
     for name, n, color in counts:
         if n <= 0:
             continue
-        frac = n / total
+        frac = n / (total or 1)
         segs.append(
             f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="{color}"'
             f' stroke-width="15" stroke-dasharray="{frac * circ:.2f} {circ:.2f}"'

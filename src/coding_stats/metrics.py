@@ -803,6 +803,11 @@ def snapshot(conn: sqlite3.Connection, top: int = 15) -> MetricSnapshot:
 
 
 def snapshot_to_json(snap: MetricSnapshot) -> str:
+    """External JSON shape. The snapshot's Fix-event keys are `fix_events`,
+    `fix_event_total` and `uncovered_fix_commits`; the ONE deliberate
+    exception is `top_features_by_fixes[].fixes` — the per-feature Fix-event
+    count under its historical key (its value was always the reach count
+    through fixes_features, so nothing changed but the prose)."""
     return json.dumps(
         {
             "total_commits": snap.total_commits,

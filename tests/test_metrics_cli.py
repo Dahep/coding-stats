@@ -127,6 +127,116 @@ def test_rolling_and_timeline(classified, repo):
     assert roll[-1].fixes_per_feature == 2.0
 
 
+def test_fix_events_count_per_reach(tmp_path):
+    """THE Fix-event semantics, discriminated from the old per-commit count:
+    ONE fix commit rewriting a line from EACH of two features counts TWO Fix
+    events (two (fix, Feature) reaches) — the pre-change `total_fixes` said
+    one. Its events bucket by the Landing date (committer date), never the
+    author date a rebase preserves. A fix reaching nothing is no event at
+    all: it survives only in the audit view."""
+    import os
+    import subprocess
+
+    repo = tmp_path / "rr"
+    repo.mkdir()
+
+    def git(*args: str, env_extra: dict | None = None) -> str:
+        env = dict(os.environ, **(env_extra or {}))
+        return subprocess.run(
+            ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True, env=env
+        ).stdout
+
+    def commit(msg: str, files: dict[str, str], dates: dict | None = None) -> str:
+        for name, content in files.items():
+            p = repo / name
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+        git("add", "-A")
+        git("commit", "-m", msg, env_extra=dates)
+        return git("rev-parse", "HEAD").strip()
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "T")
+    c1 = commit("feature one", {"f1.txt": "F1-A\nF1-B\n"})
+    c2 = commit("feature two", {"f2.txt": "F2-A\nF2-B\n"})
+    # THE fix: one commit rewriting a line from each feature. Rebases the
+    # author date into January; lands (committer date) in March.
+    commit(
+        "fix both features",
+        {"f1.txt": "F1-A-FIXED\nF1-B\n", "f2.txt": "F2-A-FIXED\nF2-B\n"},
+        dates={
+            "GIT_AUTHOR_DATE": "2026-01-10T12:00:00Z",
+            "GIT_COMMITTER_DATE": "2026-03-20T12:00:00Z",
+        },
+    )
+    # reach-less fixes: append-only (no deleted lines -> no targets, no
+    # fixes_features edges, no Fix events). TWO of them, so the raw fix
+    # COMMIT count (3) and the reach count (2) can never be confused.
+    for i, day in enumerate(("05", "06"), 1):
+        commit(
+            f"fix nothing yet {i}",
+            {f"n{i}.txt": "new\n"},
+            dates={
+                "GIT_AUTHOR_DATE": f"2026-02-{day}T12:00:00Z",
+                "GIT_COMMITTER_DATE": f"2026-02-{day}T12:00:00Z",
+            },
+        )
+
+    conn = make_db(tmp_path / "rr.db", repo)
+    walk(repo, conn, "main")
+    for sha, verdict in ((c1, "feature"), (c2, "feature")):
+        conn.execute(
+            "INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output, model,"
+            " classified_at) VALUES ((SELECT id FROM commits WHERE sha = ?), ?, '', '', 'm', 'x')",
+            (sha, verdict),
+        )
+    for sha in conn.execute("SELECT sha FROM commits WHERE sha NOT IN (?, ?)", (c1, c2)).fetchall():
+        conn.execute(
+            "INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output, model,"
+            " classified_at) VALUES ((SELECT id FROM commits WHERE sha = ?), 'fix', '', '',"
+            " 'm', 'x')",
+            (sha["sha"],),
+        )
+    for sha, title in ((c1, "one"), (c2, "two")):
+        fid = add_feature(conn, title, "", "2026-01-01")
+        conn.execute(
+            "INSERT INTO commits_features (commit_id, feature_id, role)"
+            " VALUES ((SELECT id FROM commits WHERE sha = ?), ?, 'defines')",
+            (sha, fid),
+        )
+    conn.commit()
+
+    from coding_stats.lineage import close_lineage
+    from coding_stats.metrics import features_timeline, fixes_rolling
+    from coding_stats.targets import annotate_all
+
+    assert annotate_all(repo, conn) == 3  # three fix commits annotated; the
+    # reach-less ones target nothing (an append deletes no lines), so the
+    # closure below sees exactly the both-features fix's two reaches
+    close_lineage(conn)
+
+    snap = snapshot(conn)
+    assert snap.verdict_counts["fix"] == 3  # three fix COMMITS (raw count, unchanged)
+    # but only TWO Fix events — both reaches of the one both-features fix.
+    # The pre-change count (raw fix commits) said 3.
+    assert snap.fix_event_total == 2
+    assert snap.uncovered_fix_commits == 2  # the reach-less fixes: audit view only
+
+    roll = fixes_rolling(conn)
+    # the events' Landing date is the fix's COMMITTER date (2026-03-20); the
+    # author date (2026-01-10) must never start the series
+    assert roll[0].when == "2026-03-20"
+    assert (roll[0].fix_events, roll[0].features_touched) == (2, 2)
+
+    tl = features_timeline(conn)
+    march = [p for p in tl if p.month == "2026-03"]
+    assert march and march[0].fix_events == 2 and march[0].commits == 1
+    assert all(p.fix_events == 0 for p in tl if p.month == "2026-02")  # reach-less: no event
+    assert all(p.fix_events == 0 for p in tl if p.month == "2026-01")  # never the author date
+    conn.close()
+
+
 def test_rolling_and_timeline_empty_db(tmp_path):
     from coding_stats.db import connect
     from coding_stats.metrics import features_timeline, fixes_rolling
