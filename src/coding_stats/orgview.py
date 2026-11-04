@@ -54,12 +54,12 @@ _base = identity.key_base
 
 
 def _project(conn: sqlite3.Connection) -> sqlite3.Connection:
-    from . import artifact  # lazy: artifact→htmlreport→metrics→orgview cycle
+    from . import tablecatalog  # leaf: the one declaration every shape derives from
 
     out = sqlite3.connect(":memory:")
     out.row_factory = sqlite3.Row
-    for table in artifact._TABLES:
-        out.execute(table.ddl.strip())
+    for table in tablecatalog.artifact_tables():
+        out.execute(tablecatalog.artifact_ddl(table))
 
     _copy_repositories(conn, out)
     commit_map = _copy_commits(conn, out)  # dedup shas per repo base
