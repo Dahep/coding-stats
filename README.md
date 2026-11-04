@@ -25,14 +25,15 @@ See `DESIGN.md` (decisions) and `CONTEXT.md` (domain language).
    on every run: a raised `min_target_lines` on a later run drops the
    targets that fall below it. The originary `detect`/`lineage` verbs were
    folded in and deleted.
-5. `report` — features/year, fixes/feature, churn per feature; text, JSON (`--json`), matplotlib charts (`--charts`), and a self-contained HTML page
+4. `report` — features/year, fixes/feature, churn per feature; text, JSON
+   (`--json`), matplotlib charts (`--charts`), and a self-contained HTML page
    (`--html [path]`: fix ranking, features-over-time, 1-month rolling
    fixes/feature, verdict mix, commit volume, churn).
-6. `update` — one orchestrating run: verify the artifact digest first (on
+5. `update` — one orchestrating run: verify the artifact digest first (on
    mismatch, partial recompute anchored at the newest self-verifying
    committed artifact version, full recompute when none verifies), then
    `walk → classify → derive → report → serialize` +
-   digest + verify. Default `--db coding-stats.db` on a machine; CI runs pass
+  digest + verify. Default `--db coding-stats.db` on a machine; CI runs pass
    `--db .coding-stats/working.db` — the CI working DB is throwaway (runs are
    stateless and the committed artifact is the store), so a fresh DB adopts
    the checkout's git repo and seeds itself from the artifact. Classification
@@ -40,7 +41,7 @@ See `DESIGN.md` (decisions) and `CONTEXT.md` (domain language).
    on a later run. One opt-in extra stage (ADR-0007 clause 1, `detect-pr`):
    the watermark-driven PR-channel increment runs after `derive`, before
    `serialize` — see "PR-channel attribution (opt-in: `detect-pr`)" below.
-7. `migrate` — two one-time moves. From the legacy `skill-stats` layout
+6. `migrate` — two one-time moves. From the legacy `skill-stats` layout
    (ADR-0005): verifies the legacy artifact, reuses the machine-local DB
    when it corresponds (verdicts survive), relabels the repository key when
    the GitHub rename changed it, regenerates the store under

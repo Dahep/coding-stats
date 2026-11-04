@@ -6,7 +6,7 @@ import subprocess
 
 import pytest
 
-from coding_stats.blame import _porcelain_shas
+from coding_stats.blame import porcelain_shas
 from coding_stats.derive import _line_counts_at, run_derive, sample_points
 from coding_stats.gitwalk import walk
 from conftest import add_feature, commit_files, make_db, run
@@ -173,7 +173,7 @@ def test_binary_files_never_crash_blame(repo, tmp_path):
     # fresh text + high-byte text attribute normally
     counts_shas = set(counts)
     tip_blames = {
-        _porcelain_shas(
+        porcelain_shas(
             subprocess.run(
                 ["git", "-C", str(repo), "blame", "-w", "-C", "--porcelain", h2, "--", p],
                 check=True,
@@ -205,7 +205,7 @@ def test_porcelain_parser_on_real_blame_output(repo, shas):
         capture_output=True,
         text=True,
     ).stdout
-    blamed = _porcelain_shas(out)
+    blamed = porcelain_shas(out)
     assert len(blamed) == 4  # a.txt has 4 lines at the tip
     assert set(blamed) <= set(shas.values())  # every line maps to a walked commit
 

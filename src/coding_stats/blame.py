@@ -93,7 +93,7 @@ def blame_deleted_lines(repo: Path, sha: str) -> dict[str, list[str]]:
                     "--",
                     file,
                 )
-                per_line.extend(_porcelain_shas(text)[:count])
+                per_line.extend(porcelain_shas(text)[:count])
         except subprocess.CalledProcessError:
             continue
         if per_line:
@@ -115,7 +115,7 @@ def contiguous(rs: list[tuple[int, int]]) -> list[tuple[int, int]]:
 SHA_LINE_RE = re.compile(r"^([0-9a-f]{40}) (\d+) (\d+)(?: (\d+))?$")
 
 
-def _porcelain_shas(text: str) -> list[str]:
+def porcelain_shas(text: str) -> list[str]:
     """One sha per blamed old line, in order, from git blame --porcelain v1."""
     shas: list[str] = []
     for line in text.splitlines():

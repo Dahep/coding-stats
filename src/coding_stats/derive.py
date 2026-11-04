@@ -37,8 +37,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import verdicts
-from .blame import _porcelain_shas, blame_deleted_lines
-from .gitwalk import _unquote_git_path, is_store_path
+from .blame import blame_deleted_lines, porcelain_shas
+from .gitwalk import is_store_path, unquote_git_path
 
 # Backfill plan caps (grill-r3-Q9 leaves the cap to implementation):
 # a full sweep up to this many walked commits, evenly sampled above it.
@@ -411,7 +411,7 @@ def _line_counts_at(repo_dir: Path, sha: str) -> tuple[Counter[str], int]:
         except subprocess.CalledProcessError:
             unattributed += _blob_line_count(repo_dir, sha, path)  # blame failure
             continue
-        for blamed in _porcelain_shas(text):
+        for blamed in porcelain_shas(text):
             counts[blamed] += 1
     return counts, unattributed
 
@@ -481,7 +481,7 @@ def _decode_name(raw: bytes) -> str:
     defensively quoted-looking spelling (with escapes) is decoded so exclusion
     and blame always see the real path."""
     if raw[:1] == b'"' and raw[-1:] == b'"' and b"\\" in raw[1:-1]:
-        return _unquote_git_path(raw.decode("ascii", "surrogateescape"))
+        return unquote_git_path(raw.decode("ascii", "surrogateescape"))
     return raw.decode("utf-8", "surrogateescape")
 
 
