@@ -1,12 +1,51 @@
 """update-verb tests: stage order, end-to-end artifact landing, backlog
-visibility (Q13), trim flags, verify-first digest verdict."""
+visibility (Q13), trim flags, verify-first digest verdict, options drift."""
 
+import argparse
 import re
 import sqlite3
+from dataclasses import fields
 
-from coding_stats import artifact
+from coding_stats import artifact, cli
 from coding_stats.cli import main
 from conftest import commit_files, store_dir
+
+
+def test_update_options_drift_guard():
+    """Every flag the update parser accepts is an UpdateOptions field, and a
+    fully-flagged invocation populates the frozen record through the builder
+    (a fabricated-Namespace-vs-parser gap can never hide again: tests exercise
+    stages by constructing UpdateOptions directly, with no argparse)."""
+    root = argparse.ArgumentParser(prog="coding-stats")
+    subparsers = root.add_subparsers(dest="cmd", required=True)
+    update = cli._update_parser(subparsers)
+    dests = {action.dest for action in update._actions} - {"help"}
+    assert dests == {f.name for f in fields(cli.UpdateOptions)}
+
+    stated = cli.update_options(
+        update.parse_args(
+            [
+                "--db",
+                "drift.db",
+                "--no-classify",
+                "--no-detect",
+                "--no-lineage",
+                "--no-serialize",
+                "--detect-pr",
+                "--pr-backfill",
+                "full",
+            ]
+        )
+    )
+    assert stated == cli.UpdateOptions(
+        db="drift.db",
+        no_classify=True,
+        no_detect=True,
+        no_lineage=True,
+        no_serialize=True,
+        detect_pr=True,
+        pr_backfill="full",
+    )
 
 
 class FakeSession:
