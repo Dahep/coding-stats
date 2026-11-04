@@ -325,13 +325,14 @@ def resolve_attribution(conn: sqlite3.Connection) -> list[ResolvedCommit]:
     """Every walked commit's attribution, resolved ONCE per commit from the
     union of its evidence rows through aiattr's canonical per-commit resolver
     (``aiattr.resolve`` — ONE evidence read per commit, carrying the
-    attribution, the resolved channel and the channel-tagged rows): the
-    verdict is the strongest contributing tier, identity claims resolve
-    git-first, suspicious rows contribute nothing, and the channel is the
-    resolver's ('git' when the walk recorded any row, else 'pr'; no
-    contributing evidence reads as '' and the verdict as ``no-evidence``).
-    Only the presentation dedup of the evidence rows happens here — never a
-    second resolution rule or evidence read.
+    attribution, the resolved channel and the channel-tagged rows, identity
+    columns included): the verdict is the strongest contributing tier,
+    identity claims resolve git-first, suspicious rows contribute nothing,
+    and the channel is the resolver's ('git' when the walk recorded any
+    row, else 'pr'; no contributing evidence reads as '' and the verdict as
+    ``no-evidence``). The evidence list keeps every contributing row as
+    recorded — a raw matched on several channels or PRs is several
+    observations, never deduped or re-resolved here.
 
     The ONE resolution pass: a caller building several attribution views
     resolves here once and hands the result back through each view's
@@ -346,13 +347,6 @@ def resolve_attribution(conn: sqlite3.Connection) -> list[ResolvedCommit]:
     ):
         cid = int(r["cid"])
         resolved = aiattr.resolve(conn, cid)  # ONE evidence read per commit
-        seen: set[tuple[str, str, str]] = set()
-        evidence: list[tuple[str, str, str]] = []
-        for _ch, rule, raw, verdict in resolved.tagged:
-            key = (rule, raw, verdict)
-            if key not in seen:
-                seen.add(key)
-                evidence.append(key)
         out.append(
             ResolvedCommit(
                 cid,
@@ -362,7 +356,7 @@ def resolve_attribution(conn: sqlite3.Connection) -> list[ResolvedCommit]:
                 resolved.attribution.harness,
                 resolved.attribution.model,
                 resolved.channel,
-                evidence,
+                [(c.rule, c.raw, c.verdict) for c in resolved.tagged],
             )
         )
     return out
