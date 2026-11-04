@@ -7,7 +7,10 @@ repo-scoped purge, the ingest ownership predicates, orgview's projection
 copies) and the copies were deliberately non-uniform. This module is the ONE
 owner: every consumer derives its SQL from here.
 
-It is a LEAF: zero imports from the coding-stats package. artifact, schema,
+It is a LEAF: zero imports from the coding-stats package apart from the
+verdicts leaf (itself import-free), whose CHECK constraint the
+commit_verdicts declaration embeds — the working schema's DDL and the
+Artifact's DDL generate that one copy. artifact, schema,
 gather and orgview consume it directly (db, recovery and migration reach it
 through artifact); it imports nothing back, so the declaration can never
 depend on a consumer.
@@ -75,6 +78,8 @@ import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Literal
+
+from . import verdicts
 
 Direction = Literal["gather", "orgview"]
 
@@ -248,8 +253,10 @@ _TABLES: tuple[Table, ...] = (
             Column("commit_id", "INTEGER PRIMARY KEY", Ref("commits")),
             Column(
                 "verdict",
-                "TEXT NOT NULL CHECK (verdict IN ('feature', 'fix', 'refactor',"
-                " 'revert', 'cleanup', 'merge', 'unknown'))",
+                # the recorded Commit verdicts: the ONE CHECK copy, generated
+                # from the verdicts leaf (the donut coupling test pins the
+                # accepted set to what the reports show)
+                f"TEXT NOT NULL {verdicts.check_constraint()}",
             ),
             Column("rationale", "TEXT NOT NULL"),
             Column("raw_llm_output", "TEXT NOT NULL"),
