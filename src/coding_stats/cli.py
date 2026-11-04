@@ -1,4 +1,4 @@
-"""CLI: uv run coding-stats {init,walk,classify,detect,lineage,report,update,ci,gather,migrate}.
+"""CLI: uv run coding-stats {init,walk,classify,derive,report,update,ci,gather,migrate}.
 Requires the
 opencode CLI on PATH for classify (ADR-0001 rolling session). update is the
 orchestrating verb (ADR-0003 clause 7); the stage subcommands stay plumbing;
@@ -16,8 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import aiattr, ci, datastore, db, gitwalk, identity, prsource, prsweep
 from .classify import DEFAULT_MODEL, SESSION_DIR, Session, classify_pending
-from .lineage import close_lineage
-from .targets import annotate_all
+from .derive import run_derive
 
 if TYPE_CHECKING:
     _SubParsers = argparse._SubParsersAction[argparse.ArgumentParser]
@@ -45,6 +44,9 @@ class UpdateOptions:
 
     db: str = "coding-stats.db"
     no_classify: bool = False
+    # No-detect / no-lineage debug trims: they skip derive's attribution
+    # rebuild (the live-lines pass always runs — how the old pipeline's
+    # trims composed).
     no_detect: bool = False
     no_lineage: bool = False
     no_serialize: bool = False
@@ -66,14 +68,25 @@ def _update_parser(sub: "_SubParsers") -> argparse.ArgumentParser:
     UpdateOptions field (tests/test_update.py)."""
     up = sub.add_parser(
         "update",
-        help="verify -> walk -> seed -> classify -> detect -> lineage -> live-lines"
-        " -> serialize + digest (ADR-0006: the store holds only the SQL artifact;"
-        " reports render via the report verb/action)",
+        help="verify -> walk -> seed -> classify -> derive -> serialize + digest (ADR-0006:"
+        " the store holds only the SQL artifact; reports render via the report"
+        " verb/action)",
     )
     up.add_argument("--db", default="coding-stats.db")
     up.add_argument("--no-classify", action="store_true", help="skip LLM classification")
-    up.add_argument("--no-detect", action="store_true", help="skip blame-based fix detection")
-    up.add_argument("--no-lineage", action="store_true", help="skip lineage closure")
+    up.add_argument(
+        "--no-detect",
+        action="store_true",
+        help="debug trim: skip the derive stage's fix attribution + lineage"
+        " closure rebuild (the live-lines pass still runs; --no-lineage is"
+        " the same trim)",
+    )
+    up.add_argument(
+        "--no-lineage",
+        action="store_true",
+        help="debug trim: as --no-detect (derive is one stage: fix"
+        " attribution, lineage closure, live-lines attribution)",
+    )
     up.add_argument("--no-serialize", action="store_true", help="skip artifact write")
     up.add_argument(
         "--detect-pr",
@@ -138,11 +151,11 @@ def main(argv: list[str] | None = None) -> None:
     cls.add_argument("--limit", type=int, default=None)
     cls.add_argument("--fresh", action="store_true", help="drop saved opencode session")
 
-    det = sub.add_parser("detect", help="blame evidence -> fix_touches/fix_targets")
-    det.add_argument("--db", default="coding-stats.db")
-
-    lin = sub.add_parser("lineage", help="fixes_features transitive closure")
-    lin.add_argument("--db", default="coding-stats.db")
+    der = sub.add_parser(
+        "derive",
+        help="one deterministic pass: fix attribution -> lineage closure -> live lines",
+    )
+    der.add_argument("--db", default="coding-stats.db")
 
     rep = sub.add_parser("report", help="metrics text summary + optional charts")
     rep.add_argument("--db", default="coding-stats.db")
@@ -431,14 +444,14 @@ def main(argv: list[str] | None = None) -> None:
             if session.session_id:
                 _set(conn, "classify_session_id", session.session_id)
         print(f"classified {len(done)} commits (session {session.session_id})")
-    elif args.cmd == "detect":
+    elif args.cmd == "derive":
         assert repo_dir is not None, "run init first"
-        n_fixes = annotate_all(repo_dir, conn, int(settings.get("min_target_lines", 1)))
-        print(f"annotated {n_fixes} fix commits")
-    elif args.cmd == "lineage":
-        n_rows = close_lineage(conn)
-        rows_now = conn.execute("SELECT COUNT(*) c FROM fixes_features").fetchone()["c"]
-        print(f"closure rows now {rows_now} (+{n_rows})")
+        derived = run_derive(conn, repo_dir, int(settings.get("min_target_lines", 1)))
+        print(
+            f"annotated {derived.fixes_annotated} fix commits,"
+            f" closure rows {derived.closure_rows}"
+        )
+        _print_live_lines(derived.at_sha, derived.unattributed_lines, derived.samples_written)
     elif args.cmd == "report":
         from .report import text_report
 
@@ -473,6 +486,15 @@ def _pending_count(conn: sqlite3.Connection) -> int:
             "SELECT COUNT(*) c FROM commits c LEFT JOIN commit_verdicts v"
             " ON v.commit_id = c.id WHERE v.commit_id IS NULL"
         ).fetchone()["c"]
+    )
+
+
+def _print_live_lines(at_sha: str, unattributed_lines: int, samples_written: int) -> None:
+    """The live-lines tail of the derive stage's report (same shape as before
+    the derive consolidation)."""
+    print(
+        f"live lines at {at_sha[:12] or '(none)'}: unattributed"
+        f" {unattributed_lines}, {samples_written} samples written"
     )
 
 
@@ -528,9 +550,9 @@ def _run_update(
     conn: sqlite3.Connection, options: UpdateOptions, layout: StoreLayout = StoreLayout.DATA_BRANCH
 ) -> sqlite3.Connection:
     """One orchestrating run (ADR-0003 clause 7, Q11): verify the existing
-    artifact first, then walk -> classify -> detect -> lineage -> live-lines ->
-    serialize + digest + verify (no report stage since ADR-0006: the store
-    holds only the SQL artifact; reports render via the report verb/action).
+    artifact first, then walk -> classify -> derive -> serialize + digest +
+    verify (no report stage since ADR-0006: the store holds only the SQL
+    artifact; reports render via the report verb/action).
     Deterministic stages always run;
     classification is best-effort — when it cannot run the walked backlog stays
     pending, is printed loudly, and reprocesses on a later successful update
@@ -568,7 +590,7 @@ def _run_update(
     default runs exactly this pipeline, unchanged."""
     import os as _os
 
-    from . import artifact, livelines, recovery
+    from . import artifact, derive, recovery
 
     db_path = Path(options.db)
     settings = _settings(conn)
@@ -691,18 +713,20 @@ def _run_update(
                 " update"
             )
 
-    if not options.no_detect:
-        n_fixes = annotate_all(repo_dir, conn, int(settings.get("min_target_lines", 1)))
-        print(f"annotated {n_fixes} fix commits")
-    if not options.no_lineage:
-        close_lineage(conn)
-        print("lineage closure updated")
-
-    live = livelines.update_live_lines(conn, repo_dir)
-    print(
-        f"live lines at {live.at_sha[:12] or '(none)'}: unattributed"
-        f" {live.unattributed_lines}, {live.samples_written} samples written"
+    # The derive stage (ADR-0008): one deterministic pass rebuilding the
+    # blame-derived state — fix attribution, lineage closure, the tip's
+    # live-lines accounting. The derived-only tables are fully rebuilt each
+    # run, so a raised min_target_lines drops the targets that fall below
+    # it. Runs after classify and before anything consumes it (the PR tier
+    # below).
+    derived = derive.run_derive(
+        conn,
+        repo_dir,
+        int(settings.get("min_target_lines", 1)),
+        attribution=not (options.no_detect or options.no_lineage),
     )
+    print(f"annotated {derived.fixes_annotated} fix commits, closure rows {derived.closure_rows}")
+    _print_live_lines(derived.at_sha, derived.unattributed_lines, derived.samples_written)
 
     # ADR-0007 clause 1 (ticket #37): the opt-in PR tier runs as the last
     # stage before serialization, so its evidence rows and the watermark

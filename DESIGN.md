@@ -193,7 +193,12 @@ matplotlib scripts over SQL queries. Build git-only phase first.
   live-lines history stays append-only: forward samples every update,
   historical samples from the adoption backfill) — so it runs after
   classify and before anything consumes it; the PR tier runs after derive
-  and before serialize.
+  and before serialize. The consolidation landed ahead of #48: the former
+  `detect`/`lineage` verbs folded into one `derive` stage, and the
+  attribution tables (`fix_touches`, `fix_targets`, `fixes_features`) are
+  derived-only — cleared and rebuilt every run, so a raised
+  `min_target_lines` drops the targets that fall below it (the append-only
+  prev-targets guard that silently retained stale targets is gone).
 - **Feature size**: per-feature `live_lines` = blame at the Target-branch
   tip, every line owned by exactly one commit; fix-owned lines accrue to
   the features the fix targets (via fix lineage); a commit claimed by two

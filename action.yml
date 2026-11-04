@@ -70,11 +70,11 @@ inputs:
     required: false
     default: "false"
   no-detect:
-    description: "Debug pass-through to update --no-detect: skip blame-based fix detection."
+    description: "Debug pass-through to update --no-detect: skip the derive stage's attribution rebuild (live-lines still runs)."
     required: false
     default: "false"
   no-lineage:
-    description: "Debug pass-through to update --no-lineage: skip the lineage closure."
+    description: "Debug pass-through to update --no-lineage: as --no-detect — derive is one stage (fix attribution, lineage closure, live-lines attribution)."
     required: false
     default: "false"
   detect-pr:
