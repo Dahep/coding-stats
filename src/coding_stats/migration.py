@@ -48,8 +48,6 @@ NEW_ARTIFACT_REL = ".coding-stats/coding-stats.sql"
 DEFAULT_LEGACY_DB = Path("~/.skill-stats/skill-stats.db")
 DEFAULT_MIRRORED_DB = Path("~/.coding-stats/coding-stats.db")
 
-_SIDECARS = ("-wal", "-shm", "-journal")
-
 
 class MigrationError(RuntimeError):
     """Migration cannot proceed safely; nothing was changed."""
@@ -448,34 +446,26 @@ def run(plan: Plan, repo: Path, no_classify: bool = False) -> list[str]:
 def _rebuild_from_artifact(db_path: Path, data: bytes, repo: Path) -> None:
     """Fresh working DB seeded from verified legacy artifact bytes: the
     verdict rows travel inside the artifact, so classification cost is zero.
-    register_repository is deliberately NOT used — migration relabels the
-    repositories row itself (the rename is an identity change the register
-    rules must refuse; see module docstring)."""
-    tmp_path = db_path.parent / (db_path.name + ".migrate-tmp")
-    for suffix in ("", *_SIDECARS):
-        Path(str(tmp_path) + suffix).unlink(missing_ok=True)
-    raw = sqlite3.connect(tmp_path)
-    raw.row_factory = sqlite3.Row
-    try:
-        artifact.restore_into(raw, data)
-    finally:
-        raw.close()
-    conn = db.connect(tmp_path)
+    register=False: register_repository is deliberately not used — migration
+    relabels the repositories row itself (the rename is an identity change
+    the register rules must refuse; see module docstring)."""
+    tmp_path = db.swap_tmp(db_path)
+    db.remove_db_files(tmp_path)
+    conn = artifact.seed_working_db(tmp_path, data, register=False)
     try:
         recovery.rehydrate_diffs(conn, repo)
         conn.commit()
     finally:
         conn.close()
-    _atomic_swap(tmp_path, db_path)
+    db.replace_file(tmp_path, db_path)
 
 
 def _atomic_copy(source: Path, db_path: Path) -> None:
     """Consistent copy of the legacy DB through a tmp file + atomic swap
     (the sqlite backup API handles WAL consistency; the destination is never
     in a half-open state)."""
-    tmp_path = db_path.parent / (db_path.name + ".migrate-tmp")
-    for suffix in ("", *_SIDECARS):
-        Path(str(tmp_path) + suffix).unlink(missing_ok=True)
+    tmp_path = db.swap_tmp(db_path)
+    db.remove_db_files(tmp_path)
     src = _open_read_snapshot(source)
     try:
         dst = sqlite3.connect(tmp_path)
@@ -485,17 +475,7 @@ def _atomic_copy(source: Path, db_path: Path) -> None:
             dst.close()
     finally:
         src.close()
-    _atomic_swap(tmp_path, db_path)
-
-
-def _atomic_swap(tmp_path: Path, db_path: Path) -> None:
-    """Replace db_path with tmp_path atomically; stale destination sidecars
-    are removed only after the main file is in place (they would otherwise
-    replay old frames onto the new file)."""
-    tmp_path.replace(db_path)
-    for suffix in _SIDECARS:
-        Path(str(db_path) + suffix).unlink(missing_ok=True)
-        Path(str(tmp_path) + suffix).unlink(missing_ok=True)
+    db.replace_file(tmp_path, db_path)
 
 
 def _relabel(conn: sqlite3.Connection, relabel: tuple[str, str, str, str], branch: str) -> None:
@@ -535,7 +515,7 @@ def migrate_to_data_branch(
     pushes ONLY refs/heads/coding-stats/<target>; the Target branch itself
     never receives a commit. The scratch seed goes through
     artifact.restore_into, so the landed header's schema-step stamp always
-    reflects the legacy store's step, never an unstamped-DB 0 (#31).
+    reflects the legacy store's step.
     Idempotent: a Data branch already holding a verifying, branch-carrying
     artifact reports 'already migrated'."""
     from . import ci, datastore, gitwalk, identity  # late imports (module cycle)
@@ -562,9 +542,8 @@ def migrate_to_data_branch(
         )
     out.append("committed artifact: digest ok")
     # re-prefix in memory: the ids upgrade to the {repo}@{branch} form. The
-    # scratch DB is seeded through artifact.restore_into: serialize's header
-    # stamp reads the _schema_step_* bookkeeping, so an unstamped seed would
-    # mint a step-0 artifact whose content is the migrated layout (#31).
+    # scratch DB is seeded through artifact.restore_into, so serialize's
+    # header stamp reads the _schema_step_* bookkeeping the seed wrote.
     rows = sqlite3.connect(":memory:")
     rows.row_factory = sqlite3.Row
     try:

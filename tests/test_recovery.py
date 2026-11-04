@@ -339,7 +339,8 @@ def test_rebuild_swap_failure_keeps_original_db(tmp_path, repo, monkeypatch):
     def boom(src, dst):
         raise OSError("disk full")
 
-    monkeypatch.setattr(recovery.os, "replace", boom)
+    # the swap lives in db.replace_file now; its replace call is the seam
+    monkeypatch.setattr("pathlib.Path.replace", boom)
     old = sqlite3.connect(db_path)
     old.row_factory = sqlite3.Row
     with pytest.raises(OSError, match="disk full"):

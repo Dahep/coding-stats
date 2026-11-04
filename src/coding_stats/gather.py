@@ -149,12 +149,9 @@ def _load(source: Path, label: str, data: bytes) -> _Ingest:
     if err is not None:
         raise GatherError(f"{label}: refusing artifact ({err})")
 
-    rows = sqlite3.connect(":memory:")
-    rows.row_factory = sqlite3.Row
     try:
-        artifact.materialize(rows, data)
+        rows = artifact.seed_working_db(Path(":memory:"), data, register=False)
     except artifact.MaterializeError as exc:
-        rows.close()
         raise GatherError(f"{label}: {exc}") from exc
     repo_row = rows.execute("SELECT * FROM repositories ORDER BY id LIMIT 1").fetchone()
     if repo_row is None:

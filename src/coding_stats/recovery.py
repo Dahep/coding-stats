@@ -20,7 +20,6 @@ The same rebuild primitive serves a third case: a fresh/throwaway working DB
 committed artifact is the store (see cli._run_update).
 """
 
-import os
 import sqlite3
 import subprocess
 from dataclasses import dataclass
@@ -103,25 +102,26 @@ def rebuild(
     repo_dir: Path,
     branch: str | None,
 ) -> sqlite3.Connection:
-    """Replace the working DB atomically with a fresh one: materialize `data`
-    (artifact bytes) when given — restore/seed — or leave it empty for a full
-    recompute. Pending commits regain their real diffs from git (the artifact
+    """Replace the working DB atomically with a fresh one: seed it from
+    `data` (artifact bytes) through artifact.seed_working_db when given —
+    the restore/seed path — or leave it empty for a full recompute (plain
+    connect). Pending commits regain their real diffs from git (the artifact
     stores ''), non-derived settings are carried over, and the repository is
     (re-)registered so identity rules stay enforced."""
-    tmp_path = db_path.parent / (db_path.name + ".rebuild-tmp")
-    _cleanup(tmp_path)
-    raw = sqlite3.connect(tmp_path)
-    raw.row_factory = sqlite3.Row
-    try:
-        if data is not None:
-            artifact.restore_into(raw, data)  # replay + stamp, the ONE seed entry
-    finally:
-        raw.close()
-    fresh = db.connect(tmp_path)  # no-op for materialized steps; migrates old artifacts
+    tmp_path = db.swap_tmp(db_path)
+    db.remove_db_files(tmp_path)
+    if data is not None:
+        fresh = artifact.seed_working_db(
+            tmp_path, data, register=True, repo_dir=repo_dir, branch=branch
+        )
+    else:
+        fresh = db.connect(tmp_path)
     try:
         _carry_settings(old, fresh)
-        identity.register_repository(fresh, repo_dir, branch)
-        if data is not None:
+        if data is None:
+            # nothing was seeded, so no in-seed registration happened
+            identity.register_repository(fresh, repo_dir, branch)
+        else:
             rehydrate_diffs(fresh, repo_dir)
             # safe-side upgrade: artifacts minted before the scheme carries
             # branch ids ({repo-slug}-{n}) re-prefix in place, suffixes kept
@@ -131,12 +131,7 @@ def rebuild(
     finally:
         fresh.close()
     old.close()
-    try:
-        os.replace(tmp_path, db_path)  # atomic: the original stays until the swap
-    except OSError:
-        _cleanup(tmp_path)  # failed swap: the original DB is untouched
-        raise
-    _cleanup_sidecars(db_path)  # stale sidecars of the replaced DB, only now
+    db.replace_file(tmp_path, db_path)  # atomic: the original stays until the swap
     return db.connect(db_path)
 
 
@@ -170,13 +165,3 @@ def _carry_settings(old: sqlite3.Connection, new: sqlite3.Connection) -> None:
         new.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (r["key"], r["value"])
         )
-
-
-def _cleanup(db_path: Path) -> None:
-    for suffix in ("", "-wal", "-shm", "-journal"):
-        Path(str(db_path) + suffix).unlink(missing_ok=True)
-
-
-def _cleanup_sidecars(db_path: Path) -> None:
-    for suffix in ("-wal", "-shm", "-journal"):
-        Path(str(db_path) + suffix).unlink(missing_ok=True)

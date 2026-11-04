@@ -5,6 +5,8 @@ import json
 import re
 import sqlite3
 
+import pytest
+
 from coding_stats import artifact
 from coding_stats.gitwalk import walk
 from coding_stats.lineage import close_lineage
@@ -167,6 +169,41 @@ def test_artifact_materializes_standalone_with_committed_shapes(tmp_path, repo):
     )
     conn.close()
     mat.close()
+
+
+def test_seed_working_db_stamps_the_artifacts_schema_step(tmp_path, repo):
+    """The one-seed API keeps replay and stamp inseparable: the seeded DB
+    carries the artifact's own stamp (its schema step, not a fabricated 0),
+    so a later serialize of the seeded DB re-emits the same header stamp —
+    losing #31 again is not reachable through this path."""
+    conn, *_ = _built_db(tmp_path, repo)
+    data = artifact.serialize(conn)
+    step = artifact.parse_header(data).schema_step
+    assert step > 0  # the source artifact is stamped; the compare is not vacuous
+
+    seeded = artifact.seed_working_db(tmp_path / "seeded.db", data, register=False)
+    markers = {
+        r[0]
+        for r in seeded.execute("SELECT name FROM sqlite_master WHERE name LIKE '_schema_step_%'")
+    }
+    assert markers == {f"_schema_step_{i:04d}" for i in range(step + 1)}
+    assert artifact.parse_header(artifact.serialize(seeded)).schema_step == step
+    seeded.close()
+    conn.close()
+
+
+def test_seed_working_db_refuses_data_that_does_not_verify(tmp_path, repo):
+    """Digest verification gates the ONE seed path itself: stale-digest
+    bytes are refused before anything is built (entry points keep their own
+    earlier checks for their own messages — this one cannot be bypassed)."""
+    conn, *_ = _built_db(tmp_path, repo)
+    data = artifact.serialize(conn)
+    tampered = data.replace(b"INSERT INTO features", b"INSERT INTO featurez", 1)
+    assert artifact.verify_bytes(tampered) is not None  # the digest is stale
+    with pytest.raises(artifact.MaterializeError, match="refusing artifact"):
+        artifact.seed_working_db(tmp_path / "seeded.db", tampered, register=False)
+    assert not (tmp_path / "seeded.db").exists()  # refused before the file existed
+    conn.close()
 
 
 def test_header_fields(tmp_path, repo):

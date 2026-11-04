@@ -75,7 +75,7 @@ def test_materialize_refuses_hostile_sql(tmp_path, payload):
     data = _hostile_artifact(repo, payload)
     conn = sqlite3.connect(":memory:")
     with pytest.raises(artifact.MaterializeError):
-        artifact.materialize(conn, data)
+        artifact.restore_into(conn, data)
     conn.close()
 
 
@@ -112,7 +112,7 @@ def test_materialize_refuses_an_artifact_missing_a_core_table(tmp_path, table):
     conn = sqlite3.connect(":memory:")
     try:
         with pytest.raises(artifact.MaterializeError, match=f"missing table {table}"):
-            artifact.materialize(conn, mutilated)
+            artifact.restore_into(conn, mutilated)
     finally:
         conn.close()
 
@@ -123,7 +123,7 @@ def test_benign_artifact_materializes_with_curated_shape(tmp_path):
     assert artifact.verify(art) is None
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
-    artifact.materialize(conn, art.read_bytes())
+    artifact.restore_into(conn, art.read_bytes())
     # shape drift guard: the replayed tables carry exactly the curated columns
     for name, spec in artifact.KNOWN_TABLES.items():
         cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({name})")]
