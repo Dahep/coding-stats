@@ -30,6 +30,7 @@ from coding_stats.metrics import (
     attribution_by_repo,
     attribution_rows,
     attribution_summary,
+    resolve_attribution,
     snapshot,
 )
 from coding_stats.report import text_report
@@ -203,6 +204,51 @@ def test_loser_git_rows_outrank_winner_pr_rows_in_the_union(tmp_path):
     eff = aiattr.resolve(view, cid).attribution
     assert (eff.verdict, eff.harness, eff.model) == ("yes", "claude", "Opus 4.8 (1M context)")
     assert [c.channel for c in aiattr.effective_evidence(view, cid)] == ["git", "pr"]
+    assert attribution_summary(view).verdict_counts == {"yes": 1}
+    conn.close()
+
+
+def test_one_raw_mirrored_on_both_channels_keeps_every_observation(tmp_path):
+    """A raw matched on several channels or PRs is SEVERAL observations: the
+    evidence list keeps every contributing row as recorded (git first), never
+    deduped on (rule, raw, verdict) — dedup is the projection's table keying
+    (git rows on (rule, raw), PR rows per (PR, commit, rule, raw)), never a
+    resolution rule. The summary counts read the resolution, not the rows."""
+    conn = db.connect(tmp_path / "union.db")
+    conn.executescript(
+        """
+        INSERT INTO repositories (id, repo_key, slug, branch, clone_url, added_at)
+          VALUES (1, 'local:eq@later', 'eq@later', 'later', NULL, ''),
+                 (2, 'local:eq@early', 'eq@early', 'early', NULL, '');
+        INSERT INTO commits (id, repo_id, sha, parent_sha, tree_sha, committed_at,
+                             author_name, title, message, walk_index, kind, diff,
+                             added_lines, deleted_lines, churn_lines)
+          VALUES (1, 1, 'x40', NULL, 't', '2026-01-05T00:00:00Z', 't', 'one', 'm', 1,
+                  'normal', '', 1, 0, 1),
+                 (2, 2, 'x40', NULL, 't', '2026-01-05T00:00:00Z', 't', 'one', 'm', 1,
+                  'normal', '', 1, 0, 1);
+        INSERT INTO ai_attribution (commit_id, verdict, harness, model)
+          VALUES (1, 'yes', 'claude', 'Opus 4.8 (1M context)');
+        INSERT INTO ai_evidence (commit_id, rule, raw, verdict)
+          VALUES (1, 'co-authored-by', 'Claude <noreply@anthropic.com>', 'yes');
+        INSERT INTO pr_evidence (repo_id, pr_number, commit_id, rule, raw, verdict,
+                                 harness, model, channel, observed_at, suspicious)
+          VALUES (2, 5, 2, 'co-authored-by', 'Claude <noreply@anthropic.com>', 'yes',
+                  'claude', NULL, 'pr', '2026-10-30T00:00:00+00:00', 0),
+                 (2, 6, 2, 'co-authored-by', 'Claude <noreply@anthropic.com>', 'yes',
+                  'claude', NULL, 'pr', '2026-10-30T00:00:00+00:00', 0);
+        """
+    )
+    conn.commit()
+    view = orgview.org(conn)
+    cid = int(view.execute("SELECT id FROM commits WHERE sha = 'x40'").fetchone()["id"])
+    rows = {r.cid: r for r in resolve_attribution(view)}
+    assert (rows[cid].verdict, rows[cid].channel) == ("yes", "git")
+    assert (rows[cid].harness, rows[cid].model) == ("claude", "Opus 4.8 (1M context)")
+    # the git observation first, then BOTH recorded PR observations of the
+    # same raw — three observations, kept as recorded
+    assert rows[cid].evidence == [("co-authored-by", "Claude <noreply@anthropic.com>", "yes")] * 3
+    # counts read the resolution, not the row list: one attributed commit
     assert attribution_summary(view).verdict_counts == {"yes": 1}
     conn.close()
 
