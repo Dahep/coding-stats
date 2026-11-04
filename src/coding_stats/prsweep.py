@@ -660,13 +660,12 @@ def run(
 ) -> SweepResult:
     """THE pr-sweep entry point (the one the CLI verbs call): selects the
     ``--full`` full-history / ``--after-pr`` bounded / default increment
-    face and passes ``max_prs`` through. Default caps live on the faces
-    (the constants block above defines them once): the increment face caps
-    at ``DEFAULT_RUN_CAP`` (a few PRs per push run); the full and bounded
-    faces are unlimited unless ``max_prs`` says otherwise. The CI backfill
-    (update's ``--pr-backfill full``) is NOT one of these faces: it is the
-    batched ``sweep_backfill`` face at ``DEFAULT_BACKFILL_CAP`` per
-    invocation.
+    face and passes ``max_prs`` through; with none given, ``run`` omits it
+    so the increment face consumes its own default (``DEFAULT_RUN_CAP``,
+    defined once in the constants block above — never restated here). The
+    CI backfill (update's ``--pr-backfill full``) is NOT one of these
+    faces: it is the batched ``sweep_backfill`` face at
+    ``DEFAULT_BACKFILL_CAP`` per invocation.
 
     The shared run machinery converts expected API/git/OS failures to
     ``STOP_UNAVAILABLE`` at the phase that owns the counters, so an
@@ -678,14 +677,12 @@ def run(
         return sweep_full(conn, repo, branch, transport=transport, now=now, max_prs=max_prs)
     if after_pr is not None:
         return sweep(conn, repo, branch, after_pr, transport=transport, now=now, max_prs=max_prs)
-    return sweep_increment(
-        conn,
-        repo,
-        branch,
-        transport=transport,
-        now=now,
-        max_prs=DEFAULT_RUN_CAP if max_prs is None else max_prs,
-    )
+    if max_prs is None:
+        # the default cap is the increment face's own signature default:
+        # omitting the argument is how run() consumes it (stated once,
+        # never restated here)
+        return sweep_increment(conn, repo, branch, transport=transport, now=now)
+    return sweep_increment(conn, repo, branch, transport=transport, now=now, max_prs=max_prs)
 
 
 def _github_repo(conn: sqlite3.Connection) -> tuple[str, str]:
