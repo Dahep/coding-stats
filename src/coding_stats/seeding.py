@@ -156,7 +156,8 @@ def _copy_commit(
     """Copy one seeded commit's verdict, defined/linked feature rows, and
     direct fix attribution. via_fix ids are re-anchored to our own commit
     ids when the referenced sha exists here (else NULL: no dangling ints —
-    the closure's deterministic re-derivation below extends what reproves)."""
+    critical when the update's derive stage is trimmed; an untrimmed run
+    clears and re-derives the closure from this branch's own blame)."""
     src_id = src.by_sha[sha]
     v = src.rows.execute("SELECT * FROM commit_verdicts WHERE commit_id = ?", (src_id,)).fetchone()
     if v is not None:

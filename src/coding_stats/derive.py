@@ -152,9 +152,10 @@ def annotate_all(repo: Path, conn: sqlite3.Connection, min_target_lines: int = 1
 
 def close_lineage(conn: sqlite3.Connection) -> int:
     """Rebuild the transitive closure for all fix commits — from scratch:
-    `fixes_features` is cleared first (derived-only). Chronological order
-    guarantees a fix's targets have already been closed when it is
-    processed; every remaining insert is fresh."""
+    `fixes_features` is cleared first (derived-only). Each fix closes through
+    its own `fix_targets` in one self-contained BFS (`close_one` never reads
+    earlier closure rows), so the walk_index order is deterministic, not
+    load-bearing; every remaining insert is fresh."""
     rows = conn.execute(
         """SELECT c.id FROM commits c
            JOIN fix_targets ft ON ft.fix_commit_id = c.id
