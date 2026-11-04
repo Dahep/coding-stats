@@ -85,7 +85,8 @@ def test_per_model_fix_events_count_per_reach(tmp_path, repo):
         "SELECT commit_id FROM commit_verdicts WHERE verdict = 'fix'",
     ).fetchone()[0]
     ha_id, fid_a = conn.execute(
-        "SELECT commit_id, feature_id FROM commits_features WHERE role = 'defines' LIMIT 1"
+        "SELECT commit_id, feature_id FROM commits_features WHERE role = 'defines'"
+        " ORDER BY commit_id LIMIT 1"
     ).fetchone()
     # the same claude commit defines a SECOND feature; the fix reaches it too
     fid_two = add_feature(conn, "classifier-two")

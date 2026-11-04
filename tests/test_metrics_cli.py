@@ -158,8 +158,18 @@ def test_fix_events_count_per_reach(tmp_path):
     git("init", "-q", "-b", "main")
     git("config", "user.email", "t@example.com")
     git("config", "user.name", "T")
-    c1 = commit("feature one", {"f1.txt": "F1-A\nF1-B\n"})
-    c2 = commit("feature two", {"f2.txt": "F2-A\nF2-B\n"})
+    git("config", "commit.gpgsign", "false")
+
+    def pinned(day: str, t: str) -> dict[str, str]:
+        # author and committer dates pinned equal: only the both-features fix
+        # below diverges them (rebased work vs landing)
+        return {
+            "GIT_AUTHOR_DATE": f"2026-04-{day}T{t}",
+            "GIT_COMMITTER_DATE": f"2026-04-{day}T{t}",
+        }
+
+    c1 = commit("feature one", {"f1.txt": "F1-A\nF1-B\n"}, dates=pinned("01", "12:00:00Z"))
+    c2 = commit("feature two", {"f2.txt": "F2-A\nF2-B\n"}, dates=pinned("02", "12:00:01Z"))
     # THE fix: one commit rewriting a line from each feature. Rebases the
     # author date into January; lands (committer date) in March.
     commit(
