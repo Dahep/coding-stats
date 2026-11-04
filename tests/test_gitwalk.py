@@ -171,6 +171,33 @@ def test_walk_resumes_across_skipped_commits(repo):
     assert row["sha"] == c4 and row["walk_index"] == 4
 
 
+def test_walk_stores_the_landing_date(repo, shas):
+    """committed_at is the CONTEXT.md Landing date: the committer date the
+    commit landed with, never the author date a rebase preserves. A rebased
+    fix's events must bucket at the date it landed, not the date it was
+    originally written."""
+    import os
+    import subprocess
+
+    env = dict(
+        os.environ,
+        GIT_AUTHOR_DATE="2026-01-10T12:00:00Z",
+        GIT_COMMITTER_DATE="2026-03-20T12:00:00Z",
+    )
+    (repo / "l.txt").write_text("l\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "rebased work"], check=True, env=env)
+    rebased = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    db = make_db(repo / "l.db", repo)
+    walk(repo, db, "main")
+    stored = db.execute("SELECT committed_at FROM commits WHERE sha = ?", (rebased,)).fetchone()
+    assert stored["committed_at"].startswith("2026-03-20")  # the committer (Landing) date
+    assert not stored["committed_at"].startswith("2026-01-10")  # never the author date
+
+
 # ------------------------------------------------------------- diff parsing --
 
 

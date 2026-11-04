@@ -286,7 +286,11 @@ def backfill_attribution(conn: sqlite3.Connection, repo: Path) -> int:
 
 
 def author_and_time(repo: Path, sha: str) -> tuple[str, str]:
-    out = _git(repo, "show", "-s", "--format=%an%x1f%aI", sha).strip().split("\x1f")
+    """The author name and the commit's Landing date (CONTEXT.md): the
+    COMMITTER date (%cI) — the closest git fact about landing on the Target
+    branch, which a fast-forward or merge keeps. Never the author date
+    (%aI), which a rebase preserves from the original work."""
+    out = _git(repo, "show", "-s", "--format=%an%x1f%cI", sha).strip().split("\x1f")
     return out[0], out[1]
 
 

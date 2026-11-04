@@ -163,11 +163,7 @@ def _bare_verdict_literals(path: Path) -> list[str]:
             out.append(node.value)
         elif isinstance(node, ast.JoinedStr):
             for v in node.values:
-                if (
-                    isinstance(v, ast.Constant)
-                    and type(v.value) is str
-                    and v.value in _RECORDED
-                ):
+                if isinstance(v, ast.Constant) and type(v.value) is str and v.value in _RECORDED:
                     out.append(v.value)
     return out
 
