@@ -303,7 +303,7 @@ def test_single_repo_report_renders_unchanged(tmp_path):
     assert "<th>Repo</th>" not in page  # single-repo: zero visual diff
     assert "repos" not in page.split("<title>")[1].split("</title>")[0]
     assert "coding-stats report · alpha-repo" in page  # slug branding when single
-    assert "alpha-repo " not in text.split("top 15 features by fixes:")[1].splitlines()[1]
+    assert "alpha-repo " not in text.split("top 15 features by fix events:")[1].splitlines()[1]
     conn.close()
 
 

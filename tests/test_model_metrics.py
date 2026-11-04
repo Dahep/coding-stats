@@ -65,11 +65,51 @@ def test_per_model_metrics_are_lower_bounds(tmp_path, repo):
     claude = by_h["claude"]
     assert (claude.model, claude.commits, claude.features) == ("Opus 4.8 (1M context)", 1, 1)
     assert claude.churn == 3  # the walked churn_lines (3 added lines in a.txt)
-    assert claude.fixes == 1 and claude.fixes_per_feature == 1.0
+    assert claude.fix_events == 1 and claude.fixes_per_feature == 1.0
 
     codex = by_h["codex"]
     assert (codex.model, codex.commits, codex.features) == ("gpt-5", 1, 1)
-    assert codex.churn == 2 and codex.fixes == 0 and codex.fixes_per_feature == 0.0
+    assert codex.churn == 2 and codex.fix_events == 0 and codex.fixes_per_feature == 0.0
+    conn.close()
+
+
+def test_per_model_fix_events_count_per_reach(tmp_path, repo):
+    """THE Fix-event semantics for the by-model views: ONE fix commit
+    reaching TWO of the model's features counts TWO Fix events (one per
+    (fix commit, Feature) reach) — the pre-change count said one (per
+    commit), however many features it reached."""
+    from coding_stats.metrics import attribution_by_model, attribution_trend
+
+    conn, _ids = _built(tmp_path, repo)
+    fix_id = conn.execute(
+        "SELECT commit_id FROM commit_verdicts WHERE verdict = 'fix'",
+    ).fetchone()[0]
+    ha_id, fid_a = conn.execute(
+        "SELECT commit_id, feature_id FROM commits_features WHERE role = 'defines'"
+        " ORDER BY commit_id LIMIT 1"
+    ).fetchone()
+    # the same claude commit defines a SECOND feature; the fix reaches it too
+    fid_two = add_feature(conn, "classifier-two")
+    conn.execute(
+        "INSERT INTO commits_features (commit_id, feature_id, role) VALUES (?, ?, 'defines')",
+        (ha_id, fid_two),
+    )
+    conn.execute(
+        "INSERT INTO fixes_features (fix_commit_id, feature_id, via_fix_commit_id)"
+        " VALUES (?, ?, NULL)",
+        (fix_id, fid_two),
+    )
+    conn.commit()
+
+    rows = attribution_by_model(conn)
+    claude = next(r for r in rows if r.harness == "claude")
+    assert claude.features == 2
+    assert claude.fix_events == 2  # two reaches of the same fix commit
+    assert claude.fixes_per_feature == 1.0
+
+    trend = attribution_trend(conn)
+    claude_trend = trend["claude/Opus 4.8 (1M context)"]
+    assert sum(p.fix_events for p in claude_trend) == 2
     conn.close()
 
 
@@ -86,7 +126,7 @@ def test_per_model_trend_buckets_months(tmp_path, repo):
     assert all(p.month for p in claude)
     assert sum(p.commits for p in claude) == 1
     assert sum(p.features for p in claude) == 1 and sum(p.churn for p in claude) == 3
-    assert sum(p.fixes for p in claude) == 1
+    assert sum(p.fix_events for p in claude) == 1
     conn.close()
 
 

@@ -46,10 +46,14 @@ def text_report(conn: sqlite3.Connection, top: int = 15) -> str:
         ),
         *([DISCLOSURE_LINE] if attr.github_sourced else []),
         f"Features: {snap.total_features}",
-        f"Fixes:    {snap.total_fixes}",
+        f"Fix events: {snap.fix_event_total}",
+        "  (Fix event: a fix commit counted once per Feature its lineage",
+        "  reaches, dated by its Landing date; Embedded fixes and the",
+        "  product-Area filter are pending spec #48 — all Areas count until",
+        "  then. See CONTEXT.md.)",
         f"Features / year: {snap.features_per_year:.1f}",
         f"Fixes / feature: {snap.fixes_per_feature:.2f}",
-        f"Fixes attributable to no feature: {snap.fixes_uncovered}",
+        f"Fix commits reaching no feature (audit): {snap.uncovered_fix_commits}",
         "",
         "features / year:",
     ]
@@ -60,7 +64,7 @@ def text_report(conn: sqlite3.Connection, top: int = 15) -> str:
     for yr, v in snap.fixes_by_year_mean:
         lines.append(f"  {yr}: {v:.2f}")
     lines.append("")
-    lines.append(f"top {top} features by fixes:")
+    lines.append(f"top {top} features by fix events:")
     for fid, title, n in snap.top_features_by_fixes:
         if multi:
             lines.append(f"  #{fid:<4} {title:<32} {repos.get(fid, ''):<16} {n}")
@@ -114,8 +118,8 @@ def _charts(conn: sqlite3.Connection, out_dir: str) -> list[str]:
     labels = [f"#{fid} {title[:36]}" for fid, title, _n in top][::-1]
     vals = [int(n) for _, _, n in top][::-1]
     ax.barh(labels, vals)
-    ax.set_title("features with most fixes")
-    ax.set_xlabel("fixes")
+    ax.set_title("features with most fix events")
+    ax.set_xlabel("fix events")
     p = f"{out_dir}/fixes_by_feature_top.png"
     fig.savefig(p, bbox_inches="tight")
     written.append(p)

@@ -3,6 +3,7 @@
 import sqlite3
 from pathlib import Path
 
+from . import verdicts
 from .blame import blame_deleted_lines
 
 
@@ -52,7 +53,8 @@ def annotate_all(repo: Path, conn: sqlite3.Connection, min_target_lines: int = 1
         r["sha"]
         for r in conn.execute(
             """SELECT c.sha FROM commits c JOIN commit_verdicts v ON v.commit_id = c.id
-               WHERE v.verdict = 'fix' ORDER BY c.walk_index"""
+               WHERE v.verdict = ? ORDER BY c.walk_index""",
+            (verdicts.FIX,),
         )
     ]
     for sha in shas:
