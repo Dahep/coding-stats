@@ -12,15 +12,15 @@ Everything downstream derives from here:
   is fed through the tablecatalog, so the working schema's DDL (schema step 0)
   and the Artifact's DDL generate that ONE copy (PR 4's rule: one declaration
   owns every table's shape);
-* the classifier's verdict writes and the derived stages' fix filters
-  (classify, targets, lineage);
+* the classifier's verdict writes and the derive stage's fix filters
+  (classify, derive);
 * the metrics/reports' verdict-donut slices (REPORT_ORDER — every
   schema-accepted verdict is a slice, so the donut's slices always sum to its
   center total by construction).
 
 LEAF: zero imports from the coding-stats package. tablecatalog (itself a
-leaf above this one), classify, targets, lineage, metrics and the reports
-consume it; it imports nothing back.
+leaf above this one), classify, derive, metrics and the reports consume it;
+it imports nothing back.
 """
 
 # The recorded verdicts, exactly the set the schema CHECK accepts today

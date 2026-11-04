@@ -17,8 +17,8 @@ Rules per ADR-0006 / ticket #22:
   ``classified_at``, ties broken by the lexicographic Repository key order —
   checking sources in (earliest-classified-at, key) order and taking the
   first cover of each sha is exactly that selection;
-- detect, lineage and live-lines still run on B afterwards: B's fix targets
-  and line counts come from its own blame, and B's walk order stays its own
+- the derive stage still runs on B afterwards: B's fix targets and line
+  counts come from its own blame, and B's walk order stays its own
   (seeding never re-derives, it only copies what classification decided).
 """
 

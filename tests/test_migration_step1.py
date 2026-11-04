@@ -340,10 +340,9 @@ CREATED4 = "2026-01-04T00:00:00Z"
 
 
 def test_migration_matches_fresh_walk(repo, tmp_path):
+    from coding_stats.derive import annotate_all, close_lineage
     from coding_stats.gitwalk import author_and_time, diff_for, walk
-    from coding_stats.lineage import close_lineage
     from coding_stats.metrics import snapshot, snapshot_to_json
-    from coding_stats.targets import annotate_all
     from conftest import add_feature, commit_files, make_db
 
     k1 = commit_files(repo, "feature one", {"a.txt": "alpha\nbeta\ncharlie\n"})

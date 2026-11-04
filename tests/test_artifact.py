@@ -9,10 +9,8 @@ import sqlite3
 import pytest
 
 from coding_stats import artifact
+from coding_stats.derive import annotate_all, close_lineage, run_derive
 from coding_stats.gitwalk import walk
-from coding_stats.lineage import close_lineage
-from coding_stats.livelines import update_live_lines
-from coding_stats.targets import annotate_all
 from conftest import add_feature, commit_files, make_db
 
 CLASSIFIED_AT = "2026-01-01T00:00:00Z"
@@ -49,7 +47,7 @@ def _built_db(tmp_path, repo, name="a.db", hist=None):
     conn.commit()
     annotate_all(repo, conn)
     close_lineage(conn)
-    update_live_lines(conn, repo)
+    run_derive(conn, repo)  # with the tables just rebuilt, the live-lines pass
     conn.commit()
     return conn, fa, h1, h2
 

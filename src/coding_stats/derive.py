@@ -1,28 +1,32 @@
-"""Live lines: per-feature line counts at the Target-branch tip via blame.
+"""Derive (ADR-0008): THE single deterministic stage rebuilding the
+blame-derived state from scratch every run — fix attribution, Fix lineage,
+and the tip's live-lines accounting.
 
-Every line of every tracked file at the analyzed tip is owned by exactly one
-commit (``git blame -w -C --first-parent --porcelain`` — first-parent like the
-walk, so merge-brought lines attribute to the merge commit the walk stores);
-commit lines accrue to the Features
-the commit is attributed to (grill-r3-Q7): directly via commits_features
-(defines/touches), and for fix commits through the fixes_features lineage
-closure — so fix-owned lines accrue to the features the fix reaches, and a
-commit claimed by two features counts its lines in both. Lines whose
-introducing commit is not in the DB (work outside the walk) are counted and
-surfaced as unattributed_lines — never silently dropped. Store paths
-(``.coding-stats/**``) and submodule gitlinks are skipped.
+One stage, one entry point: `run_derive` is what the update orchestrator
+calls once per run (after classify, before anything consumes it). What used
+to be three sequential stages with three separate transactions
+(targets.py's annotate, lineage.py's closure, livelines.py's attribution)
+is folded here; blame.py stays the internal line-evidence leaf (its
+porcelain parsing is implemented exactly once and imported).
 
-History: ``feature_line_samples`` holds one Sample per (feature, sample
-commit) for every feature alive at that commit (CONTEXT.md "Sample"). The
-forward sample is written at the tip on every run (idempotent on the same
-sha). Backfill (grill-r3-Q9: "Full backfill unless the repo is huge, sample in
-that case") runs once, when the samples table is empty: a full sweep over
-every walked commit, or ~BACKFILL_SAMPLE_POINTS evenly spaced commits when
-the walk exceeds BACKFILL_FULL_MAX_COMMITS. A feature not yet defined at a
-sample point simply has no row there.
+The derived-only tables (Q11a) are REBUILT FROM SCRATCH each production
+run: `fix_touches`, `fix_targets` and `fixes_features` are fully cleared and
+recomputed inside this stage. Nothing carries over across runs, so the
+stage is idempotent: re-running it at a RAISED `min_target_lines` drops the
+targets that now fall below the threshold (the append-only
+prev-targets guard that silently retained stale targets is gone). Artifact
+carry-over at rest is unchanged — the Artifact still serializes whatever
+content these tables hold after the stage.
 
-The measured point is the latest WALKED Target-branch commit — identical to
-the branch tip whenever walk ran first (update runs walk before live-lines).
+Debug trims (`--no-detect` / `--no-lineage`) skip the attribution sections
+while the live-lines pass keeps running — the old pipeline's behaviour
+(live-lines was never skippable), kept honest by staying debug-only:
+production update always rebuilds from scratch.
+
+Per-section writing keeps the old transaction sizes (empty-then-rebuild
+per table; the backfill sweep writes its state when its history is
+trustworthy). A stage that fails midway leaves partially rebuilt derived
+tables behind, serializes nothing, and the next run rebuilds from scratch.
 """
 
 import json
@@ -32,7 +36,8 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
-from .blame import _porcelain_shas
+from . import verdicts
+from .blame import _porcelain_shas, blame_deleted_lines
 from .gitwalk import _unquote_git_path, is_store_path
 
 # Backfill plan caps (grill-r3-Q9 leaves the cap to implementation):
@@ -42,8 +47,172 @@ BACKFILL_SAMPLE_POINTS = 160
 
 
 @dataclass(frozen=True)
+class DeriveResult:
+    """What one derive stage computed and recorded."""
+
+    fixes_annotated: int  # fix-verdict commits attributed this run (0 on a debug trim)
+    closure_rows: int  # fixes_features rows counted in the rebuilt closure
+    at_sha: str  # the measured tip (latest walked commit)
+    unattributed_lines: int  # tip lines whose commit is not in the DB
+    samples_written: int  # feature_line_samples rows written (incl. tip)
+    backfilled_points: int  # sample points processed by the backfill sweep
+
+
+def run_derive(
+    conn: sqlite3.Connection,
+    repo_dir: Path,
+    min_target_lines: int = 1,
+    *,
+    attribution: bool = True,
+) -> DeriveResult:
+    """The derive stage: fix attribution -> lineage closure -> live lines,
+    in that order (live lines accrue through the closure). One orchestrator
+    call, one deterministic result. `attribution=False` is the debug trim:
+    the live-lines pass runs as usual, the attribution tables are left
+    untouched."""
+    fixes_annotated = 0
+    closure_rows = 0
+    if attribution:
+        fixes_annotated = annotate_all(repo_dir, conn, min_target_lines)
+        closure_rows = close_lineage(conn)
+    live = update_live_lines(conn, repo_dir)
+    return DeriveResult(
+        fixes_annotated=fixes_annotated,
+        closure_rows=closure_rows,
+        at_sha=live.at_sha,
+        unattributed_lines=live.unattributed_lines,
+        samples_written=live.samples_written,
+        backfilled_points=live.backfilled_points,
+    )
+
+
+# ------------------------------------------------- fix attribution (targets)
+
+
+def annotate_fix(repo: Path, conn: sqlite3.Connection, sha: str, min_target_lines: int = 1) -> None:
+    """Record fix_touches and fix_targets for one fix verdict commit.
+    Called from the from-scratch rebuild (the tables are already clear);
+    its own DELETE keeps a direct call idempotent too."""
+    hits_per_source: dict[str, int] = {}
+    excluded = {sha}
+    row = conn.execute("SELECT id, parent_sha FROM commits WHERE sha = ?", (sha,)).fetchone()
+    if not row or not row["parent_sha"]:
+        return
+    per_file = blame_deleted_lines(repo, sha)
+    for _file, shas in per_file.items():
+        for source in shas:
+            if source in excluded or source.startswith("0000"):
+                continue
+            hits_per_source[source] = hits_per_source.get(source, 0) + 1
+
+    commit_id = row["id"]
+    touched: list[tuple[str, int]] = sorted(hits_per_source.items(), key=lambda kv: -kv[1])
+    with conn:
+        conn.execute("DELETE FROM fix_touches WHERE fix_commit_id = ?", (commit_id,))
+        conn.execute("DELETE FROM fix_targets WHERE fix_commit_id = ?", (commit_id,))
+        for source_sha, lines in touched:
+            src = conn.execute("SELECT id FROM commits WHERE sha = ?", (source_sha,)).fetchone()
+            if not src:
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO fix_touches (fix_commit_id, source_commit_id, hit_lines)"
+                " VALUES (?, ?, ?)",
+                (commit_id, src["id"], lines),
+            )
+            if lines >= min_target_lines:
+                conn.execute(
+                    "INSERT OR IGNORE INTO fix_targets (fix_commit_id, target_commit_id)"
+                    " VALUES (?, ?)",
+                    (commit_id, src["id"]),
+                )
+
+
+def annotate_all(repo: Path, conn: sqlite3.Connection, min_target_lines: int = 1) -> int:
+    """Rebuild fix_touches/fix_targets from scratch for every fix-verdict
+    commit. Derived-only: both tables are cleared first, so a re-run at a
+    raised min_target_lines drops targets that fall below it."""
+    shas = [
+        r["sha"]
+        for r in conn.execute(
+            """SELECT c.sha FROM commits c JOIN commit_verdicts v ON v.commit_id = c.id
+               WHERE v.verdict = ? ORDER BY c.walk_index""",
+            (verdicts.FIX,),
+        )
+    ]
+    with conn:
+        conn.execute("DELETE FROM fix_touches")
+        conn.execute("DELETE FROM fix_targets")
+    for sha in shas:
+        annotate_fix(repo, conn, sha, min_target_lines)
+    return len(shas)
+
+
+# ------------------------------------------------------- fix lineage closure
+
+
+def close_lineage(conn: sqlite3.Connection) -> int:
+    """Rebuild the transitive closure for all fix commits — from scratch:
+    `fixes_features` is cleared first (derived-only). Chronological order
+    guarantees a fix's targets have already been closed when it is
+    processed; every remaining insert is fresh."""
+    rows = conn.execute(
+        """SELECT c.id FROM commits c
+           JOIN fix_targets ft ON ft.fix_commit_id = c.id
+           ORDER BY c.walk_index"""
+    ).fetchall()
+    added = 0
+    with conn:  # clear + rebuild in one transaction: a partial closure never lands
+        conn.execute("DELETE FROM fixes_features")
+        for (fix_id,) in rows:
+            added += close_one(conn, fix_id)
+    return added
+
+
+def close_one(conn: sqlite3.Connection, fix_id: int) -> int:
+    added = 0
+    seen: set[int] = set()
+    queue: list[tuple[int, int | None]] = [
+        (r["target_commit_id"], None)
+        for r in conn.execute(
+            "SELECT target_commit_id FROM fix_targets WHERE fix_commit_id = ?", (fix_id,)
+        )
+    ]
+    while queue:
+        unit, first_fix = queue.pop(0)
+        if unit in seen or unit == fix_id:
+            continue
+        seen.add(unit)
+        for r in conn.execute(
+            "SELECT feature_id FROM commits_features WHERE commit_id = ? AND role = 'defines'",
+            (unit,),
+        ):
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO fixes_features (fix_commit_id, feature_id,"
+                " via_fix_commit_id) VALUES (?, ?, ?)",
+                (fix_id, r["feature_id"], first_fix),
+            )
+            added += cur.rowcount
+        verdict = conn.execute(
+            "SELECT verdict FROM commit_verdicts WHERE commit_id = ?", (unit,)
+        ).fetchone()
+        if verdict and verdicts.is_fix(verdict["verdict"]):
+            next_fix = first_fix if first_fix is not None else unit
+            for r in conn.execute(
+                "SELECT target_commit_id FROM fix_targets WHERE fix_commit_id = ?", (unit,)
+            ):
+                queue.append((r["target_commit_id"], next_fix))
+    return added
+
+
+# ------------------------------------------------------------- live lines
+# (folds the former livelines stage: per-feature counts at the tip, the
+# backfill sweep, the Sample writer. Sample rows keep their schema and
+# append-only history — only the derivation process consolidated.)
+
+
+@dataclass(frozen=True)
 class LiveLineResult:
-    """What one live-lines run measured and recorded."""
+    """What the live-lines pass measured and recorded."""
 
     at_sha: str  # the measured tip (latest walked commit)
     unattributed_lines: int  # tip lines whose commit is not in the DB

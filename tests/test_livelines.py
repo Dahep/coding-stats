@@ -7,10 +7,8 @@ import subprocess
 import pytest
 
 from coding_stats.blame import _porcelain_shas
+from coding_stats.derive import _line_counts_at, run_derive, sample_points
 from coding_stats.gitwalk import walk
-from coding_stats.lineage import close_lineage
-from coding_stats.livelines import _line_counts_at, sample_points, update_live_lines
-from coding_stats.targets import annotate_all
 from conftest import add_feature, commit_files, make_db, run
 
 
@@ -44,10 +42,7 @@ def test_live_lines_defines_only_and_fix_through_lineage(repo, tmp_path):
     for sha, v in ((h1, "feature"), (h2, "fix"), (h3, "feature")):
         _verdict(conn, sha, v)
     conn.commit()
-    annotate_all(repo, conn)  # fix_touches/fix_targets h2 -> h1
-    close_lineage(conn)  # fixes_features h2 -> fa
-
-    res = update_live_lines(conn, repo)
+    res = run_derive(conn, repo)  # attribution + closure + live lines, one pass
     assert res.at_sha == h3
     assert res.unattributed_lines == 0
     live = dict(conn.execute("SELECT id, live_lines FROM features"))
@@ -78,7 +73,7 @@ def test_live_lines_follow_renames(repo, tmp_path):
     fa = add_feature(conn, "feature a")
     _define(conn, fa, h1)
     conn.commit()
-    res = update_live_lines(conn, repo)
+    res = run_derive(conn, repo)
     assert res.at_sha == h2
     # blame follows the rename: both lines still owned by h1
     assert dict(conn.execute("SELECT id, live_lines FROM features")) == {fa: 2}
@@ -105,7 +100,7 @@ def test_unattributed_lines_are_counted_not_dropped(repo, tmp_path):
     )
     conn.execute("DELETE FROM commits WHERE sha = ?", (h2,))
     conn.commit()
-    res = update_live_lines(conn, repo)
+    res = run_derive(conn, repo)
     assert res.at_sha == h3  # tip = latest walked commit
     assert res.unattributed_lines == 1  # g.txt's single line
     assert dict(conn.execute("SELECT id, live_lines FROM features")) == {fa: 2}
@@ -121,7 +116,7 @@ def test_backfill_samples_every_walked_commit(repo, tmp_path):
     _define(conn, fa, h1)
     _define(conn, fb, h2)
     conn.commit()
-    res = update_live_lines(conn, repo)
+    res = run_derive(conn, repo)
     assert res.backfilled_points == 2  # full sweep: one point per walked commit
     points = {
         r["at_commit_sha"] for r in conn.execute("SELECT at_commit_sha FROM feature_line_samples")
@@ -135,7 +130,7 @@ def test_backfill_samples_every_walked_commit(repo, tmp_path):
     assert rows == {(fa, h1, 2), (fa, h2, 2), (fb, h2, 1)}
 
 
-def test_update_live_lines_is_idempotent(repo, tmp_path):
+def test_derive_live_lines_is_idempotent(repo, tmp_path):
     h1 = commit_files(repo, "feature a", {"f.txt": "a1\na2\n"})
     conn = make_db(tmp_path / "l.db", repo)
     walk(repo, conn, "main")
@@ -143,9 +138,9 @@ def test_update_live_lines_is_idempotent(repo, tmp_path):
     _define(conn, fa, h1)
     _verdict(conn, h1, "feature")  # classified: the sweep may complete
     conn.commit()
-    update_live_lines(conn, repo)
+    run_derive(conn, repo)
     before = set(conn.execute("SELECT * FROM feature_line_samples"))
-    res2 = update_live_lines(conn, repo)
+    res2 = run_derive(conn, repo)
     assert res2.backfilled_points == 0  # samples already complete -> no re-sweep
     assert set(conn.execute("SELECT * FROM feature_line_samples")) == before
 
@@ -230,7 +225,7 @@ def test_report_renders_live_lines_column_and_size_chart(repo, tmp_path):
     _define(conn, fa, h1)
     _define(conn, fb, h2)
     conn.commit()
-    update_live_lines(conn, repo)
+    run_derive(conn, repo)
     page = htmlreport.build(conn)
     assert "Live lines" in page  # ranking table column
     assert "Feature size over time" in page  # sample-driven chart section
@@ -268,7 +263,7 @@ def test_live_lines_handles_non_ascii_names_and_quoted_store_paths(repo, tmp_pat
     fa = add_feature(conn, "feature a")
     _define(conn, fa, h1)
     conn.commit()
-    res = update_live_lines(conn, repo)
+    res = run_derive(conn, repo)
     assert res.at_sha == h3
     # café.txt's lines attribute despite the quoted spelling; the non-ASCII
     # store file is excluded on its decoded name (not blamed at all)
@@ -290,7 +285,7 @@ def test_merge_brought_lines_attribute_to_the_merge_commit(repo, tmp_path):
     fm = add_feature(conn, "side feature")
     _define(conn, fm, merge)
     conn.commit()
-    res = update_live_lines(conn, repo)
+    res = run_derive(conn, repo)
     # blame --first-parent assigns the side branch's lines to the merge commit
     # (which the walk includes) -> its features; nothing goes unattributed
     assert res.unattributed_lines == 0
@@ -323,9 +318,9 @@ def _verdicted_feature_repo(repo, tmp_path):
 
 def test_backfill_resumes_after_interruption(repo, tmp_path, monkeypatch):
     conn, fa, fb, h1, h2 = _verdicted_feature_repo(repo, tmp_path)
-    import coding_stats.livelines as livelines
+    import coding_stats.derive as derive
 
-    real = livelines._line_counts_at
+    real = derive._line_counts_at
     calls = {"n": 0, "boom": True}
 
     def flaky(repo_dir, sha):
@@ -334,13 +329,13 @@ def test_backfill_resumes_after_interruption(repo, tmp_path, monkeypatch):
             raise RuntimeError("injected sweep failure")
         return real(repo_dir, sha)
 
-    monkeypatch.setattr(livelines, "_line_counts_at", flaky)
+    monkeypatch.setattr(derive, "_line_counts_at", flaky)
     with pytest.raises(RuntimeError, match="injected"):
-        update_live_lines(conn, repo)
+        run_derive(conn, repo)
     assert _state(conn) is None  # interrupted sweep records no completeness
 
     calls["boom"] = False
-    res = update_live_lines(conn, repo)  # a normal update resumes the sweep
+    res = run_derive(conn, repo)  # a normal update resumes the sweep
     assert res.backfilled_points == 2
     assert _state(conn) == {"status": "done", "max_classified_walk_index": 2}
     points = {r[0] for r in conn.execute("SELECT at_commit_sha FROM feature_line_samples")}
@@ -358,7 +353,7 @@ def test_backfill_resweeps_for_late_classification(repo, tmp_path):
     _define(conn, fb, h2)
     _verdict(conn, h2, "feature")
     conn.commit()
-    res = update_live_lines(conn, repo)
+    res = run_derive(conn, repo)
     assert res.backfilled_points == 2
     assert _state(conn)["status"] == "pending"  # backlog keeps trust pending
 
@@ -368,7 +363,7 @@ def test_backfill_resweeps_for_late_classification(repo, tmp_path):
     _define(conn, fa, h1)
     _verdict(conn, h1, "feature")
     conn.commit()
-    res2 = update_live_lines(conn, repo)
+    res2 = run_derive(conn, repo)
     assert res2.backfilled_points == 2  # re-swept
     rows = {
         (r["feature_id"], r["at_commit_sha"])
@@ -381,10 +376,10 @@ def test_backfill_resweeps_for_late_classification(repo, tmp_path):
 
 def test_backfill_done_state_is_stable(repo, tmp_path):
     conn, fa, fb, h1, h2 = _verdicted_feature_repo(repo, tmp_path)
-    update_live_lines(conn, repo)
+    run_derive(conn, repo)
     assert _state(conn)["status"] == "done"
     before = set(conn.execute("SELECT * FROM feature_line_samples"))
-    res = update_live_lines(conn, repo)  # no new classification -> no re-sweep
+    res = run_derive(conn, repo)  # no new classification -> no re-sweep
     assert res.backfilled_points == 0
     assert set(conn.execute("SELECT * FROM feature_line_samples")) == before
     conn.close()
@@ -400,7 +395,7 @@ def test_known_commit_without_links_is_neither_feature_nor_unattributed(repo, tm
     _verdict(conn, h1, "feature")
     _verdict(conn, h2, "cleanup")  # known + classified, but claims no feature
     conn.commit()
-    res = update_live_lines(conn, repo)
+    res = run_derive(conn, repo)
     assert res.unattributed_lines == 0  # unattributed = introducing commit UNKNOWN
     # k.txt's line accrues to no feature — it is neither counted nor dropped
     # from the tip: it simply belongs to no feature
@@ -420,7 +415,7 @@ def test_report_marks_incomplete_sampling_and_renames_total(repo, tmp_path):
     _define(conn, fa, h1)
     _define(conn, fb, h2)
     conn.commit()
-    update_live_lines(conn, repo)  # no verdicts -> backlog -> state pending
+    run_derive(conn, repo)  # no verdicts -> backlog -> state pending
     page = htmlreport.build(conn)
     assert "total attributed lines" in page  # renamed total
     assert "can exceed" in page  # multi-feature claims can exceed repo size
@@ -430,7 +425,7 @@ def test_report_marks_incomplete_sampling_and_renames_total(repo, tmp_path):
     _verdict(conn, h1, "feature")
     _verdict(conn, h2, "feature")
     conn.commit()
-    update_live_lines(conn, repo)  # backlog cleared -> sweep completes
+    run_derive(conn, repo)  # backlog cleared -> sweep completes
     page2 = htmlreport.build(conn)
     assert "sampling incomplete" not in page2.lower()
     conn.close()
