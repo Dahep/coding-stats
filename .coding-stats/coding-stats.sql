@@ -2,8 +2,8 @@
 -- format: 1
 -- schema-step: 3
 -- repository-key: https://github.com/Dahep/coding-stats@main
--- covered-through: 39af68379a8492316be3158c0bdd5be3df110b8b
--- digest: b87c764743337aa3993042481ed02709fc4976ab57c7247e6aae07afc73bc2ce
+-- covered-through: 2ac4b37332afa5af64f5c41b23be57e2d48a99de
+-- digest: 64f9af4045def6c5ffb4ef668e83583d5fb990bbd48bf8b9fc6063bca0a0e33d
 CREATE TABLE repositories (
                id INTEGER PRIMARY KEY,
                repo_key TEXT NOT NULL UNIQUE,
@@ -1435,6 +1435,26 @@ evidence list keeps every contributing row (git first), never deduped on
 (rule, raw, verdict) — dedup is the projection''s table keying, never a
 resolution rule. Pins the documented Merge Danger point so a re-added
 dedup cannot slip in silently.', 'c74dc0c8d372cecef5cae3b183f99866da2cd10e', 44, 'normal', '', 177, 83, 260);
+INSERT INTO commits (id, repo_id, sha, parent_sha, tree_sha, committed_at, author_name, title, message, subject_patch_id, walk_index, kind, diff, added_lines, deleted_lines, churn_lines) VALUES (35, 1, '2ac4b37332afa5af64f5c41b23be57e2d48a99de', '39af68379a8492316be3158c0bdd5be3df110b8b', 'a714dad8376eddb362c07cd6f5216c148f644f81', '2026-11-04T02:51:07-03:00', 'Daniel Herrmann', 'prsweep: five public faces, three behaviours — one _run_face, caps once (#59)', 'prsweep: five public faces, three behaviours — one _run_face, caps once (#59)
+
+* prsweep: one _run_face carries the sweep behaviour; five faces alias it
+
+Sweep and sweep_increment/sweep_backfill/sweep_full each restated the
+same _run call with a hand-written slice of the mode matrix; the
+behaviour now lives once in _run_face (filter by the resume marker? x
+claim coverage?) and the four public faces are one-line aliases over it,
+keeping their signatures, their caps and their ADR-0007 clause 2
+vocabulary (bounded never advances the marker, full re-sweeps, backfill
+is batched). The negative-bound SweepError moves into the shared body.
+The 111-line _run stays byte-identical; no behavior change.
+
+* prsweep run(): consume the increment cap, never restate it
+
+run() repeated the increment face''s cap defaulting (max_prs=None ->
+DEFAULT_RUN_CAP). The cap is defined once in the module constants block;
+run() now consumes it by omitting the argument, letting
+sweep_increment''s own signature default apply — behavior identical, the
+restatement gone.', '8bad9bfd5af6589694f26fd891ae6095bd45d8d5', 45, 'normal', '', 95, 58, 153);
 CREATE TABLE commit_verdicts (
                commit_id INTEGER PRIMARY KEY,
                verdict TEXT NOT NULL CHECK (verdict IN ('feature', 'fix', 'refactor',
@@ -1480,6 +1500,7 @@ INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output, mode
 INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output, model, run_id, classified_at) VALUES (32, 'feature', 'Introduces coherent new design-doc functionality (two new ADRs plus new glossary vocabulary), following the repo''s one-ADR-wave-per-feature pattern rather than repairing earlier docs.', '{"k":"new","title":"Verdict taxonomy and classification ADRs","about":"Adds ADR-0008/0009 and reworks CONTEXT.md/DESIGN.md to record the verdict taxonomy, fix-attribution and stateless-classification domain decisions.","why":"Introduces coherent new design-doc functionality (two new ADRs plus new glossary vocabulary), following the repo''s one-ADR-wave-per-feature pattern rather than repairing earlier docs."}', 'opencode/glm-5.3-flash', NULL, '2026-11-03 18:38:21');
 INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output, model, run_id, classified_at) VALUES (33, 'refactor', 'Type-unifies the update verb''s run options (frozen UpdateOptions dataclass, StoreLayout enum, extracted _update_parser) with identical semantics and no behavior change — structural rework of the update pipeline''s option plumbing, no defect repair intent.', '{"k":"refactor","why":"Type-unifies the update verb''s run options (frozen UpdateOptions dataclass, StoreLayout enum, extracted _update_parser) with identical semantics and no behavior change — structural rework of the update pipeline''s option plumbing, no defect repair intent."}', 'opencode/glm-5.3-flash', NULL, '2026-11-04 04:52:46');
 INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output, model, run_id, classified_at) VALUES (34, 'fix', 'Repairs resolve()''s broken ONE-read contract — the promised single evidence read actually ran 3-4 queries (re-reading ai_attribution/pr_evidence for identity) and the suspicious filter was duplicated; identity now rides the single effective_evidence statement', '{"k":"fix","why":"Repairs resolve()''s broken ONE-read contract — the promised single evidence read actually ran 3-4 queries (re-reading ai_attribution/pr_evidence for identity) and the suspicious filter was duplicated; identity now rides the single effective_evidence statement"}', 'opencode/glm-5.3-flash', NULL, '2026-11-04 05:29:48');
+INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output, model, run_id, classified_at) VALUES (35, 'refactor', 'Consolidates the duplicated _run invocations of sweep/sweep_increment/sweep_backfill/sweep_full into one _run_face helper with one-line aliases and deduplicates run()''s increment-cap defaulting; _run stays byte-identical and the commit states no behavior change — pure restructuring of the prsweep fe', '{"k":"refactor","why":"Consolidates the duplicated _run invocations of sweep/sweep_increment/sweep_backfill/sweep_full into one _run_face helper with one-line aliases and deduplicates run()''s increment-cap defaulting; _run stays byte-identical and the commit states no behavior change — pure restructuring of the prsweep feature''s lines, no defect repair intent."}', 'opencode/glm-5.3-flash', NULL, '2026-11-04 05:51:29');
 CREATE TABLE features (
                id TEXT NOT NULL,
                title TEXT NOT NULL,
@@ -1503,7 +1524,7 @@ INSERT INTO features (id, title, about, title_history_json, created_at, created_
 INSERT INTO features (id, title, about, title_history_json, created_at, created_run_id, repo_id, live_lines) VALUES ('dahep-coding-stats@main-18', 'Data branches design docs', 'Adds ADR-0006 (data branches, multi-branch tracking, shared-commit seeding, composite-action distribution) and updates CONTEXT.md glossary accordingly.', '[]', '2026-10-22T18:40:32-03:00', NULL, 1, 149);
 INSERT INTO features (id, title, about, title_history_json, created_at, created_run_id, repo_id, live_lines) VALUES ('dahep-coding-stats@main-19', 'Data branches implementation', 'Implements ADR-0006: Data-branch landing via orphan worktrees, branch-carrying feature ids, sibling seeding of shared commits, composite update/report actions, and ADR-0006 store migration.', '[]', '2026-10-23T10:10:55-03:00', NULL, 1, 3616);
 INSERT INTO features (id, title, about, title_history_json, created_at, created_run_id, repo_id, live_lines) VALUES ('dahep-coding-stats@main-2', 'SQLite schema scaffold', 'Initial uv package scaffold with SQLite schema (commits, features, fix tables), migration mechanism, and project tooling config.', '[]', '2026-10-05T10:10:03-03:00', NULL, 1, 1066);
-INSERT INTO features (id, title, about, title_history_json, created_at, created_run_id, repo_id, live_lines) VALUES ('dahep-coding-stats@main-20', 'AI attribution and PR sweep', 'Adds ADR-0007 and implements AI attribution: a git-only per-commit detector with evidence rows, the opt-in pr-sweep PR-channel tier, schema/artifact support, and attribution reporting.', '[]', '2026-11-01T09:59:19-03:00', NULL, 1, 8300);
+INSERT INTO features (id, title, about, title_history_json, created_at, created_run_id, repo_id, live_lines) VALUES ('dahep-coding-stats@main-20', 'AI attribution and PR sweep', 'Adds ADR-0007 and implements AI attribution: a git-only per-commit detector with evidence rows, the opt-in pr-sweep PR-channel tier, schema/artifact support, and attribution reporting.', '[]', '2026-11-01T09:59:19-03:00', NULL, 1, 8256);
 INSERT INTO features (id, title, about, title_history_json, created_at, created_run_id, repo_id, live_lines) VALUES ('dahep-coding-stats@main-21', 'Verdict taxonomy and classification ADRs', 'Adds ADR-0008/0009 and reworks CONTEXT.md/DESIGN.md to record the verdict taxonomy, fix-attribution and stateless-classification domain decisions.', '[]', '2026-11-03T15:37:55-03:00', NULL, 1, 333);
 INSERT INTO features (id, title, about, title_history_json, created_at, created_run_id, repo_id, live_lines) VALUES ('dahep-coding-stats@main-3', 'Target-branch commit walk', 'Adds gitwalk module: first-parent chronological walk of the Target branch importing commits into the DB with patch-id evidence, resumable and history-rewrite detection, plus tests.', '[]', '2026-10-05T10:10:03-03:00', NULL, 1, 339);
 INSERT INTO features (id, title, about, title_history_json, created_at, created_run_id, repo_id, live_lines) VALUES ('dahep-coding-stats@main-4', 'LLM commit classification', 'Adds classify.py: rolling opencode-CLI session that assigns one verdict per commit with resumable per-commit checkpointing, feature registry context, and reply-parsing/apply logic, plus tests.', '[]', '2026-10-05T10:10:03-03:00', NULL, 1, 393);
@@ -1610,6 +1631,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-1', '1071f03aa2742cc7fb662e049eb76ec3dbd024cd', 185);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-1', '1bbe64a60d3a3ec30fc891a01439c9025edb9b2e', 231);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-1', '243fa80681eda5ab4ac955c2409fd3ecc314383c', 227);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-1', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 198);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-1', '2c2d504fdd9054ffd72bed97c1157826e90a3797', 233);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-1', '2fde25218097f639f982c4238a7d9e9b8d307b3d', 227);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-1', '35be1bfe9fd8f8526af0e4488816effa9168018f', 227);
@@ -1642,6 +1664,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-1', 'fb62a1504040479027cb455e4c30f23760e7daff', 227);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-10', '0bfb8b934adf837db8ddcfc89946c43edf25c9b3', 1953);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-10', '243fa80681eda5ab4ac955c2409fd3ecc314383c', 1946);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-10', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 1956);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-10', '2c2d504fdd9054ffd72bed97c1157826e90a3797', 2019);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-10', '2fde25218097f639f982c4238a7d9e9b8d307b3d', 1956);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-10', '35be1bfe9fd8f8526af0e4488816effa9168018f', 1946);
@@ -1666,6 +1689,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-10', 'fb62a1504040479027cb455e4c30f23760e7daff', 1915);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-11', '0bfb8b934adf837db8ddcfc89946c43edf25c9b3', 1846);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-11', '243fa80681eda5ab4ac955c2409fd3ecc314383c', 1838);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-11', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 1841);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-11', '2c2d504fdd9054ffd72bed97c1157826e90a3797', 1862);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-11', '2fde25218097f639f982c4238a7d9e9b8d307b3d', 1848);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-11', '35be1bfe9fd8f8526af0e4488816effa9168018f', 1836);
@@ -1689,6 +1713,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-11', 'fb62a1504040479027cb455e4c30f23760e7daff', 1805);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-12', '0bfb8b934adf837db8ddcfc89946c43edf25c9b3', 1079);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-12', '243fa80681eda5ab4ac955c2409fd3ecc314383c', 1076);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-12', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 1077);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-12', '2c2d504fdd9054ffd72bed97c1157826e90a3797', 1592);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-12', '2fde25218097f639f982c4238a7d9e9b8d307b3d', 1079);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-12', '35be1bfe9fd8f8526af0e4488816effa9168018f', 1076);
@@ -1711,6 +1736,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-12', 'fb62a1504040479027cb455e4c30f23760e7daff', 1592);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-13', '0bfb8b934adf837db8ddcfc89946c43edf25c9b3', 1609);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-13', '243fa80681eda5ab4ac955c2409fd3ecc314383c', 1609);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-13', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 1612);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-13', '2c2d504fdd9054ffd72bed97c1157826e90a3797', 1642);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-13', '2fde25218097f639f982c4238a7d9e9b8d307b3d', 1609);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-13', '35be1bfe9fd8f8526af0e4488816effa9168018f', 1609);
@@ -1732,6 +1758,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-13', 'fb62a1504040479027cb455e4c30f23760e7daff', 1642);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-14', '0bfb8b934adf837db8ddcfc89946c43edf25c9b3', 22);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-14', '243fa80681eda5ab4ac955c2409fd3ecc314383c', 22);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-14', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 22);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-14', '2c2d504fdd9054ffd72bed97c1157826e90a3797', 98);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-14', '2fde25218097f639f982c4238a7d9e9b8d307b3d', 22);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-14', '35be1bfe9fd8f8526af0e4488816effa9168018f', 22);
@@ -1750,6 +1777,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-14', 'fb62a1504040479027cb455e4c30f23760e7daff', 98);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-15', '0bfb8b934adf837db8ddcfc89946c43edf25c9b3', 52);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-15', '243fa80681eda5ab4ac955c2409fd3ecc314383c', 52);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-15', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 52);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-15', '2fde25218097f639f982c4238a7d9e9b8d307b3d', 52);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-15', '35be1bfe9fd8f8526af0e4488816effa9168018f', 52);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-15', '38de1fd81523169791d71e343d90b7db2ec4da66', 52);
@@ -1764,6 +1792,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-15', 'cb40b3d68a3c74b47c6129eab54610a9115c2541', 52);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-16', '0bfb8b934adf837db8ddcfc89946c43edf25c9b3', 1440);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-16', '243fa80681eda5ab4ac955c2409fd3ecc314383c', 1433);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-16', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 1430);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-16', '2fde25218097f639f982c4238a7d9e9b8d307b3d', 1440);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-16', '35be1bfe9fd8f8526af0e4488816effa9168018f', 1433);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-16', '38de1fd81523169791d71e343d90b7db2ec4da66', 1430);
@@ -1777,6 +1806,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-16', 'cb40b3d68a3c74b47c6129eab54610a9115c2541', 1378);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-17', '0bfb8b934adf837db8ddcfc89946c43edf25c9b3', 81);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-17', '243fa80681eda5ab4ac955c2409fd3ecc314383c', 81);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-17', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 81);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-17', '2fde25218097f639f982c4238a7d9e9b8d307b3d', 81);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-17', '35be1bfe9fd8f8526af0e4488816effa9168018f', 81);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-17', '38de1fd81523169791d71e343d90b7db2ec4da66', 81);
@@ -1789,6 +1819,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-17', 'cb40b3d68a3c74b47c6129eab54610a9115c2541', 81);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-18', '0bfb8b934adf837db8ddcfc89946c43edf25c9b3', 149);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-18', '243fa80681eda5ab4ac955c2409fd3ecc314383c', 149);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-18', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 149);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-18', '2fde25218097f639f982c4238a7d9e9b8d307b3d', 149);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-18', '35be1bfe9fd8f8526af0e4488816effa9168018f', 149);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-18', '38de1fd81523169791d71e343d90b7db2ec4da66', 149);
@@ -1800,6 +1831,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-18', 'cb40b3d68a3c74b47c6129eab54610a9115c2541', 149);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-19', '0bfb8b934adf837db8ddcfc89946c43edf25c9b3', 3584);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-19', '243fa80681eda5ab4ac955c2409fd3ecc314383c', 3566);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-19', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 3616);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-19', '2fde25218097f639f982c4238a7d9e9b8d307b3d', 3622);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-19', '35be1bfe9fd8f8526af0e4488816effa9168018f', 3568);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-19', '38de1fd81523169791d71e343d90b7db2ec4da66', 3616);
@@ -1812,6 +1844,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-2', '1071f03aa2742cc7fb662e049eb76ec3dbd024cd', 1030);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-2', '1bbe64a60d3a3ec30fc891a01439c9025edb9b2e', 1030);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-2', '243fa80681eda5ab4ac955c2409fd3ecc314383c', 1067);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-2', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 1066);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-2', '2c2d504fdd9054ffd72bed97c1157826e90a3797', 1063);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-2', '2fde25218097f639f982c4238a7d9e9b8d307b3d', 1066);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-2', '35be1bfe9fd8f8526af0e4488816effa9168018f', 1067);
@@ -1842,11 +1875,13 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-2', 'cb40b3d68a3c74b47c6129eab54610a9115c2541', 1067);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-2', 'fb62a1504040479027cb455e4c30f23760e7daff', 1063);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-20', '0bfb8b934adf837db8ddcfc89946c43edf25c9b3', 8403);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-20', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 8256);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-20', '2fde25218097f639f982c4238a7d9e9b8d307b3d', 8212);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-20', '38de1fd81523169791d71e343d90b7db2ec4da66', 8208);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-20', '39af68379a8492316be3158c0bdd5be3df110b8b', 8300);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-20', '50fe643ff2d71d738ca05e83aea4ca4a74471287', 8403);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-20', 'a4e82a73147b8006831dc33ef95ceeaeae2e54f1', 8212);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-21', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 333);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-21', '38de1fd81523169791d71e343d90b7db2ec4da66', 333);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-21', '39af68379a8492316be3158c0bdd5be3df110b8b', 333);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-21', 'a4e82a73147b8006831dc33ef95ceeaeae2e54f1', 333);
@@ -1854,6 +1889,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-3', '1071f03aa2742cc7fb662e049eb76ec3dbd024cd', 243);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-3', '1bbe64a60d3a3ec30fc891a01439c9025edb9b2e', 243);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-3', '243fa80681eda5ab4ac955c2409fd3ecc314383c', 335);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-3', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 339);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-3', '2c2d504fdd9054ffd72bed97c1157826e90a3797', 335);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-3', '2fde25218097f639f982c4238a7d9e9b8d307b3d', 339);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-3', '35be1bfe9fd8f8526af0e4488816effa9168018f', 335);
@@ -1886,6 +1922,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-4', '1071f03aa2742cc7fb662e049eb76ec3dbd024cd', 402);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-4', '1bbe64a60d3a3ec30fc891a01439c9025edb9b2e', 454);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-4', '243fa80681eda5ab4ac955c2409fd3ecc314383c', 393);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-4', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 393);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-4', '2c2d504fdd9054ffd72bed97c1157826e90a3797', 394);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-4', '2fde25218097f639f982c4238a7d9e9b8d307b3d', 393);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-4', '35be1bfe9fd8f8526af0e4488816effa9168018f', 393);
@@ -1917,6 +1954,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-5', '1071f03aa2742cc7fb662e049eb76ec3dbd024cd', 384);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-5', '1bbe64a60d3a3ec30fc891a01439c9025edb9b2e', 384);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-5', '243fa80681eda5ab4ac955c2409fd3ecc314383c', 361);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-5', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 361);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-5', '2c2d504fdd9054ffd72bed97c1157826e90a3797', 365);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-5', '2fde25218097f639f982c4238a7d9e9b8d307b3d', 361);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-5', '35be1bfe9fd8f8526af0e4488816effa9168018f', 361);
@@ -1947,6 +1985,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-6', '1071f03aa2742cc7fb662e049eb76ec3dbd024cd', 534);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-6', '1bbe64a60d3a3ec30fc891a01439c9025edb9b2e', 534);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-6', '243fa80681eda5ab4ac955c2409fd3ecc314383c', 473);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-6', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 473);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-6', '2c2d504fdd9054ffd72bed97c1157826e90a3797', 489);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-6', '2fde25218097f639f982c4238a7d9e9b8d307b3d', 474);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-6', '35be1bfe9fd8f8526af0e4488816effa9168018f', 473);
@@ -1976,6 +2015,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-7', '1071f03aa2742cc7fb662e049eb76ec3dbd024cd', 90);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-7', '1bbe64a60d3a3ec30fc891a01439c9025edb9b2e', 90);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-7', '243fa80681eda5ab4ac955c2409fd3ecc314383c', 78);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-7', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 93);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-7', '2c2d504fdd9054ffd72bed97c1157826e90a3797', 79);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-7', '2fde25218097f639f982c4238a7d9e9b8d307b3d', 93);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-7', '35be1bfe9fd8f8526af0e4488816effa9168018f', 78);
@@ -2003,6 +2043,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-8', '0bfb8b934adf837db8ddcfc89946c43edf25c9b3', 645);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-8', '1bbe64a60d3a3ec30fc891a01439c9025edb9b2e', 701);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-8', '243fa80681eda5ab4ac955c2409fd3ecc314383c', 645);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-8', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 645);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-8', '2c2d504fdd9054ffd72bed97c1157826e90a3797', 656);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-8', '2fde25218097f639f982c4238a7d9e9b8d307b3d', 645);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-8', '35be1bfe9fd8f8526af0e4488816effa9168018f', 645);
@@ -2028,6 +2069,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-8', 'fb62a1504040479027cb455e4c30f23760e7daff', 656);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-9', '0bfb8b934adf837db8ddcfc89946c43edf25c9b3', 326);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-9', '243fa80681eda5ab4ac955c2409fd3ecc314383c', 326);
+INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-9', '2ac4b37332afa5af64f5c41b23be57e2d48a99de', 320);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-9', '2c2d504fdd9054ffd72bed97c1157826e90a3797', 335);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-9', '2fde25218097f639f982c4238a7d9e9b8d307b3d', 326);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-9', '35be1bfe9fd8f8526af0e4488816effa9168018f', 326);
@@ -2052,7 +2094,7 @@ INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES 
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-9', 'cb40b3d68a3c74b47c6129eab54610a9115c2541', 326);
 INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines) VALUES ('dahep-coding-stats@main-9', 'fb62a1504040479027cb455e4c30f23760e7daff', 237);
 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-INSERT INTO settings (key, value) VALUES ('backfill_state', '{"status": "done", "max_classified_walk_index": 44}');
+INSERT INTO settings (key, value) VALUES ('backfill_state', '{"status": "done", "max_classified_walk_index": 45}');
 INSERT INTO settings (key, value) VALUES ('branch', '"main"');
 INSERT INTO settings (key, value) VALUES ('min_target_lines', '1');
 INSERT INTO settings (key, value) VALUES ('model', '"opencode/glm-5.3-flash"');
