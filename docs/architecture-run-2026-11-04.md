@@ -1,7 +1,6 @@
 # Architecture run 2026-11-04: seven deepenings, reviewed and shipped
 
-An architecture review of 2026-11-03 (report: `/tmp/opencode/architecture-review-20261103-155214.html`
-on the authoring machine) surfaced seven deepening candidates. The domain decisions were
+An architecture review of 2026-11-03 surfaced seven deepening candidates. The domain decisions were
 settled in a grilling session the same day; each PR was implemented by one thread, reviewed
 and shipped by a second, independent thread, and merged sequentially so every PR branched
 from the previous merge.
@@ -11,7 +10,7 @@ Order of landing (all squash-merged into `main`):
 ## 1. UpdateOptions + StoreLayout — #57 (merge `38de1fd`)
 
 `cli._run_update` stops consuming a duck-typed `argparse.Namespace`; `migration` no longer
-fabricates one by hand (the alien `no_report` field died). `legacy_store` became the named
+fabricates one by hand (the alien `no_report` field is removed). `legacy_store` became the named
 `StoreLayout` enum across its four sites. A bidirectional drift guard pins parser flags ⇔
 `UpdateOptions` fields.
 
@@ -21,14 +20,14 @@ fabricates one by hand (the alien `no_report` field died). `legacy_store` became
 contribution rows with identity (`harness`/`model`), the duplicated `pr_evidence` re-read and
 second `suspicious` filter are gone, `metrics.resolve_attribution` shed its de-dup loop. The
 ship thread re-ran its own equivalence probe (15 commits, 0 diffs) and strengthened the read
-guard to count `resolve`'s total statements per commit. Spec #38 (gather/report union of
+guard to count `resolve`'s total statements per commit. Ticket #38 (gather/report union of
 recorded PR evidence) builds on this shape.
 
 ## 3. prsweep five faces → three behaviours — #59 (merge `2ac4b37`)
 
 One `_run_face` carries the sweep behaviour (mode matrix documented); the five public names
 remain one-line aliases — they carry ADR-0007 clause 2 vocabulary and tests monkeypatch two
-of them. Caps stated once. AST-verified per-face behavioral identity.
+of them. Caps stated once. AST-verified per-face behavioural identity.
 
 ## 4. tablecatalog — #60 (merge `1d5760c`)
 
@@ -57,29 +56,33 @@ uses `%cI` (committer date), not `%aI`.
 
 `db.replace_file` is the one atomic swap with one sidecar rule; `artifact.seed_working_db(db_path, bytes, *, register)`
 is the single public restorer (`register=False` is migration's named relabel-authority
-path). `materialize` went private; all four seed routes go through one entry; the "#31 again"
-warnings died because the unsafe path did. Review added a hardening fix: a forged header
+path). `materialize` went private; all four seed routes go through one entry, so the
+recurring unsafe-seed warnings (issue #31's digest/stamp failure mode) disappear with their
+subject. Review added a hardening fix: a forged header
 stamp now refuses as a typed `MaterializeError` instead of a raw crash mid-seed.
 
 ## 7. derive stage — #63 (merge `3485801`) · paper trail: [#48 comment](https://github.com/Dahep/coding-stats/issues/48#issuecomment-6627552231)
 
-`derive.py` replaces `targets.py` + `lineage.py` + the derive part of `livelines.py`;
+`derive.py` replaces `targets.py`, `lineage.py` and `livelines.py`;
 `fix_touches`/`fix_targets`/`fixes_features` are rebuilt from scratch every run in one
 transaction — the append-only asymmetry and its stale-target retention are gone (regression
-test at a raised threshold). `detect`/`lineage` CLI verbs are deleted. Spec #48 lands
+test at a raised threshold). The `detect`/`lineage` CLI verbs are replaced by one `derive`
+verb; the `--no-detect`/`--no-lineage` update flags stay as debug trims. Spec #48 lands
 Areas, Embedded fixes and Provenance columns on this substrate.
 
 ## Suite trajectory
 
-415 (baseline) → 416 → 417 → 417 → **432** (catalogue) → **439** (verdicts) → **446**
+415 (baseline) → 416 → 417 → 417 → **432** (catalogue) → **442** (verdicts) → **446**
 (seed) → **448** tests, ruff and mypy strict clean at every merge. Zero coverage deleted;
 every PR's body carries its merge-danger notes.
 
 ## Known follow-ups recorded during the run
 
 - `attribution_trend`'s month normalization and its fix-verdict gate are pre-existing
-  divergences (noted in the #61 review) — follow-up issue worthy.
+  divergences, observed during the #61 review and not yet filed as an issue — follow-up
+  issue worthy.
 - Historical `feature_line_samples` rows keep old attribution after a raised
   `min_target_lines` until the next backfill sweep trigger (noted to #48).
 - DESIGN.md still carries stale bullets (two "Feature size"/"Identity" pairs; the
-  two-Target-branch claim superseded by ADR-0006 clause 4) — doc clean-up candidate.
+  two-Target-branch claim superseded by ADR-0006's Status line — gather no longer refuses
+  two Target branches of one repository) — doc clean-up candidate.
