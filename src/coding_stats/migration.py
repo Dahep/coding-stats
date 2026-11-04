@@ -31,7 +31,6 @@ verifies on disk — a failed update never destroys the old artifact. The
 second run of this verb is a no-op cleanup (idempotent).
 """
 
-import argparse
 import json
 import shutil
 import sqlite3
@@ -418,23 +417,21 @@ def run(plan: Plan, repo: Path, no_classify: bool = False) -> list[str]:
     finally:
         conn.close()
 
-    from .cli import _run_update  # late import: cli imports this module at top level
+    # late import: cli imports this module at top level
+    from .cli import StoreLayout, UpdateOptions, _run_update
 
     conn = db.connect(plan.db_path)
     try:
+        # a direct frozen record, not a fabricated Namespace: the runner
+        # regenerates ON the Target checkout (legacy layout) and everything
+        # but classification rides the deterministic stages untouched
         conn = _run_update(
             conn,
-            plan.db_path,
-            argparse.Namespace(
+            UpdateOptions(
+                db=str(plan.db_path),
                 no_classify=no_classify,
-                no_detect=False,
-                no_lineage=False,
-                no_report=False,
-                no_serialize=False,
-                detect_pr=False,
-                pr_backfill=None,
             ),
-            legacy_store=True,
+            StoreLayout.LEGACY_COMMITTED,
         )
     finally:
         conn.close()
