@@ -320,22 +320,37 @@ def seed_working_db(
     recovery rebuild registers the repository against the seeded rows); False
     leaves the row entirely to the caller — the migration path holds the
     relabel authority (a rename IS the identity change the register rules
-    must refuse) and writes the row itself. Never a hidden default."""
+    must refuse) and writes the row itself. Never a hidden default.
+
+    The header stamp sits inside the digested content, but the digest is
+    unkeyed — anyone who can commit a Data branch can mint a header whose
+    stamp the body did not earn. A low stamp makes db.apply_steps run
+    migration steps on newer content, so EVERY failure inside the
+    replay/stamp/working-shape block refuses as MaterializeError
+    ("artifact refused: ...") — never a raw sqlite3.Error/RuntimeError that
+    would escape gather's and seeding's refusal channel and crash a whole
+    loop instead of one clean sibling skip. register_repository's refusals
+    are NOT wrapped: they carry their own pinned refusal text."""
     err = verify_bytes(data)
     if err is not None:
         raise MaterializeError(f"refusing artifact: {err}")
+    if register and repo_dir is None:
+        # before anything is built: a use error, not an artifact refusal
+        raise ValueError("seed_working_db(register=True) needs the repo to register")
     conn = sqlite3.connect(db_path)
     try:
-        _replay(conn, data)
-        stamp_schema_steps(conn, data)
-        # the working shape (db.apply_steps) needs FK enforcement and Row
-        # rows exactly like connect gives them
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.row_factory = sqlite3.Row
-        db.apply_steps(conn)
+        try:
+            _replay(conn, data)
+            stamp_schema_steps(conn, data)
+            # the working shape (db.apply_steps) needs FK enforcement and Row
+            # rows exactly like connect gives them
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.row_factory = sqlite3.Row
+            db.apply_steps(conn)
+        except (sqlite3.Error, RuntimeError) as exc:
+            raise MaterializeError(f"artifact refused: {exc}") from exc
         if register:
-            if repo_dir is None:
-                raise ValueError("seed_working_db(register=True) needs the repo to register")
+            assert repo_dir is not None  # narrowed by the use error above, before any build
             identity.register_repository(conn, repo_dir, branch)
     except BaseException:
         conn.close()

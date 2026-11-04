@@ -5,6 +5,7 @@ and the stateless-DB store seed behind it."""
 import hashlib
 import sqlite3
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -349,6 +350,11 @@ def test_rebuild_swap_failure_keeps_original_db(tmp_path, repo, monkeypatch):
     again = sqlite3.connect(db_path)
     assert again.execute("SELECT COUNT(*) FROM commits").fetchone()[0] == 1
     again.close()
+    # the failed swap's leftovers are gone: replace_file's failure branch
+    # removes the tmp files (the original is never touched)
+    staging = tmp_path / "r.db.swap-tmp"
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        assert not Path(str(staging) + suffix).exists()
 
 
 def test_find_anchor_scopes_to_one_target_data_branch(tmp_path, repo):

@@ -67,7 +67,7 @@ class _Ingest:
     unattributed_lines: int
     model: str
     min_target_lines: int
-    rows: sqlite3.Connection  # materialized artifact rows (in-memory)
+    rows: sqlite3.Connection  # seeded working-shape rows (in-memory throwaway)
 
 
 def gather(union_path: Path, sources: list[Path]) -> GatherResult:
