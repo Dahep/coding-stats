@@ -141,9 +141,15 @@ def test_shared_commit_is_attributed_once_by_the_stronger_signal(tmp_path, repo)
     # evidence from several branches feeds that ONE attribution: the git row
     # first (it outranks), the inherited PR row still attached
     ev = aiattr.effective_evidence(view, cid)
-    assert [(c, rule) for c, rule, _raw, _v in ev] == [
+    assert [(c.channel, c.rule) for c in ev] == [
         ("git", "co-authored-by"),
         ("pr", "tool-trailer"),
+    ]
+    # the identity claims ride the same ONE read: git first (the walk's
+    # summary claim), PR rows their recorded identity
+    assert [(c.channel, c.harness, c.model) for c in ev] == [
+        ("git", "claude", "Opus 4.8 (1M context)"),
+        ("pr", "codex", "gpt-5"),
     ]
 
     # AI share per repo (lower bound): shared commits count ONCE
@@ -196,7 +202,7 @@ def test_loser_git_rows_outrank_winner_pr_rows_in_the_union(tmp_path):
     cid = int(view.execute("SELECT id FROM commits WHERE sha = 'x40'").fetchone()["id"])
     eff = aiattr.resolve(view, cid).attribution
     assert (eff.verdict, eff.harness, eff.model) == ("yes", "claude", "Opus 4.8 (1M context)")
-    assert [c for c, _r, _raw, _v in aiattr.effective_evidence(view, cid)] == ["git", "pr"]
+    assert [c.channel for c in aiattr.effective_evidence(view, cid)] == ["git", "pr"]
     assert attribution_summary(view).verdict_counts == {"yes": 1}
     conn.close()
 
@@ -306,8 +312,11 @@ def test_report_build_resolves_attribution_once(tmp_path, repo, monkeypatch):
 
 def test_resolve_attribution_reads_each_commits_evidence_exactly_once(tmp_path, repo, monkeypatch):
     """The ONE-read contract: a resolution pass consumes the canonical aiattr
-    resolver once per commit — exactly one ``effective_evidence`` read per
-    commit, never a second read for the channel or the tagged rows."""
+    resolver once per commit — and each commit's TOTAL query count is what
+    the docstring promises: exactly ONE statement — ``ai_evidence`` UNION
+    ALL the suspicious-clean ``pr_evidence`` with the summary's identity
+    folded onto the git rows — never the old extra queries for identity or
+    a re-read of ``pr_evidence``."""
     union, _h_c, _h_d = _two_key_union(tmp_path, repo)
     uconn = sqlite3.connect(union)
     uconn.row_factory = sqlite3.Row
@@ -319,8 +328,27 @@ def test_resolve_attribution_reads_each_commits_evidence_exactly_once(tmp_path, 
         return real(conn, commit_id)
 
     monkeypatch.setattr(aiattr, "effective_evidence", counting)
+    totals: dict[int, list[str]] = {}
+    original_resolve = aiattr.resolve
+
+    def counting_resolve(conn, commit_id):
+        statements: list[str] = []
+        conn.set_trace_callback(statements.append)
+        try:
+            return original_resolve(conn, commit_id)
+        finally:
+            conn.set_trace_callback(None)
+            totals[commit_id] = statements
+
+    monkeypatch.setattr(aiattr, "resolve", counting_resolve)
     rows = metrics.resolve_attribution(uconn)
     assert sorted(reads) == sorted(r.cid for r in rows)  # one read per commit, none doubled
+    assert sorted(totals) == sorted(r.cid for r in rows)
+    for statements in totals.values():
+        assert len(statements) == 1  # TOTAL queries per commit: the ONE evidence statement
+        sql = statements[0]
+        assert "ai_evidence" in sql and "pr_evidence" in sql  # both channels, side by side
+        assert sql.count("pr_evidence") == 1  # never a second pass through the evidence tables
     uconn.close()
 
 

@@ -1008,7 +1008,7 @@ def test_a_skip_consumes_no_cap_and_creates_no_attribution(tmp_path, repo, monke
     assert skip[0] is None and skip[7] == 1  # NULL commit + suspicious: never attribution
     for sha in (shas[1], shas[2]):
         ev = aiattr.effective_evidence(conn, commit_id(conn, sha))
-        assert all(rule != prsweep.RULE_OPERATOR_SKIP for _, rule, _, _ in ev)
+        assert all(c.rule != prsweep.RULE_OPERATOR_SKIP for c in ev)
 
 
 def test_the_positive_bounded_face_skips_a_marked_pr_but_never_advances(

@@ -565,14 +565,19 @@ def test_git_evidence_outranks_inherited_pr_evidence(tmp_path, repo):
     assert eff.harness == "codex"  # the git-only evidence outranks
     assert eff.model == "gpt-5"
     # the canonical resolver: ONE read carries the attribution, the resolved
-    # channel and the channel-tagged rows
+    # channel and the channel-tagged rows — with the identity claims riding
+    # the tags: git first (the walk's summary claim), PR rows their own
     assert resolved.channel == "git"
-    assert [c for c, _, _, _ in resolved.tagged] == ["git", "pr", "pr"]
-    assert "evil[bot]" not in {raw for _, _, raw, _ in resolved.tagged}
+    assert [(c.channel, c.rule, c.harness, c.model) for c in resolved.tagged] == [
+        ("git", "tool-trailer", "codex", "gpt-5"),
+        ("pr", "co-authored-by", "claude", "Ghost"),
+        ("pr", "tool-trailer", "claude", None),
+    ]
+    assert "evil[bot]" not in {c.raw for c in resolved.tagged}
     # audit rows keep their provenance, git first; suspicious rows excluded
     seen = aiattr.effective_evidence(conn, cid)
-    assert [c for c, _, _, _ in seen] == ["git", "pr", "pr"]
-    assert "evil[bot]" not in {raw for _, _, raw, _ in seen}
+    assert [c.channel for c in seen] == ["git", "pr", "pr"]
+    assert "evil[bot]" not in {c.raw for c in seen}
 
 
 def test_pr_evidence_fills_where_git_evidence_is_silent(tmp_path, repo):
