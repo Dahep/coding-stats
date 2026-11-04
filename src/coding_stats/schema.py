@@ -10,7 +10,7 @@ import json
 import sqlite3
 from collections.abc import Callable
 
-from . import gitwalk, identity
+from . import gitwalk, identity, tablecatalog
 
 Step = str | Callable[[sqlite3.Connection], None]
 
@@ -35,13 +35,14 @@ STEP_0_SQL = f"""
 
     {RUNS_DDL};
 
-    -- settings as JSON key/value
-    CREATE TABLE settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-    );
+    -- settings as JSON key/value (FK-ful DDL from the tablecatalog declaration)
+    {tablecatalog.fk_ddl(tablecatalog.table("settings"))}
 
-    -- Target-branch commits only, in chronological walk order.
+    -- Target-branch commits only, in chronological walk order. The shape
+    -- below is this step's PRE-migration shape (global sha/walk_index
+    -- uniques, no repo columns): the curated shape lives in the catalogue
+    -- and is rebuilt by migration step 1, which stays handwritten — the
+    -- historical shapes of migrated tables are facts, not derivations.
     CREATE TABLE commits (
         id INTEGER PRIMARY KEY,
         sha TEXT NOT NULL UNIQUE,
@@ -58,16 +59,7 @@ STEP_0_SQL = f"""
     );
 
     -- LLM-assigned Commit verdict; blame evidence is stored as evidence, not verdict.
-    CREATE TABLE commit_verdicts (
-        commit_id INTEGER PRIMARY KEY REFERENCES commits(id),
-        verdict TEXT NOT NULL CHECK (verdict IN ('feature', 'fix', 'refactor', 'revert',
-                                                 'cleanup', 'merge', 'unknown')),
-        rationale TEXT NOT NULL,
-        raw_llm_output TEXT NOT NULL,
-        model TEXT NOT NULL,
-        run_id INTEGER REFERENCES runs(id),
-        classified_at TEXT NOT NULL
-    );
+    {tablecatalog.fk_ddl(tablecatalog.table("commit_verdicts"))}
 
     CREATE TABLE features (
         id INTEGER PRIMARY KEY,
@@ -79,6 +71,7 @@ STEP_0_SQL = f"""
     );
 
     -- Many-to-many: a commit may define several features; feature set may span commits.
+    -- (Pre-migration shapes: the curated shapes live in the catalogue, rebuilt by step 3.)
     CREATE TABLE commits_features (
         commit_id INTEGER NOT NULL REFERENCES commits(id),
         feature_id INTEGER NOT NULL REFERENCES features(id),
@@ -88,22 +81,13 @@ STEP_0_SQL = f"""
     );
 
     -- Raw blame hits at commit granularity.
-    CREATE TABLE fix_touches (
-        fix_commit_id INTEGER NOT NULL REFERENCES commits(id),
-        source_commit_id INTEGER NOT NULL REFERENCES commits(id),
-        hit_lines INTEGER NOT NULL,
-        PRIMARY KEY (fix_commit_id, source_commit_id)
-    );
+    {tablecatalog.fk_ddl(tablecatalog.table("fix_touches"))}
 
     -- Curated targets: sources with nontrivial overlap; may include other fixes.
-    CREATE TABLE fix_targets (
-        fix_commit_id INTEGER NOT NULL REFERENCES commits(id),
-        target_commit_id INTEGER NOT NULL REFERENCES commits(id),
-        PRIMARY KEY (fix_commit_id, target_commit_id),
-        FOREIGN KEY (target_commit_id) REFERENCES commits(id)
-    );
+    {tablecatalog.fk_ddl(tablecatalog.table("fix_targets"))}
 
     -- Transitive closure fix -> original feature(s); one row per (fix, feature) reach.
+    -- (Pre-migration shape: the curated shape lives in the catalogue, rebuilt by step 3.)
     CREATE TABLE fixes_features (
         fix_commit_id INTEGER NOT NULL REFERENCES commits(id),
         feature_id INTEGER NOT NULL REFERENCES features(id),
