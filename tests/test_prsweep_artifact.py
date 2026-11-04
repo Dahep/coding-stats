@@ -139,7 +139,7 @@ def test_materialize_refuses_smuggled_pr_rows(tmp_path, repo):
     mat = sqlite3.connect(":memory:")
     mat.row_factory = sqlite3.Row
     try:
-        artifact.materialize(mat, hostile)
+        artifact.restore_into(mat, hostile)
     except artifact.MaterializeError as exc:
         assert "pr_evidence" in str(exc)
     else:
@@ -157,7 +157,7 @@ def test_materialize_refuses_smuggled_pr_rows(tmp_path, repo):
     mat = sqlite3.connect(":memory:")
     mat.row_factory = sqlite3.Row
     try:
-        artifact.materialize(mat, hostile2)
+        artifact.restore_into(mat, hostile2)
     except artifact.MaterializeError as exc:
         assert "pr_evidence" in str(exc)
     else:

@@ -118,7 +118,7 @@ def test_materialize_refuses_smuggled_evidence_rows(tmp_path, repo):
     mat = sqlite3.connect(":memory:")
     mat.row_factory = sqlite3.Row
     try:
-        artifact.materialize(mat, hostile)
+        artifact.restore_into(mat, hostile)
     except artifact.MaterializeError as exc:
         assert "ai_evidence" in str(exc)
     else:

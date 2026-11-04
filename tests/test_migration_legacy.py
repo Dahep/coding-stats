@@ -170,6 +170,37 @@ def test_migrate_without_db_rebuilds_from_artifact(tmp_path, repo, monkeypatch, 
     assert not (repo / ".skill-stats").exists()
 
 
+def test_migrate_rebuild_leaves_no_stale_sidecars(tmp_path, repo, monkeypatch, capsys):
+    """The rebuild's file replacement drops stale destination sidecars only
+    after the swap, and nothing lingers: a -wal planted next to the (not yet
+    existing) destination would otherwise survive the migration next to the
+    fresh DB — the stale-replay hazard the recovery rebuild and the
+    migration swap each hit and were each separately fixed for. Neither
+    suite ever asserted the sidecars' absence after a rebuild."""
+    monkeypatch.setenv("HOME", str(tmp_path))  # pin the implicit legacy-DB lookup
+    monkeypatch.setattr(
+        "coding_stats.identity.normalize_clone_url",
+        lambda url, ssh_config=None: (
+            "https://github.com/Dahep/" + url.rpartition("/")[2].removesuffix(".git")
+        ),
+    )
+    _legacy_repo(tmp_path, repo, monkeypatch)
+    _rename(repo)
+    dest = tmp_path / "fresh-rebuild.db"
+    for suffix in ("-wal", "-shm", "-journal"):
+        Path(str(dest) + suffix).write_bytes(b"stale frames")
+    monkeypatch.setattr("coding_stats.cli.Session", lambda model, sid=None: FakeSession([]))
+
+    main(["migrate", str(repo), "--db", str(dest)])
+    out = capsys.readouterr().out
+    assert "seed: rebuild-artifact" in out
+
+    assert _counts(dest) == (2, 2)  # the fresh DB itself is the seeded one
+    for suffix in ("-wal", "-shm", "-journal"):
+        assert not Path(str(dest) + suffix).exists()
+    assert not (tmp_path / "fresh-rebuild.db.swap-tmp").exists()  # one staging name, gone
+
+
 def test_migrate_alias_spelled_key_is_kept_with_a_notice(tmp_path, repo, monkeypatch, capsys):
     """The dotfiles case: the legacy DB is keyed on a canonical-looking
     spelling; with no canonicalizable origin the resolved identity is the

@@ -507,8 +507,8 @@ def _step_4(conn: sqlite3.Connection) -> None:
     the walk records them per commit and re-derives any missing rows on the
     next walk (a restored pre-feature artifact carries none), so they ride
     the Artifact like every other recorded state. ``IF NOT EXISTS`` because
-    artifact.materialize completes a pre-feature artifact's missing known
-    tables before this step runs on the replayed DB."""
+    the artifact replay (restore_into) completes a pre-feature artifact's
+    missing known tables before this step runs on the replayed DB."""
     conn.execute(
         """CREATE TABLE IF NOT EXISTS ai_attribution (
                commit_id INTEGER PRIMARY KEY REFERENCES commits(id),
@@ -612,7 +612,7 @@ def _step_8(conn: sqlite3.Connection) -> None:
     state exactly like the ``pr_evidence`` rows and the watermark: it rides
     the Artifact, survives partial recompute and gather unchanged, and is
     never removed. ``IF NOT EXISTS`` for the same replay reason as steps
-    4-6 (artifact.materialize completes a pre-step-8 artifact's missing
+    4-6 (the artifact replay completes a pre-step-8 artifact's missing
     known table before this step runs on the replayed DB)."""
     conn.execute(
         """CREATE TABLE IF NOT EXISTS pr_disclosure (

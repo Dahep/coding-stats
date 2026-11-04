@@ -1,9 +1,12 @@
 """Artifact serializer tests: determinism, curation, digest verify, materialization."""
 
+import contextlib
 import hashlib
 import json
 import re
 import sqlite3
+
+import pytest
 
 from coding_stats import artifact
 from coding_stats.gitwalk import walk
@@ -167,6 +170,96 @@ def test_artifact_materializes_standalone_with_committed_shapes(tmp_path, repo):
     )
     conn.close()
     mat.close()
+
+
+def test_seed_working_db_stamps_the_artifacts_schema_step(tmp_path, repo):
+    """The one-seed API keeps replay and stamp inseparable: the seeded DB
+    carries the artifact's own stamp (its schema step, not a fabricated 0),
+    so a later serialize of the seeded DB re-emits the same header stamp —
+    losing #31 again is not reachable through this path."""
+    conn, *_ = _built_db(tmp_path, repo)
+    data = artifact.serialize(conn)
+    step = artifact.parse_header(data).schema_step
+    assert step > 0  # the source artifact is stamped; the compare is not vacuous
+
+    seeded = artifact.seed_working_db(tmp_path / "seeded.db", data, register=False)
+    markers = {
+        r[0]
+        for r in seeded.execute("SELECT name FROM sqlite_master WHERE name LIKE '_schema_step_%'")
+    }
+    assert markers == {f"_schema_step_{i:04d}" for i in range(step + 1)}
+    assert artifact.parse_header(artifact.serialize(seeded)).schema_step == step
+    seeded.close()
+    conn.close()
+
+
+def test_seed_working_db_refuses_data_that_does_not_verify(tmp_path, repo):
+    """Digest verification gates the ONE seed path itself: stale-digest
+    bytes are refused before anything is built (entry points keep their own
+    earlier checks for their own messages — this one cannot be bypassed)."""
+    conn, *_ = _built_db(tmp_path, repo)
+    data = artifact.serialize(conn)
+    tampered = data.replace(b"INSERT INTO features", b"INSERT INTO featurez", 1)
+    assert artifact.verify_bytes(tampered) is not None  # the digest is stale
+    with pytest.raises(artifact.MaterializeError, match="refusing artifact"):
+        artifact.seed_working_db(tmp_path / "seeded.db", tampered, register=False)
+    assert not (tmp_path / "seeded.db").exists()  # refused before the file existed
+    conn.close()
+
+
+def _reforged_low_stamp(data: bytes, step: int) -> bytes:
+    """Set the header's schema-step line to `step` and RE-compute the digest:
+    the unkeyed digest cannot authenticate the stamp — anyone who can commit
+    a Data branch can mint a header whose stamp the body did not earn."""
+    text = re.sub(
+        rb"^-- schema-step: \d+$",
+        f"-- schema-step: {step}".encode("ascii"),
+        data,
+        count=1,
+        flags=re.M,
+    )
+    m = artifact._DIGEST_LINE_RE.search(text)
+    blanked = text[: m.start()] + artifact.DIGEST_BLANK.encode("ascii") + text[m.end() :]
+    digest = hashlib.sha256(blanked).hexdigest()
+    return text[: m.start()] + f"-- digest: {digest}".encode("ascii") + text[m.end() :]
+
+
+def test_seed_working_db_refuses_a_forged_low_stamp(tmp_path, repo):
+    """A current-shape body carrying a forged (re-digested) low header stamp
+    may not crash: whatever db.apply_steps does with migration steps re-run
+    on newer content, every outcome is either a clean MaterializeError
+    refusal (gather/seeding skip the sibling, recovery refuses, no pinned
+    message touched) or a quiet success on steps that tolerate their own
+    re-run — a raw sqlite3.Error/RuntimeError escaping the refusal channel
+    is the crash this forbids. The strictest stamp (0) refuses concretely:
+    its step 1 needs machine-local settings the artifact does not carry."""
+    from coding_stats.gather import GatherError, _load
+
+    conn, *_ = _built_db(tmp_path, repo)
+    data = artifact.serialize(conn)
+    current = artifact.parse_header(data).schema_step
+    assert current > 1  # steps 1..current exist that a 0-stamp would re-run
+
+    for step in range(current):
+        forged = _reforged_low_stamp(data, step)
+        assert artifact.verify_bytes(forged) is None  # the digest freshly minted
+        target = tmp_path / f"seeded{step}.db"
+        if step == 0:
+            # the object body needs machine-local settings step 1 cannot recover
+            with pytest.raises(artifact.MaterializeError, match="artifact refused"):
+                artifact.seed_working_db(target, forged, register=False)
+            with pytest.raises(GatherError, match="artifact refused"):
+                _load(repo, "forged0", forged)
+            continue
+        try:
+            seeded = artifact.seed_working_db(target, forged, register=False)
+        except artifact.MaterializeError:
+            continue  # clean refusal — the only rejection channel
+        seeded.close()  # otherwise: steps tolerate their own re-run, fine
+        # gather's channel lets the refusal through, never a raw error
+        with contextlib.suppress(GatherError):
+            _load(repo, f"forged{step}", forged)
+    conn.close()
 
 
 def test_header_fields(tmp_path, repo):

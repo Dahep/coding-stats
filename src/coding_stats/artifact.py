@@ -39,7 +39,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import tablecatalog
+from . import db, identity, tablecatalog
 
 FORMAT = 1
 
@@ -182,7 +182,7 @@ def parse_header(data: bytes, require_tag: bool = True) -> ArtifactHeader | None
     )
 
 
-def materialize(conn: sqlite3.Connection, data: bytes) -> None:
+def _replay(conn: sqlite3.Connection, data: bytes) -> None:
     """Replay artifact bytes into conn under an SQLite authorizer: ONLY the
     curated shape is executable — CREATE TABLE of the known tables and INSERTs
     into them (plus plain reads/transactions). ATTACH/DETACH, PRAGMAs, DML
@@ -190,10 +190,14 @@ def materialize(conn: sqlite3.Connection, data: bytes) -> None:
 
     This is load-bearing: the artifact digest is an unkeyed checksum, so any
     committer can recompute it — checksummed artifact bytes are DATA, never
-    code. Both ingest (gather) and recovery (anchor bytes from the artifact's
-    git history) replay through here. Schema bookkeeping is deliberately not
-    part of the replay: see stamp_schema_steps. Raises MaterializeError on
-    refusal or on a shape that does not match the curated columns."""
+    code. Schema bookkeeping is deliberately not part of the replay: see
+    stamp_schema_steps. Raises MaterializeError on refusal or on a shape
+    that does not match the curated columns.
+
+    Private on purpose: a replay is never callable without its schema-step
+    stamp (restore_into) or without the working-shape finish and digest
+    verification (seed_working_db) — the stamp-less replay that lost #31 is
+    unreachable."""
     conn.set_authorizer(_artifact_authorizer())
     try:
         conn.executescript(data.decode("utf-8"))
@@ -275,15 +279,83 @@ def stamp_schema_steps(conn: sqlite3.Connection, data: bytes) -> None:
 
 
 def restore_into(conn: sqlite3.Connection, data: bytes) -> None:
-    """Seed a DB from artifact bytes in ONE call: the authorizer-guarded
-    replay, then the schema-step stamp. The pairing is load-bearing — losing
-    half of it is losing #31 again: materialize alone leaves the
-    _schema_step_* bookkeeping unstamped, and a later serialize of the seeded
-    DB then derives schema-step 0 while the content is the migrated layout
-    (every later restore re-runs the migrations and crashes). Raises
-    MaterializeError on a refused artifact."""
-    materialize(conn, data)
+    """Seed an ALREADY-OPEN connection from artifact bytes in ONE call: the
+    authorizer-guarded replay, then the schema-step stamp. The pairing is
+    the point — a stamp-less replay leaves the _schema_step_* bookkeeping
+    unwritten, and a later serialize of the seeded DB then derives
+    schema-step 0 while the content is a newer layout, so every later
+    restore re-runs the migrations and crashes (#31). Every caller outside
+    this module goes through restore_into or seed_working_db; the replay
+    alone is not reachable. Raises MaterializeError on a refused artifact."""
+    _replay(conn, data)
     stamp_schema_steps(conn, data)
+
+
+def seed_working_db(
+    db_path: Path,
+    data: bytes,
+    *,
+    register: bool,
+    repo_dir: Path | None = None,
+    branch: str | None = None,
+) -> sqlite3.Connection:
+    """The ONE path from artifact bytes to a working DB: verify the digest,
+    replay the curated rows, stamp the schema steps, and apply the working
+    shape — one call on one connection. The parameters are inseparable here
+    on purpose: an unstamped replay leaves the bookkeeping unwritten and a
+    later serialize derives schema-step 0 while the content is a newer
+    layout, so every later restore re-runs the migrations and crashes (#31).
+
+    The result is a fresh DB at `db_path` (which must not already exist —
+    callers stage a db.swap_tmp name, or pass ':memory:' for a throwaway
+    connection, in which case Path(':memory:') fspaths back to the literal
+    sqlite name). Returns the open connection with db.connect's semantics
+    (Row rows, FK enforcement, current shape). Digest verification runs
+    here AND at the entry points that own the bytes (the anchor search,
+    gather, seeding, migration all verify before seeding and keep their own
+    refusal messages) — an unverifiable artifact never reaches a replay.
+
+    `register` is keyword-required and decides who writes the repositories
+    row: True runs identity.register_repository inside the seed (the
+    recovery rebuild registers the repository against the seeded rows); False
+    leaves the row entirely to the caller — the migration path holds the
+    relabel authority (a rename IS the identity change the register rules
+    must refuse) and writes the row itself. Never a hidden default.
+
+    The header stamp sits inside the digested content, but the digest is
+    unkeyed — anyone who can commit a Data branch can mint a header whose
+    stamp the body did not earn. A low stamp makes db.apply_steps run
+    migration steps on newer content, so EVERY failure inside the
+    replay/stamp/working-shape block refuses as MaterializeError
+    ("artifact refused: ...") — never a raw sqlite3.Error/RuntimeError that
+    would escape gather's and seeding's refusal channel and crash a whole
+    loop instead of one clean sibling skip. register_repository's refusals
+    are NOT wrapped: they carry their own pinned refusal text."""
+    err = verify_bytes(data)
+    if err is not None:
+        raise MaterializeError(f"refusing artifact: {err}")
+    if register and repo_dir is None:
+        # before anything is built: a use error, not an artifact refusal
+        raise ValueError("seed_working_db(register=True) needs the repo to register")
+    conn = sqlite3.connect(db_path)
+    try:
+        try:
+            _replay(conn, data)
+            stamp_schema_steps(conn, data)
+            # the working shape (db.apply_steps) needs FK enforcement and Row
+            # rows exactly like connect gives them
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.row_factory = sqlite3.Row
+            db.apply_steps(conn)
+        except (sqlite3.Error, RuntimeError) as exc:
+            raise MaterializeError(f"artifact refused: {exc}") from exc
+        if register:
+            assert repo_dir is not None  # narrowed by the use error above, before any build
+            identity.register_repository(conn, repo_dir, branch)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
 
 KNOWN_TABLES: dict[str, tuple[str, ...]] = {

@@ -132,12 +132,9 @@ def _winning_sources(
         if artifact.verify_bytes(data) is not None:
             print(f"seeding source {name}: digest does not verify; skipped")
             continue  # a damaged sibling can't spread its data
-        rows = sqlite3.connect(":memory:")
-        rows.row_factory = sqlite3.Row
         try:
-            artifact.materialize(rows, data)
+            rows = artifact.seed_working_db(Path(":memory:"), data, register=False)
         except artifact.MaterializeError as exc:
-            rows.close()
             print(f"seeding source {name}: refused ({exc})")
             continue
         sources.append(
