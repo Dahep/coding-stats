@@ -65,11 +65,11 @@ def test_per_model_metrics_are_lower_bounds(tmp_path, repo):
     claude = by_h["claude"]
     assert (claude.model, claude.commits, claude.features) == ("Opus 4.8 (1M context)", 1, 1)
     assert claude.churn == 3  # the walked churn_lines (3 added lines in a.txt)
-    assert claude.fixes == 1 and claude.fixes_per_feature == 1.0
+    assert claude.fix_events == 1 and claude.fixes_per_feature == 1.0
 
     codex = by_h["codex"]
     assert (codex.model, codex.commits, codex.features) == ("gpt-5", 1, 1)
-    assert codex.churn == 2 and codex.fixes == 0 and codex.fixes_per_feature == 0.0
+    assert codex.churn == 2 and codex.fix_events == 0 and codex.fixes_per_feature == 0.0
     conn.close()
 
 
@@ -86,7 +86,7 @@ def test_per_model_trend_buckets_months(tmp_path, repo):
     assert all(p.month for p in claude)
     assert sum(p.commits for p in claude) == 1
     assert sum(p.features for p in claude) == 1 and sum(p.churn for p in claude) == 3
-    assert sum(p.fixes for p in claude) == 1
+    assert sum(p.fix_events for p in claude) == 1
     conn.close()
 
 

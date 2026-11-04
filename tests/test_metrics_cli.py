@@ -45,13 +45,18 @@ def test_snapshot_counts(classified):
     assert snap.total_commits == 9
     assert snap.verdict_counts == {"feature": 5, "fix": 2, "refactor": 1, "cleanup": 1}
     assert snap.total_features == 1
-    assert snap.total_fixes == 2
+    # Fix events are REACHES (fixes_features edges), not fix-verdict commits:
+    # before the lineage closure runs there are no edges, so the Fix event
+    # total is 0 while 2 fix commits are recorded. (Re-anchored from
+    # total_fixes == 2, which counted the raw commits.)
+    assert snap.fix_event_total == 0
+    assert snap.uncovered_fix_commits == 2  # audit view: raw commit counts
 
 
 def test_snapshot_json_shape(classified):
     data = json.loads(snapshot_to_json(snapshot(classified)))
     assert data["features"] == 1
-    assert data["fixes"] == 2
+    assert data["fix_events"] == 0
     assert set(data) >= {"total_commits", "verdicts", "features_per_year", "fixes_per_feature"}
 
 
@@ -63,6 +68,9 @@ def test_populate_fix_rows_then_metrics(classified, repo, shas):
     assert n == 2
     close_lineage(classified)
     snap = snapshot(classified)
+    # c3 -> alpha (direct) + c5 -> alpha (via c3): two reaches, two Fix events
+    assert snap.fix_event_total == 2
+    assert snap.uncovered_fix_commits == 0
     assert snap.fixes_per_feature == 2.0
     assert snap.top_features_by_fixes[0][2] == 2
     # c3's written a.txt has 1 del + 1 add = 2 churn lines; feature alpha churn from c1's diff
@@ -112,8 +120,9 @@ def test_rolling_and_timeline(classified, repo):
     roll = fixes_rolling(classified)
     assert roll and all(p.fixes_per_feature >= 0 for p in roll)
     # c3 (targets c1 defining alpha) + c5 (fix-of-fix, lineage -> alpha) both
-    # land on the same day: one sample, 2 fixes, 1 distinct feature touched
-    assert roll[-1].fixes_window == 2
+    # land on the same day: one sample, 2 Fix events (one reach each),
+    # 1 distinct feature touched
+    assert roll[-1].fix_events == 2
     assert roll[-1].features_touched == 1
     assert roll[-1].fixes_per_feature == 2.0
 

@@ -1,5 +1,11 @@
 """Feature-level metrics over SQL + diff scans: features/year, fixes/feature, churn,
-and time series (features over time, 1-month-rolling fixes/feature)."""
+and time series (features over time, 1-month-rolling fixes/feature).
+
+Every displayed 'fixes' number is the CONTEXT.md Fix event: counted once per
+(fix commit, Feature) reach through the fixes_features lineage closure, dated
+by the fix commit's Landing date (the committer date). Raw fix-commit counts
+survive only in the audit views that say so (uncovered fix commits).
+"""
 
 import json
 import sqlite3
@@ -8,7 +14,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import NamedTuple
 
-from . import aiattr
+from . import aiattr, verdicts
 from .orgview import org
 
 
@@ -18,14 +24,14 @@ class FeatureTimePoint:
     features_new: int
     features_cumulative: int
     commits: int
-    fixes: int
+    fix_events: int  # Fix events (per-reach) landing in the month, by Landing date
 
 
 @dataclass
 class RollingPoint:
     when: str  # YYYY-MM-DD (window end, UTC-normalized)
-    fixes_window: int  # fix commits in the trailing window
-    features_touched: int  # distinct features those fixes reach
+    fix_events: int  # Fix events (per-reach) with Landing date in the trailing window
+    features_touched: int  # distinct features those events reach
     fixes_per_feature: float
 
 
@@ -46,7 +52,8 @@ def _month_fill(first: str, last: str) -> list[str]:
 
 def features_timeline(conn: sqlite3.Connection) -> list[FeatureTimePoint]:
     """Monthly buckets from first to last walk commit: new/cumulative features,
-    commits, and fix commits per bucket. Org-level: a Shared commit (a sha
+    commits, and Fix events per bucket (one event per (fix commit, Feature)
+    reach, dated by the fix's Landing date). Org-level: a Shared commit (a sha
     held by several keys of one repo) counts once (the earliest verdict)."""
     conn = org(conn)
     features_by_month = {
@@ -61,12 +68,12 @@ def features_timeline(conn: sqlite3.Connection) -> list[FeatureTimePoint]:
             "SELECT strftime('%Y-%m', committed_at) m, COUNT(*) n FROM commits GROUP BY m"
         )
     }
-    fixes_by_month = {
+    fix_events_by_month = {
         r["m"]: r["n"]
         for r in conn.execute(
             """SELECT strftime('%Y-%m', c.committed_at) m, COUNT(*) n
-               FROM commits c JOIN commit_verdicts v ON v.commit_id = c.id
-               WHERE v.verdict = 'fix' GROUP BY m"""
+               FROM fixes_features ff JOIN commits c ON c.id = ff.fix_commit_id
+               GROUP BY m"""
         )
     }
     if not commits_by_month and not features_by_month:
@@ -87,7 +94,7 @@ def features_timeline(conn: sqlite3.Connection) -> list[FeatureTimePoint]:
                 features_new=n_new,
                 features_cumulative=features_seen,
                 commits=commits_by_month.get(m, 0),
-                fixes=fixes_by_month.get(m, 0),
+                fix_events=fix_events_by_month.get(m, 0),
             )
         )
     return points
@@ -98,13 +105,13 @@ def fixes_rolling(
 ) -> list[RollingPoint]:
     """fixes/feature with a trailing 1-month window, sampled weekly.
 
-    Numerator: all fix commits falling in the trailing window (end -
-    window_days + 1 .. window end). Denominator: the distinct features those
-    fixes reach through the fixes_features lineage closure — a feature counts
-    once however many fixes touch it. Dates are normalized by SQLite
-    (strftime) so month buckets and windows share one timezone convention.
-    The last sample is always placed at the latest commit date. Org-level:
-    Shared commits count once (the projection dedups them)."""
+    Numerator: the Fix events — one per (fix commit, Feature) reach, dated by
+    the fix's Landing date — whose Landing date falls in the trailing window
+    (end - window_days + 1 .. window end). Denominator: the distinct features
+    those events reach. Dates are normalized by SQLite (strftime) so month
+    buckets and windows share one timezone convention. The last sample is
+    always placed at the latest commit date. Org-level: Shared commits count
+    once (the projection dedups them)."""
     conn = org(conn)
     end_s = conn.execute(
         "SELECT MAX(strftime('%Y-%m-%d', committed_at)) d FROM commits"
@@ -113,32 +120,26 @@ def fixes_rolling(
         return []
     end = date.fromisoformat(end_s)
 
-    fix_dates: dict[int, date] = {}
+    events: list[tuple[date, str]] = []  # (Landing date, reached feature id)
     for r in conn.execute(
-        """SELECT v.commit_id id, strftime('%Y-%m-%d', c.committed_at) d
-           FROM commits c JOIN commit_verdicts v ON v.commit_id = c.id
-           WHERE v.verdict = 'fix'"""
+        """SELECT strftime('%Y-%m-%d', c.committed_at) d, ff.feature_id fid
+           FROM fixes_features ff JOIN commits c ON c.id = ff.fix_commit_id"""
     ):
-        fix_dates[r["id"]] = date.fromisoformat(r["d"])
-    if not fix_dates:
+        events.append((date.fromisoformat(r["d"]), str(r["fid"])))
+    if not events:
         return []
-
-    reached: dict[int, set[str]] = {}
-    for r in conn.execute("SELECT fix_commit_id, feature_id FROM fixes_features"):
-        reached.setdefault(r["fix_commit_id"], set()).add(r["feature_id"])
 
     span = timedelta(days=window_days - 1)
 
     def pt(day: date) -> RollingPoint:
         lo = day - span
-        fixes_in = [cid for cid, d in fix_dates.items() if lo <= d <= day]
-        touched = set().union(*(reached.get(cid, set()) for cid in fixes_in))
-        n = len(fixes_in)
+        touched = {fid for d, fid in events if lo <= d <= day}
+        n = sum(1 for d, _fid in events if lo <= d <= day)
         ratio = round(n / len(touched), 3) if touched else 0.0
         return RollingPoint(day.isoformat(), n, len(touched), ratio)
 
     points: list[RollingPoint] = []
-    cur = min(fix_dates.values())
+    cur = min(d for d, _fid in events)
     while cur <= end:
         points.append(pt(cur))
         cur += timedelta(days=step_days)
@@ -150,17 +151,17 @@ def fixes_rolling(
 @dataclass
 class MetricSnapshot:
     total_commits: int
-    verdict_counts: dict[str, int]
+    verdict_counts: dict[str, int]  # recorded verdict -> commits (raw counts)
     total_features: int
-    total_fixes: int
+    fix_event_total: int  # Fix events: one per (fix commit, Feature) reach
     years: list[tuple[str, int]]  # year -> features created
     features_per_year: float
-    fixes_per_feature: float  # overall mean
-    # year -> mean fixes per feature created that year
+    fixes_per_feature: float  # overall mean Fix events per feature
+    # year -> mean fixes per feature created that year (Fix events)
     fixes_by_year_mean: list[tuple[str, float]]
     top_features_by_fixes: list[tuple[str, str, int]]
     top_features_by_churn: list[tuple[str, str, int]]
-    fixes_uncovered: int  # fix verdicts attributed to no feature
+    uncovered_fix_commits: int  # AUDIT view: fix-verdict commits reaching no Feature
 
 
 def churn_per_feature(conn: sqlite3.Connection) -> list[tuple[str, str, int]]:
@@ -179,7 +180,8 @@ def churn_per_feature(conn: sqlite3.Connection) -> list[tuple[str, str, int]]:
 
 
 class FeatureRank(NamedTuple):
-    """One feature with its attributed-fix count, churn and live lines.
+    """One feature with its attributed Fix-event count (one per (fix commit,
+    Feature) reach), churn and live lines.
     Internal API: callers unpack by name, never by position."""
 
     fid: str
@@ -193,9 +195,9 @@ class FeatureRank(NamedTuple):
 
 
 def feature_ranking(conn: sqlite3.Connection) -> list[FeatureRank]:
-    """All features ranked by attributed fixes (lineage closure, ties broken
-    by feature id), with churn and the earliest defining-commit sha. Org
-    level: one feature row per duplicated (seeded) feature id."""
+    """All features ranked by attributed Fix events (lineage reaches, ties
+    broken by feature id), with churn and the earliest defining-commit sha.
+    Org level: one feature row per duplicated (seeded) feature id."""
     conn = org(conn)
     churn = {fid: n for fid, _t, n in churn_per_feature(conn)}
     sha = {
@@ -536,7 +538,8 @@ def _model_groups(
 def _model_preload(conn: sqlite3.Connection) -> _ModelPreload:
     """The per-commit lookups both by-model views share, read once:
     churn lines per commit, the features each commit defines (role
-    'defines'), and the DISTINCT fix commits reaching each feature."""
+    'defines'), and each fix commit's reached features (the Fix-event
+    pairing: one event per (fix commit, Feature) reach)."""
     churn_by_cid = {
         int(r["id"]): int(r["churn_lines"])
         for r in conn.execute("SELECT id, churn_lines FROM commits WHERE churn_lines IS NOT NULL")
@@ -556,16 +559,17 @@ def _model_preload(conn: sqlite3.Connection) -> _ModelPreload:
 class ModelTrendPoint:
     """One month's by-model bucket, a LOWER BOUND: the model's yes-attributed
     commits in that month, the features first defined in that month by those
-    commits, the churn that month's diffs carried, and the distinct fix
-    commits landing in that month that reach any feature the model defined
-    (all months). Missing months read as no attributed activity — an absence
-    of evidence, never a statement about authorship."""
+    commits, the churn that month's diffs carried, and the Fix events — one
+    per (fix commit, Feature) reach into the model's features, dated by the
+    fix's Landing date — landing in that month (all months). Missing months
+    read as no attributed activity — an absence of evidence, never a
+    statement about authorship."""
 
     month: str  # YYYY-MM of the event's commit
     commits: int
     features: int
     churn: int
-    fixes: int
+    fix_events: int
 
 
 def attribution_trend(
@@ -576,9 +580,10 @@ def attribution_trend(
     ``harness/model`` identity grouping as :func:`attribution_by_model`;
     each model's list covers the full month span of the walked history
     (buckets with no attributed activity are zeros — absence of a signal
-    matched, never authorship). Fixes bucket by their own commit's month,
-    reaching any feature across the model's history. ``resolved`` is a prior
-    :func:`resolve_attribution` pass over this same connection."""
+    matched, never authorship). Fix events bucket by their fix commit's
+    Landing date, reaching any feature across the model's history.
+    ``resolved`` is a prior :func:`resolve_attribution` pass over this same
+    connection."""
     conn = org(conn)
     rows = resolve_attribution(conn) if resolved is None else resolved
     month_by_cid: dict[int, str] = {}
@@ -593,7 +598,8 @@ def attribution_trend(
     fix_month: dict[str, str] = {}
     for r in conn.execute(
         "SELECT c.id, c.committed_at FROM commits c JOIN commit_verdicts v"
-        " ON v.commit_id = c.id WHERE v.verdict = 'fix'"
+        " ON v.commit_id = c.id WHERE v.verdict = ?",
+        (verdicts.FIX,),
     ):
         fix_month.setdefault(str(r["id"]), str(r["committed_at"])[:7])
 
@@ -620,11 +626,12 @@ def attribution_trend(
         for m in features_first.values():
             grid[m].features += 1  # features reaching the model later are not re-counted
         for fix_cid, lfids in fix_features.items():
-            if not (lfids & model_features):
+            reached = lfids & model_features  # one Fix event per reached feature
+            if not reached:
                 continue
             m = fix_month.get(fix_cid, "")  # a fix without a bucket: skip (defensive)
             if m and m in grid:
-                grid[m].fixes += 1
+                grid[m].fix_events += len(reached)
         out[key] = [grid[m] for m in months]
     return out
 
@@ -633,9 +640,9 @@ def attribution_trend(
 class ModelFeatureMetrics:
     """The feature metrics of one attributed AI model, as LOWER BOUNDS: the
     model's yes-attributed commits, the features they define, the churn those
-    commits carry, and the fix commits reaching those features (each fix
-    counted once per model row it reaches). Evidence-based counts over walked
-    data, never normalized upward; a commit with no matched harness/model
+    commits carry, and the Fix events reaching those features (one per
+    (fix commit, Feature) reach). Evidence-based counts over walked data,
+    never normalized upward; a commit with no matched harness/model
     contributes nowhere, and `no-evidence` never renders as a model."""
 
     harness: str
@@ -643,19 +650,19 @@ class ModelFeatureMetrics:
     commits: int
     features: int
     churn: int
-    fixes: int
+    fix_events: int
     fixes_per_feature: float
 
 
 def attribution_by_model(
     conn: sqlite3.Connection, *, resolved: Sequence[ResolvedCommit] | None = None
 ) -> list[ModelFeatureMetrics]:
-    """Features / churn / fixes per attributed AI model — the report's
+    """Features / churn / Fix events per attributed AI model — the report's
     by-model table (a lower bound per row). Over each (harness, model)
     group's yes-attributed commits: features are the DISTINCT ids those
     commits define (role 'defines'), churn is the sum of the commits'
-    ``churn_lines``, fixes are the DISTINCT ``fixes_features`` fix commits
-    reaching those features. Grouped by resolved identity — git-only
+    ``churn_lines``, fix events are the (fix commit, Feature) reaches into
+    those features. Grouped by resolved identity — git-only
     evidence outranks PR-channel claims exactly as
     ``aiattr.resolve`` resolves them. ``resolved`` is a prior
     :func:`resolve_attribution` pass over this same connection."""
@@ -673,7 +680,7 @@ def attribution_by_model(
         features: set[str] = set()
         for cid in cids:
             features |= defines.get(cid, set())
-        fixes = {f for f, lfids in fix_features.items() if lfids & features}
+        fix_events = sum(len(lfids & features) for lfids in fix_features.values())
         n = len(features)
         out.append(
             ModelFeatureMetrics(
@@ -682,8 +689,8 @@ def attribution_by_model(
                 commits=len(cids),
                 features=n,
                 churn=sum(churn_by_cid.get(cid, 0) for cid in cids),
-                fixes=len(fixes),
-                fixes_per_feature=(len(fixes) / n) if n else 0.0,
+                fix_events=fix_events,
+                fixes_per_feature=(fix_events / n) if n else 0.0,
             )
         )
     out.sort(key=lambda m: (-m.features, -m.churn, m.harness, m.model))
@@ -732,7 +739,12 @@ def snapshot(conn: sqlite3.Connection, top: int = 15) -> MetricSnapshot:
         for r in conn.execute("SELECT verdict, COUNT(*) n FROM commit_verdicts GROUP BY verdict")
     }
     total_features = conn.execute("SELECT COUNT(*) c FROM features").fetchone()["c"]
-    total_fixes = verdict_counts.get("fix", 0)
+    # The Fix event (CONTEXT.md): one per (fix commit, Feature) reach — the
+    # fixes_features closure edges. Interim (spec #48 pending): Embedded
+    # fixes are not yet recorded and the product-Area filter is not yet
+    # applicable, so today every fix-verdict commit's reach counts, over all
+    # Areas.
+    fix_event_total = int(conn.execute("SELECT COUNT(*) c FROM fixes_features").fetchone()["c"])
 
     years = [
         (r["yr"], r["n"])
@@ -763,11 +775,15 @@ def snapshot(conn: sqlite3.Connection, top: int = 15) -> MetricSnapshot:
 
     top_features_by_fixes = [(r.fid, r.title, r.fixes) for r in feature_ranking(conn)[:top]]
 
-    fixes_uncovered = conn.execute(
+    # AUDIT view (the Edge case "fixes reaching no Feature"): raw fix-verdict
+    # COMMIT counts, never Fix events — a reach-less fix commit is not a Fix
+    # event.
+    uncovered_fix_commits = conn.execute(
         """SELECT COUNT(*) c FROM commit_verdicts v
-           WHERE v.verdict = 'fix'
+           WHERE v.verdict = ?
              AND NOT EXISTS
-               (SELECT 1 FROM fixes_features ff WHERE ff.fix_commit_id = v.commit_id)"""
+               (SELECT 1 FROM fixes_features ff WHERE ff.fix_commit_id = v.commit_id)""",
+        (verdicts.FIX,),
     ).fetchone()["c"]
 
     churn = churn_per_feature(conn)
@@ -775,14 +791,14 @@ def snapshot(conn: sqlite3.Connection, top: int = 15) -> MetricSnapshot:
         total_commits=total_commits,
         verdict_counts=verdict_counts,
         total_features=total_features,
-        total_fixes=total_fixes,
+        fix_event_total=fix_event_total,
         years=years,
         features_per_year=features_per_year,
         fixes_per_feature=fixes_per_feature,
         fixes_by_year_mean=fixes_by_year_mean,
         top_features_by_fixes=top_features_by_fixes,
         top_features_by_churn=churn[:top],
-        fixes_uncovered=fixes_uncovered,
+        uncovered_fix_commits=uncovered_fix_commits,
     )
 
 
@@ -792,7 +808,7 @@ def snapshot_to_json(snap: MetricSnapshot) -> str:
             "total_commits": snap.total_commits,
             "verdicts": snap.verdict_counts,
             "features": snap.total_features,
-            "fixes": snap.total_fixes,
+            "fix_events": snap.fix_event_total,
             "features_per_year": round(snap.features_per_year, 2),
             "fixes_per_feature": round(snap.fixes_per_feature, 3),
             "features_per_year_byyear": dict(snap.years),
@@ -803,7 +819,7 @@ def snapshot_to_json(snap: MetricSnapshot) -> str:
             "top_features_by_churn": [
                 {"id": fid, "title": t, "churn": n} for fid, t, n in snap.top_features_by_churn
             ],
-            "fixes_uncovered": snap.fixes_uncovered,
+            "uncovered_fix_commits": snap.uncovered_fix_commits,
         },
         indent=2,
     )

@@ -13,6 +13,7 @@ from collections.abc import Callable
 from datetime import date
 from pathlib import Path
 
+from . import verdicts
 from .aiattr import DISCLOSURE_LINE, channel_label
 from .metrics import (
     ModelTrendPoint,
@@ -40,9 +41,9 @@ C = {
     "text": "#c0caf5",
     "muted": "#7d88b0",
     "grid": "#28314a",
-    "feature": "#9ece6a",
+    verdicts.FEATURE: "#9ece6a",
     "cumulative": "#bb9af7",
-    "fix": "#f7768e",
+    verdicts.FIX: "#f7768e",
     "ratio": "#7aa2f7",
     "churn": "#e0af68",
     "neutral": "#73daca",
@@ -472,7 +473,7 @@ def _donut(counts: list[tuple[str, int, str]]) -> str:
         offset -= frac * circ
     center = (
         f'<text x="{cx}" y="{cy - 3}" text-anchor="middle" class="donut-total">{total}</text>'
-        f'<text x="{cx}" y="{cy + 15}" text-anchor="middle" class="tick">commits'
+        f'<text x="{cx}" y="{cy + 15}" text-anchor="middle" class="tick">verdicts'
         "</text>"
     )
     legend = "".join(
@@ -485,6 +486,22 @@ def _donut(counts: list[tuple[str, int, str]]) -> str:
         f'<div class="donut-row"><svg viewBox="0 0 180 180" style="width:168px;'
         f'height:168px">{"".join(segs)}{center}</svg><div>{legend}</div></div>'
     )
+
+
+# Every schema-accepted Commit verdict is a slice (verdicts.REPORT_ORDER —
+# the coupling test pins this set to the schema CHECK), so the donut's
+# slices sum to its center total by construction. MERGE and UNKNOWN carry
+# their own colors: a repo with merge or backlog commits shows them instead
+# of silently dropping the rows from the mix.
+_VERDICT_COLORS: dict[str, str] = {
+    verdicts.FEATURE: C[verdicts.FEATURE],
+    verdicts.FIX: C[verdicts.FIX],
+    verdicts.REFACTOR: C["neutral"],
+    verdicts.REVERT: C["churn"],
+    verdicts.CLEANUP: C["cumulative"],
+    verdicts.MERGE: "#ff9e64",
+    verdicts.UNKNOWN: C["muted"],
+}
 
 
 # --------------------------------------------------------------- layout ---
@@ -657,16 +674,16 @@ def _attr_section(
                 lambda p: p.churn,
             ),
             _trend_chart(
-                "Fixes landing per month by attributed model",
-                "fixes reaching the model's features",
-                lambda p: p.fixes,
+                "Fix events landing per month by attributed model",
+                "Fix events reaching the model's features",
+                lambda p: p.fix_events,
             ),
         )
     )
     model_metric_rows = "".join(
         f"<tr><td>{_esc(m.harness)}</td><td>{_esc(m.model or '—')}</td>"
         f"<td class='num'>{m.commits}</td><td class='num'>{m.features}</td>"
-        f"<td class='num'>{m.churn}</td><td class='num'>{m.fixes}</td>"
+        f"<td class='num'>{m.churn}</td><td class='num'>{m.fix_events}</td>"
         f"<td class='num'>{m.fixes_per_feature:.1f}</td></tr>"
         for m in model_rows
     )
@@ -675,12 +692,12 @@ def _attr_section(
         " per AI model (lower bounds)</h2>"
         "<div class='note'>Per attributed model: the model's yes-attributed"
         " commits, the features they define, the churn their diffs carry and"
-        " the fix commits reaching those features — each counted once per"
-        " model it reaches. Every cell is a lower bound from recorded"
+        " the Fix events — one per (fix commit, Feature) reach — into those"
+        " features. Every cell is a lower bound from recorded"
         " evidence, never normalized upward.</div>"
         "<table><thead><tr><th>Harness</th><th>Model</th>"
         "<th class='num'>yes-commits</th><th class='num'>Features</th>"
-        "<th class='num'>Churn (lines)</th><th class='num'>Fixes</th>"
+        "<th class='num'>Churn (lines)</th><th class='num'>Fix events</th>"
         "<th class='num'>Fixes/feature</th></tr></thead><tbody>"
         + model_metric_rows
         + "</tbody></table>"
@@ -771,16 +788,20 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
     ranking = feature_ranking(conn)
     hbars_fixes = _hbars(
         [(f"#{r.fid} {r.title}", r.fixes) for r in ranking[:top]],
-        C["fix"],
-        "fixes",
+        C[verdicts.FIX],
+        "Fix events",
     )
 
     kpis = (
         _kpi("commits walked", str(snap.total_commits), sub=f"span {span}")
         + _kpi("features", str(snap.total_features), sub=f"{snap.features_per_year:.1f} / year")
-        + _kpi("fixes", str(snap.total_fixes), sub=f"{snap.fixes_per_feature:.2f} per feature")
         + _kpi(
-            "top feature fixes",
+            "fix events",
+            str(snap.fix_event_total),
+            sub=f"{snap.fixes_per_feature:.2f} per feature",
+        )
+        + _kpi(
+            "top feature fix events",
             str(snap.top_features_by_fixes[0][2]) if snap.top_features_by_fixes else "0",
             sub=snap.top_features_by_fixes[0][1] if snap.top_features_by_fixes else "",
         )
@@ -790,9 +811,9 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
             sub="1-month trailing window",
         )
         + _kpi(
-            "fixes w/o target",
-            str(snap.fixes_uncovered),
-            sub="fix commits attributed to no feature",
+            "uncovered fix commits (audit)",
+            str(snap.uncovered_fix_commits),
+            sub="fix verdicts reaching no feature",
         )
     )
 
@@ -803,42 +824,33 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
     features_growth = _dual_chart(
         [float(p.features_new) for p in tl],
         months,
-        C["feature"],
+        C[verdicts.FEATURE],
         line=[float(p.features_cumulative) for p in tl],
         line_color=C["cumulative"],
         bar_name="new features / month",
         line_name="features in total",
     )
     fixes_roller = _dual_chart(
-        [float(p.fixes_window) for p in rolling],
+        [float(p.fix_events) for p in rolling],
         roll_labels,
-        C["fix"],
+        C[verdicts.FIX],
         line=[p.fixes_per_feature for p in rolling],
         line_color=C["ratio"],
-        bar_name="fixes in trailing 30d",
+        bar_name="Fix events in trailing 30d",
         line_name="fixes / feature",
     )
     commits_month = _dual_chart(
         [float(p.commits) for p in tl],
         months,
         C["neutral"],
-        line=[float(p.fixes) for p in tl],
-        line_color=C["fix"],
+        line=[float(p.fix_events) for p in tl],
+        line_color=C[verdicts.FIX],
         bar_name="commits / month",
-        line_name="fixes / month",
+        line_name="Fix events / month",
     )
-    verdict_counts = [
-        (v, snap.verdict_counts.get(v, 0), col)
-        for v, col in (
-            ("feature", C["feature"]),
-            ("fix", C["fix"]),
-            ("refactor", C["neutral"]),
-            ("revert", C["churn"]),
-            ("cleanup", C["cumulative"]),
-            ("unknown", C["muted"]),
-        )
-    ]
-    donut = _donut(verdict_counts)
+    donut = _donut(
+        [(v, snap.verdict_counts.get(v, 0), _VERDICT_COLORS[v]) for v in verdicts.REPORT_ORDER]
+    )
 
     rank_rows = []
     for i, r in enumerate(ranking, 1):
@@ -858,7 +870,7 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
     rank_table = (
         "<table><thead><tr>"
         "<th class='num'>#</th><th>Feature</th><th class='num'>Created</th>"
-        "<th class='num'>Fixes</th><th class='num'>Churn (lines)</th>"
+        "<th class='num'>Fix events</th><th class='num'>Churn (lines)</th>"
         "<th class='num'>Live lines</th>"
         + ("<th>Repo</th>" if multi else "")
         + "<th>First commit</th></tr></thead><tbody>"
@@ -899,9 +911,9 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
         else "first-parent walk of each Target branch"  # multi-repo: no single claim
     )
     other_pct = percent(
-        snap.verdict_counts.get("revert", 0)
-        + snap.verdict_counts.get("cleanup", 0)
-        + snap.verdict_counts.get("refactor", 0)
+        snap.verdict_counts.get(verdicts.REVERT, 0)
+        + snap.verdict_counts.get(verdicts.CLEANUP, 0)
+        + snap.verdict_counts.get(verdicts.REFACTOR, 0)
     )
     db_path = str(conn.execute("PRAGMA database_list").fetchone()[2] or "")
     title = f"coding-stats report · {repo_name}"
@@ -927,18 +939,20 @@ multiple features from one commit.</div>
 
 <section>
 <h2>fixes / feature — trailing 1-month window</h2>
-<div class="note">Each point: all fix commits that fall in the trailing 30 days,
-divided by the number of distinct features those fixes reach through the
-lineage closure (a feature counts once however many fixes touch it). Sampled
-every 7 days, with a final sample at the latest commit date.</div>
+<div class="note">Each point: the Fix events — one per (fix commit, Feature)
+reach — whose Landing date falls in the trailing 30 days, divided by the
+number of distinct features those events reach (a feature counts once however
+many events touch it). Sampled every 7 days, with a final sample at the
+latest commit date.</div>
 {fixes_roller}
 </section>
 
 <section>
-<h2>Ranking — features with most fixes</h2>
-<div class="note">Fixes reach a feature through the lineage closure
-(fix-of-a-fix counts towards the original feature); each fix is counted once
-per feature it reaches. The table covers all {len(ranking)} features.</div>
+<h2>Ranking — features with most fix events</h2>
+<div class="note">Fix events reach a feature through the lineage closure
+(a fix of a fix counts towards the original feature); each fix commit counts
+once per feature it reaches — that per-reach count is the CONTEXT.md Fix
+event. The table covers all {len(ranking)} features.</div>
 {hbars_fixes}
 {rank_table}
 </section>
@@ -953,10 +967,13 @@ per feature it reaches. The table covers all {len(ranking)} features.</div>
 <h2 style="margin-top:18px;font-size:14px">Commit verdict mix</h2>
 {donut}
 <div class="note">Every Target-branch commit got one verdict (feature · fix ·
-refactor · revert · cleanup); the single verdict drives all feature metrics.
-{percent(snap.verdict_counts.get("feature", 0)):.0f}% of commits define or
-extend the feature set, {percent(snap.verdict_counts.get("fix", 0)):.0f}% are
-fixes, {other_pct}%
+refactor · revert · cleanup · merge · unknown — the last two are the system
+verdicts); the single verdict drives all feature metrics, and the donut shows
+every verdict the schema accepts, so its slices sum to the center total.
+{percent(snap.verdict_counts.get(verdicts.FEATURE, 0)):.0f}% of commits
+define or extend the feature set,
+{percent(snap.verdict_counts.get(verdicts.FIX, 0)):.0f}% are fix commits,
+{other_pct}%
 refactor/revert/cleanup (non-feature work).</div>
 
 <h2 style="margin-top:18px;font-size:14px">Commit volume</h2>
@@ -968,11 +985,17 @@ refactor/revert/cleanup (non-feature work).</div>
 <div class="foot">
 <strong>Methodology.</strong> Walk: {walk_note}; squash-merge work appears once. Verdicts: rolling
 LLM session via the opencode CLI (<code>{_esc(model)}</code>), one JSON verdict
-per commit. Fixes: blame evidence at the first parent
+per commit. <strong>Fix event</strong> (the unit of fixes/feature): a
+fix-verdict commit counted once per Feature its lineage reaches, dated by its
+Landing date — the committer date it landed with. Interim caveat: Embedded
+fixes and the product-Area filter are pending (the derive-stage spec, #48) —
+until then a Fix event is every fix commit's reach, over all Areas, not yet
+product-only. Fix evidence: blame at the first parent
 (<code>git blame -w -C --first-parent</code>, ≥{min_lines} lines). Lineage:
 <code>fixes_features</code> transitive closure — a fix of a fix is attributed to
-every feature in its chain. Running 1-month window: fix commits in trailing
-window ÷ distinct features those fixes reach. Generated by <code>coding-stats</code> from
+every feature in its chain. Running 1-month window: Fix events with Landing
+date in the trailing window ÷ distinct features those events reach. Generated
+by <code>coding-stats</code> from
 <code>{_esc(db_path)}</code>.
 <div class="muted">{who}</div>
 </div>
