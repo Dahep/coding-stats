@@ -14,6 +14,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import verdicts
+
 DEFAULT_MODEL = "opencode/glm-5.3-flash"
 SESSION_DIR = Path("/tmp/opencode/coding-stats-classifier")
 DIFF_CAP = 12000
@@ -91,7 +93,7 @@ def parse_reply(text: str) -> Reply:
     candidate = fenced.group(1) if fenced else text
     line = candidate.splitlines()[0]
     data = json.loads(line.strip("` \t"))
-    if data.get("k") not in {"new", "existing", "fix", "refactor", "revert", "cleanup"}:
+    if data.get("k") not in K_TO_VERDICT:
         raise ValueError(f"unknown k={data.get('k')!r}")
     return Reply(kind=data["k"], payload=data)
 
@@ -144,13 +146,15 @@ Classify COMMIT {commit["sha"][:12]}: one JSON object line."""
     )
 
 
+# The LLM reply-protocol k tokens ("new"/"existing" are the model's wire
+# vocabulary, not verdicts) mapped onto the recorded verdicts.
 K_TO_VERDICT = {
-    "new": "feature",
-    "existing": "feature",
-    "fix": "fix",
-    "refactor": "refactor",
-    "revert": "revert",
-    "cleanup": "cleanup",
+    "new": verdicts.FEATURE,
+    "existing": verdicts.FEATURE,
+    "fix": verdicts.FIX,
+    "refactor": verdicts.REFACTOR,
+    "revert": verdicts.REVERT,
+    "cleanup": verdicts.CLEANUP,
 }
 
 _FEATURE_SUFFIX_RE = re.compile(r"-(\d+)$")
@@ -247,8 +251,8 @@ def classify_pending(
                 conn.execute(
                     "INSERT INTO commit_verdicts"
                     " (commit_id, verdict, rationale, raw_llm_output, model, classified_at)"
-                    " VALUES (?, 'merge', 'empty diff vs first parent', '', ?, datetime('now'))",
-                    (row["id"], model),
+                    " VALUES (?, ?, 'empty diff vs first parent', '', ?, datetime('now'))",
+                    (row["id"], verdicts.MERGE, model),
                 )
             continue
         text = session.send(msg)
@@ -267,8 +271,8 @@ def classify_pending(
                     conn.execute(
                         "INSERT INTO commit_verdicts"
                         " (commit_id, verdict, rationale, raw_llm_output, model, classified_at)"
-                        " VALUES (?, 'unknown', 'unparsable LLM reply', ?, ?, datetime('now'))",
-                        (row["id"], text, model),
+                        " VALUES (?, ?, 'unparsable LLM reply', ?, ?, datetime('now'))",
+                        (row["id"], verdicts.UNKNOWN, text, model),
                     )
                 processed.append(row["id"])
                 continue

@@ -8,6 +8,8 @@ lineage: a fix targeting a fix of a feature counts the feature once.
 
 import sqlite3
 
+from . import verdicts
+
 
 def close_lineage(conn: sqlite3.Connection) -> int:
     """Compute/update the transitive closure for all fix commits.
@@ -52,7 +54,7 @@ def close_one(conn: sqlite3.Connection, fix_id: int) -> int:
         verdict = conn.execute(
             "SELECT verdict FROM commit_verdicts WHERE commit_id = ?", (unit,)
         ).fetchone()
-        if verdict and verdict["verdict"] == "fix":
+        if verdict and verdicts.is_fix(verdict["verdict"]):
             next_fix = first_fix if first_fix is not None else unit
             for r in conn.execute(
                 "SELECT target_commit_id FROM fix_targets WHERE fix_commit_id = ?", (unit,)
