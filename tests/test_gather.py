@@ -8,9 +8,10 @@ from pathlib import Path
 
 import pytest
 
+from coding_stats import artifact
 from coding_stats.cli import main
 from coding_stats.metrics import churn_per_feature, snapshot
-from conftest import commit_files, rechecksum, run, store_worktree
+from conftest import add_feature, commit_files, make_db, rechecksum, run, store_worktree
 
 
 class Scripted:
@@ -634,6 +635,219 @@ def test_gather_keeps_shim_when_no_origin_resolves(tmp_path):
     assert _rows(union2, "SELECT repo_key, slug FROM repositories") == [
         {"repo_key": "local:dotfiles@main", "slug": "dotfiles@main"}
     ]
+
+
+def _populate_every_table(conn, repo_id: int, sha: str, feature_id: str) -> None:
+    """One row in every Artifact table (settings is derived at gather, never
+    copied): the full-shape fixture for the per-table round-trip test."""
+    conn.execute(
+        "INSERT INTO commits (id, repo_id, sha, parent_sha, tree_sha, committed_at,"
+        " author_name, title, message, subject_patch_id, walk_index, kind, diff,"
+        " added_lines, deleted_lines, churn_lines)"
+        " VALUES (1, ?, ?, NULL, 't', '2026-01-01T00:00:00Z', 'a', 'one', 'm', NULL, 1,"
+        " 'normal', '', 1, 0, 1)",
+        (repo_id, sha),
+    )
+    conn.execute(
+        "INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output,"
+        " model, classified_at) VALUES (1, 'feature', 'why-old', 'raw', 'm-old',"
+        " '2026-01-01T00:00:00Z')"
+    )
+    conn.execute(
+        "INSERT INTO ai_attribution (commit_id, verdict, harness, model)"
+        " VALUES (1, 'possible', 'h-old', 'model-old')"
+    )
+    conn.execute(
+        "INSERT INTO ai_evidence (commit_id, rule, raw, verdict) VALUES (1, 'r', 'x', 'yes')"
+    )
+    conn.execute(
+        "INSERT INTO pr_evidence (repo_id, pr_number, commit_id, rule, raw, verdict,"
+        " harness, model, channel, observed_at, suspicious)"
+        " VALUES (?, 1, 1, 'r1', 'x', 'yes', NULL, NULL, 'pr', 't0', 0)",
+        (repo_id,),
+    )
+    conn.execute(
+        "INSERT INTO pr_watermark (repo_id, last_pr_number, last_merged_at)"
+        " VALUES (?, 1, '2026-10-01T00:00:00Z')",
+        (repo_id,),
+    )
+    conn.execute("INSERT INTO pr_disclosure (repo_id) VALUES (?)", (repo_id,))
+    conn.execute(
+        "INSERT INTO commits_features (commit_id, feature_id, role) VALUES (1, ?, 'defines')",
+        (feature_id,),
+    )
+    conn.execute(
+        "INSERT INTO fix_touches (fix_commit_id, source_commit_id, hit_lines)"
+        " VALUES (1, 1, 3)"
+    )
+    conn.execute("INSERT INTO fix_targets (fix_commit_id, target_commit_id) VALUES (1, 1)")
+    conn.execute(
+        "INSERT INTO fixes_features (fix_commit_id, feature_id, via_fix_commit_id)"
+        " VALUES (1, ?, NULL)",
+        (feature_id,),
+    )
+    conn.execute(
+        "INSERT INTO feature_line_samples (feature_id, at_commit_sha, live_lines)"
+        " VALUES (?, ?, ?)",
+        (feature_id, sha, 5),
+    )
+
+
+def test_every_table_round_trips_through_the_purge_and_reinsert(tmp_path, repo):
+    """Per-table insert/purge round-trip on a two-key union (the catalogue
+    regression test): re-gathering key A replaces its rows WHOLESALE in every
+    Artifact table — purge deletes by the generated repo-scoped rules, the
+    copy plans re-insert — never touching key B's rows, never leaving stale
+    ones, and removing A's rows from tables its new artifact no longer
+    carries (the disclosure marker)."""
+    # key B: a second repo with the same full-shape rows
+    repo_b = tmp_path / "repo-b"
+    repo_b.mkdir()
+    run(repo_b, "init", "-q", "-b", "main")
+    run(repo_b, "config", "user.name", "T")
+    run(repo_b, "config", "user.email", "t@t.io")
+    run(repo_b, "config", "commit.gpgsign", "false")
+    commit_files(repo_b, "seed", {"b.txt": "b\n"})
+
+    conn_a = make_db(tmp_path / "a.db", repo)
+    conn_b = make_db(tmp_path / "b.db", repo_b)
+    fa = add_feature(conn_a, "feature a")
+    fb = add_feature(conn_b, "feature b")
+    _populate_every_table(conn_a, 1, "x40", fa)
+    _populate_every_table(conn_b, 1, "y40", fb)
+    conn_a.commit()
+    conn_b.commit()
+    art_a = artifact.write(conn_a, repo)
+    art_b = artifact.write(conn_b, repo_b)
+
+    union = tmp_path / "union.db"
+    main(["gather", "--db", str(union), str(art_a), str(art_b)])
+    populated = (
+        "repositories",
+        "commits",
+        "commit_verdicts",
+        "ai_attribution",
+        "ai_evidence",
+        "pr_evidence",
+        "pr_watermark",
+        "pr_disclosure",
+        "features",
+        "commits_features",
+        "fix_touches",
+        "fix_targets",
+        "fixes_features",
+        "feature_line_samples",
+    )
+    for table in populated:
+        assert _rows(union, f"SELECT COUNT(*) c FROM {table}")[0]["c"] == 2, table
+
+    # A's artifact changes in every mutable row; its disclosure marker is
+    # GONE (the new artifact never ran the PR tier's bookkeeping)
+    conn_a.execute("UPDATE commits SET added_lines = 9 WHERE id = 1")
+    conn_a.execute("UPDATE commit_verdicts SET rationale = 'why-new', model = 'm-new'")
+    conn_a.execute("UPDATE ai_attribution SET verdict = 'yes', model = 'model-new'")
+    conn_a.execute("UPDATE ai_evidence SET verdict = 'possible'")
+    conn_a.execute("UPDATE pr_evidence SET observed_at = 't1'")
+    conn_a.execute(
+        "UPDATE pr_watermark SET last_pr_number = 2, last_merged_at = '2026-10-02T00:00:00Z'"
+    )
+    conn_a.execute("DELETE FROM pr_disclosure")
+    conn_a.execute("UPDATE features SET title = 'renamed' WHERE id = ?", (fa,))
+    conn_a.execute("UPDATE commits_features SET role = 'touches'")
+    conn_a.execute("UPDATE fix_touches SET hit_lines = 7")
+    conn_a.execute("UPDATE fixes_features SET via_fix_commit_id = 1")
+    conn_a.execute("UPDATE feature_line_samples SET live_lines = 11")
+    conn_a.commit()
+    artifact.write(conn_a, repo)
+
+    main(["gather", "--db", str(union), str(art_a), str(art_b)])
+
+    rid_a = _rows(union, "SELECT id FROM repositories WHERE repo_key = 'local:repo@main'")[0][
+        "id"
+    ]
+    rid_b = _rows(union, "SELECT id FROM repositories WHERE repo_key = 'local:repo-b@main'")[0][
+        "id"
+    ]
+    rows = _rows(union, "SELECT repo_id, added_lines FROM commits")
+    assert {r["repo_id"]: r["added_lines"] for r in rows} == {rid_a: 9, rid_b: 1}
+    verdicts = {
+        r["model"]: r["rationale"]
+        for r in _rows(union, "SELECT model, rationale FROM commit_verdicts")
+    }
+    assert verdicts == {"m-new": "why-new", "m-old": "why-old"}
+    attr = {
+        r["repo_id"]: (r["verdict"], r["model"])
+        for r in _rows(
+            union,
+            "SELECT c.repo_id, a.verdict, a.model FROM ai_attribution a"
+            " JOIN commits c ON c.id = a.commit_id",
+        )
+    }
+    assert attr == {rid_a: ("yes", "model-new"), rid_b: ("possible", "model-old")}
+    evidence = {
+        r["repo_id"]: r["verdict"]
+        for r in _rows(
+            union,
+            "SELECT c.repo_id, e.verdict FROM ai_evidence e JOIN commits c ON c.id = e.commit_id",
+        )
+    }
+    assert evidence == {rid_a: "possible", rid_b: "yes"}
+    pr = {
+        r["repo_id"]: r["observed_at"]
+        for r in _rows(union, "SELECT repo_id, observed_at FROM pr_evidence")
+    }
+    assert pr == {rid_a: "t1", rid_b: "t0"}
+    marks = _rows(union, "SELECT repo_id, last_pr_number, last_merged_at FROM pr_watermark")
+    assert {(m["repo_id"], m["last_pr_number"]) for m in marks} == {
+        (rid_a, 2),
+        (rid_b, 1),
+    }
+    # A's marker was purged with its rows: the new artifact lacks it
+    disclosure = _rows(union, "SELECT repo_id FROM pr_disclosure")
+    assert [d["repo_id"] for d in disclosure] == [rid_b]
+    feats = {
+        r["repo_id"]: r["title"] for r in _rows(union, "SELECT repo_id, title FROM features")
+    }
+    assert feats == {rid_a: "renamed", rid_b: "feature b"}
+    roles = {r["role"] for r in _rows(union, "SELECT DISTINCT role FROM commits_features")}
+    assert roles == {"touches", "defines"}
+    hits = {
+        r["repo_id"]: r["hit_lines"]
+        for r in _rows(
+            union,
+            "SELECT c.repo_id, t.hit_lines FROM fix_touches t"
+            " JOIN commits c ON c.id = t.fix_commit_id",
+        )
+    }
+    assert hits == {rid_a: 7, rid_b: 3}
+    targets = _rows(union, "SELECT COUNT(*) c FROM fix_targets")[0]["c"]
+    assert targets == 2  # no mutable column: presence is the round-trip assert
+    fixes = {
+        r["repo_id"]: r["via_fix_commit_id"]
+        for r in _rows(
+            union,
+            "SELECT c.repo_id, f.via_fix_commit_id FROM fixes_features f"
+            " JOIN commits c ON c.id = f.fix_commit_id",
+        )
+    }
+    # A's via was set (artifact-local commit id 1) and remapped onto A's
+    # union-space commit with walk_index 1; B's stays NULL.
+    a_via = _rows(
+        union, f"SELECT id FROM commits WHERE repo_id = {rid_a} AND walk_index = 1"
+    )[0]["id"]
+    assert fixes[rid_a] == a_via and fixes[rid_b] is None
+    samples = {
+        r["live_lines"]
+        for r in _rows(union, "SELECT DISTINCT live_lines FROM feature_line_samples")
+    }
+    assert samples == {11, 5}
+    # no stale rows anywhere, no duplication (pr_disclosure's round trip is
+    # its REMOVAL: only B's marker remains, asserted above)
+    for table in populated:
+        expected = 1 if table == "pr_disclosure" else 2
+        assert _rows(union, f"SELECT COUNT(*) c FROM {table}")[0]["c"] == expected, table
+    conn_a.close()
+    conn_b.close()
 
 
 def test_gather_aliases_shim_and_canonical_artifacts_of_one_repo(tmp_path):

@@ -13,6 +13,8 @@ a standalone queryable DB from any clone.
 * Then per table: its CREATE TABLE (curated shape — column types and
   constraints kept, cross-table REFERENCES dropped so the dump materializes
   standalone) followed by one canonical INSERT per row in stable order.
+  The shapes, column tuples, canonical SELECTs and sentinels live in
+  tablecatalog — the one declaration every consumer derives from.
 
 Curated projection (ADR-0003 clause 2), the artifact is not a byte copy of
 the working DB: table ``runs`` is excluded entirely; settings rows other than
@@ -34,283 +36,15 @@ import hashlib
 import re
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
+
+from . import tablecatalog
 
 FORMAT = 1
 
 DIGEST_BLANK = "-- digest:"
 _DIGEST_LINE_RE = re.compile(rb"^-- digest:(?: ([0-9a-f]+))?$", re.M)
-
-_SETTINGS_WHITELIST = (
-    "backfill_state",
-    "branch",
-    "min_target_lines",
-    "model",
-    "unattributed_lines",
-)
-
-
-@dataclass(frozen=True)
-class _Table:
-    name: str
-    ddl: str
-    columns: tuple[str, ...]
-    source: str  # SELECT <columns> FROM ... ORDER BY <stable keys>
-    sentinels: dict[str, object] = field(default_factory=dict)
-
-
-_TABLES: tuple[_Table, ...] = (
-    _Table(
-        "repositories",
-        """CREATE TABLE repositories (
-               id INTEGER PRIMARY KEY,
-               repo_key TEXT NOT NULL UNIQUE,
-               slug TEXT NOT NULL,
-               branch TEXT,
-               clone_url TEXT,
-               added_at TEXT
-           );""",
-        ("id", "repo_key", "slug", "branch", "clone_url", "added_at"),
-        "SELECT id, repo_key, slug, branch, clone_url, added_at FROM repositories ORDER BY id",
-        {"added_at": ""},  # wall-clock -> sentinel (impl-w1-hazard obligation)
-    ),
-    _Table(
-        "commits",
-        """CREATE TABLE commits (
-               id INTEGER PRIMARY KEY,
-               repo_id INTEGER NOT NULL,
-               sha TEXT NOT NULL,
-               parent_sha TEXT,
-               tree_sha TEXT NOT NULL,
-               committed_at TEXT NOT NULL,
-               author_name TEXT NOT NULL,
-               title TEXT NOT NULL,
-               message TEXT NOT NULL,
-               subject_patch_id TEXT,
-               walk_index INTEGER NOT NULL,
-               kind TEXT NOT NULL CHECK (kind IN ('normal', 'merge')),
-               diff TEXT NOT NULL,
-               added_lines INTEGER NOT NULL DEFAULT 0,
-               deleted_lines INTEGER NOT NULL DEFAULT 0,
-               churn_lines INTEGER NOT NULL DEFAULT 0,
-               UNIQUE (repo_id, sha),
-               UNIQUE (repo_id, walk_index)
-           );""",
-        (
-            "id",
-            "repo_id",
-            "sha",
-            "parent_sha",
-            "tree_sha",
-            "committed_at",
-            "author_name",
-            "title",
-            "message",
-            "subject_patch_id",
-            "walk_index",
-            "kind",
-            "diff",
-            "added_lines",
-            "deleted_lines",
-            "churn_lines",
-        ),
-        """SELECT id, repo_id, sha, parent_sha, tree_sha, committed_at, author_name, title,
-                  message, subject_patch_id, walk_index, kind, diff, added_lines,
-                  deleted_lines, churn_lines
-           FROM commits ORDER BY id""",
-        {"diff": ""},  # raw diff text is machine-derivable, never committed
-    ),
-    _Table(
-        "commit_verdicts",
-        """CREATE TABLE commit_verdicts (
-               commit_id INTEGER PRIMARY KEY,
-               verdict TEXT NOT NULL CHECK (verdict IN ('feature', 'fix', 'refactor',
-                                                        'revert', 'cleanup', 'merge',
-                                                        'unknown')),
-               rationale TEXT NOT NULL,
-               raw_llm_output TEXT NOT NULL,
-               model TEXT NOT NULL,
-               run_id INTEGER,
-               classified_at TEXT NOT NULL
-           );""",
-        ("commit_id", "verdict", "rationale", "raw_llm_output", "model", "run_id", "classified_at"),
-        """SELECT commit_id, verdict, rationale, raw_llm_output, model, run_id, classified_at
-           FROM commit_verdicts ORDER BY commit_id""",
-        {"run_id": None},  # run provenance is machine-local
-    ),
-    _Table(
-        "ai_attribution",
-        """CREATE TABLE ai_attribution (
-               commit_id INTEGER PRIMARY KEY,
-               verdict TEXT NOT NULL CHECK (verdict IN ('yes', 'possible', 'no-evidence')),
-               harness TEXT,
-               model TEXT
-           );""",
-        ("commit_id", "verdict", "harness", "model"),
-        "SELECT commit_id, verdict, harness, model FROM ai_attribution ORDER BY commit_id",
-    ),
-    _Table(
-        "ai_evidence",
-        """CREATE TABLE ai_evidence (
-               commit_id INTEGER NOT NULL,
-               rule TEXT NOT NULL,
-               raw TEXT NOT NULL,
-               verdict TEXT NOT NULL CHECK (verdict IN ('yes', 'possible')),
-               PRIMARY KEY (commit_id, rule, raw)
-           );""",
-        ("commit_id", "rule", "raw", "verdict"),
-        "SELECT commit_id, rule, raw, verdict FROM ai_evidence ORDER BY commit_id, rule, raw",
-    ),
-    _Table(
-        "pr_evidence",
-        """CREATE TABLE pr_evidence (
-               repo_id INTEGER NOT NULL,
-               pr_number INTEGER NOT NULL,
-               commit_id INTEGER,
-               rule TEXT NOT NULL,
-               raw TEXT NOT NULL,
-               verdict TEXT NOT NULL CHECK (verdict IN ('yes', 'possible')),
-               harness TEXT,
-               model TEXT,
-               channel TEXT NOT NULL CHECK (channel = 'pr'),
-               observed_at TEXT NOT NULL,
-               suspicious INTEGER NOT NULL CHECK (suspicious IN (0, 1)),
-               UNIQUE (repo_id, pr_number, commit_id, rule, raw)
-           );""",
-        (
-            "repo_id",
-            "pr_number",
-            "commit_id",
-            "rule",
-            "raw",
-            "verdict",
-            "harness",
-            "model",
-            "channel",
-            "observed_at",
-            "suspicious",
-        ),
-        """SELECT repo_id, pr_number, commit_id, rule, raw, verdict, harness, model, channel,
-                  observed_at, suspicious
-           FROM pr_evidence ORDER BY repo_id, pr_number, commit_id, rule, raw""",
-    ),
-    _Table(
-        "pr_watermark",
-        """CREATE TABLE pr_watermark (
-               repo_id INTEGER NOT NULL,
-               last_pr_number INTEGER NOT NULL,
-               last_merged_at TEXT,
-               PRIMARY KEY (repo_id)
-           );""",
-        ("repo_id", "last_pr_number", "last_merged_at"),
-        "SELECT repo_id, last_pr_number, last_merged_at FROM pr_watermark ORDER BY repo_id",
-    ),
-    _Table(
-        "pr_disclosure",
-        """CREATE TABLE pr_disclosure (
-               repo_id INTEGER NOT NULL,
-               PRIMARY KEY (repo_id)
-           );""",
-        ("repo_id",),
-        "SELECT repo_id FROM pr_disclosure ORDER BY repo_id",
-    ),
-    _Table(
-        "features",
-        """CREATE TABLE features (
-               id TEXT NOT NULL,
-               title TEXT NOT NULL,
-               about TEXT NOT NULL DEFAULT '',
-               title_history_json TEXT NOT NULL DEFAULT '[]',
-               created_at TEXT NOT NULL,
-               created_run_id INTEGER,
-               repo_id INTEGER NOT NULL,
-               live_lines INTEGER NOT NULL DEFAULT 0,
-               PRIMARY KEY (repo_id, id)
-           );""",
-        (
-            "id",
-            "title",
-            "about",
-            "title_history_json",
-            "created_at",
-            "created_run_id",
-            "repo_id",
-            "live_lines",
-        ),
-        """SELECT id, title, about, title_history_json, created_at, created_run_id,
-                  repo_id, live_lines
-           FROM features ORDER BY repo_id, id""",
-        {"created_run_id": None},
-    ),
-    _Table(
-        "commits_features",
-        """CREATE TABLE commits_features (
-               commit_id INTEGER NOT NULL,
-               feature_id TEXT NOT NULL,
-               role TEXT NOT NULL CHECK (role IN ('defines', 'touches')),
-               PRIMARY KEY (commit_id, feature_id),
-               UNIQUE (feature_id, commit_id)
-           );""",
-        ("commit_id", "feature_id", "role"),
-        "SELECT commit_id, feature_id, role FROM commits_features ORDER BY commit_id, feature_id",
-    ),
-    _Table(
-        "fix_touches",
-        """CREATE TABLE fix_touches (
-               fix_commit_id INTEGER NOT NULL,
-               source_commit_id INTEGER NOT NULL,
-               hit_lines INTEGER NOT NULL,
-               PRIMARY KEY (fix_commit_id, source_commit_id)
-           );""",
-        ("fix_commit_id", "source_commit_id", "hit_lines"),
-        "SELECT fix_commit_id, source_commit_id, hit_lines FROM fix_touches"
-        " ORDER BY fix_commit_id, source_commit_id",
-    ),
-    _Table(
-        "fix_targets",
-        """CREATE TABLE fix_targets (
-               fix_commit_id INTEGER NOT NULL,
-               target_commit_id INTEGER NOT NULL,
-               PRIMARY KEY (fix_commit_id, target_commit_id)
-           );""",
-        ("fix_commit_id", "target_commit_id"),
-        "SELECT fix_commit_id, target_commit_id FROM fix_targets"
-        " ORDER BY fix_commit_id, target_commit_id",
-    ),
-    _Table(
-        "fixes_features",
-        """CREATE TABLE fixes_features (
-               fix_commit_id INTEGER NOT NULL,
-               feature_id TEXT NOT NULL,
-               via_fix_commit_id INTEGER,
-               PRIMARY KEY (fix_commit_id, feature_id),
-               UNIQUE (fix_commit_id, feature_id, via_fix_commit_id)
-           );""",
-        ("fix_commit_id", "feature_id", "via_fix_commit_id"),
-        "SELECT fix_commit_id, feature_id, via_fix_commit_id FROM fixes_features"
-        " ORDER BY fix_commit_id, feature_id, via_fix_commit_id",
-    ),
-    _Table(
-        "feature_line_samples",
-        """CREATE TABLE feature_line_samples (
-               feature_id TEXT NOT NULL,
-               at_commit_sha TEXT NOT NULL,
-               live_lines INTEGER NOT NULL,
-               PRIMARY KEY (feature_id, at_commit_sha)
-           );""",
-        ("feature_id", "at_commit_sha", "live_lines"),
-        "SELECT feature_id, at_commit_sha, live_lines FROM feature_line_samples"
-        " ORDER BY feature_id, at_commit_sha",
-    ),
-    _Table(
-        "settings",
-        "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
-        ("key", "value"),
-        "SELECT key, value FROM settings WHERE key IN"
-        f" ({', '.join(f'{k!r}' for k in _SETTINGS_WHITELIST)}) ORDER BY key",
-    ),
-)
 
 
 def _lit(value: object) -> str:
@@ -360,13 +94,13 @@ def _head(conn: sqlite3.Connection) -> str:
 def serialize(conn: sqlite3.Connection) -> bytes:
     """The complete canonical artifact content, digest line filled in."""
     parts = [_head(conn)]
-    for table in _TABLES:
-        parts.append(table.ddl.strip() + "\n")
-        cols = ", ".join(table.columns)
-        for row in conn.execute(table.source):
+    for table in tablecatalog.artifact_tables():
+        parts.append(tablecatalog.artifact_ddl(table) + "\n")
+        cols = ", ".join(table.names)
+        sentinels = {c.name: c.artifact_sentinel for c in table.columns if c.has_sentinel}
+        for row in conn.execute(tablecatalog.canonical_select(table)):
             values = ", ".join(
-                _lit(table.sentinels[c]) if c in table.sentinels else _lit(row[c])
-                for c in table.columns
+                _lit(sentinels[c]) if c in sentinels else _lit(row[c]) for c in table.names
             )
             parts.append(f"INSERT INTO {table.name} ({cols}) VALUES ({values});\n")
     blank = "".join(parts)
@@ -476,14 +210,9 @@ def materialize(conn: sqlite3.Connection, data: bytes) -> None:
 # completion only ever fills THESE, and only for artifacts whose header
 # schema-step predates the table's own step. Core tables (repositories,
 # commits, commit_verdicts, features, ...) are NEVER resurrected — an
-# artifact missing one is refused by _check_shape.
-_COMPLETE_STEPS: dict[str, int] = {
-    "ai_attribution": 4,
-    "ai_evidence": 4,
-    "pr_evidence": 5,
-    "pr_watermark": 6,
-    "pr_disclosure": 8,
-}
+# artifact missing one is refused by _check_shape. Declared in the
+# catalogue (minted_at per table); core tables never appear there.
+_COMPLETE_STEPS: dict[str, int] = tablecatalog.complete_steps()
 
 # Columns minted after their table (schema step 7): a replay whose body
 # created the table at its OLDER shape gets the column added (outside the
@@ -491,10 +220,9 @@ _COMPLETE_STEPS: dict[str, int] = {
 # replayable — pr_watermark's resume-marker merge date is NULL there, a
 # marker that claims no merge date. Completed only for artifacts whose
 # header stamp predates the column's step: a newer stamp carrying the old
-# shape is drift, and _check_shape refuses it.
-_COMPLETE_COLUMNS: dict[tuple[str, str], int] = {
-    ("pr_watermark", "last_merged_at"): 7,
-}
+# shape is drift, and _check_shape refuses it. Declared in the catalogue
+# (minted_at per column).
+_COMPLETE_COLUMNS: dict[tuple[str, str], int] = tablecatalog.complete_columns()
 
 
 def _schema_step_of(data: bytes) -> int:
@@ -517,7 +245,7 @@ def _complete_shape(conn: sqlite3.Connection, step: int) -> None:
     attribution) re-derives on the next walk. A mint that already claimed
     the table's step must carry it (no completion): missing core tables are
     never resurrected, and _check_shape refuses the artifact."""
-    for table in _TABLES:
+    for table in tablecatalog.artifact_tables():
         at_step = _COMPLETE_STEPS.get(table.name)
         if at_step is None or step >= at_step:
             continue
@@ -525,14 +253,15 @@ def _complete_shape(conn: sqlite3.Connection, step: int) -> None:
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table.name,)
         ).fetchone()
         if not exists:
-            conn.execute(table.ddl)
+            conn.execute(tablecatalog.artifact_ddl(table))
     for (tname, column), at_step in _COMPLETE_COLUMNS.items():
         if step >= at_step:
             continue
         cols = {str(r[1]) for r in conn.execute(f"PRAGMA table_info({tname})")}
         if cols and column not in cols:
             # a missing table is _check_shape's refusal, not ours to fill
-            conn.execute(f"ALTER TABLE {tname} ADD COLUMN {column} TEXT")
+            col = tablecatalog.table(tname).column(column)
+            conn.execute(f"ALTER TABLE {tname} ADD COLUMN {column} {col.type}")
 
 
 def stamp_schema_steps(conn: sqlite3.Connection, data: bytes) -> None:
@@ -557,7 +286,9 @@ def restore_into(conn: sqlite3.Connection, data: bytes) -> None:
     stamp_schema_steps(conn, data)
 
 
-KNOWN_TABLES: dict[str, tuple[str, ...]] = {t.name: t.columns for t in _TABLES}
+KNOWN_TABLES: dict[str, tuple[str, ...]] = {
+    t.name: t.names for t in tablecatalog.artifact_tables()
+}
 
 
 class MaterializeError(ValueError):
@@ -630,70 +361,17 @@ def _check_ownership(conn: sqlite3.Connection) -> None:
     """Defense in depth: an artifact is ONE repository's rows. Exactly one
     repositories row, and every row in every table must belong to it — a
     crafted artifact must not smuggle rows that relabel onto another repo
-    during ingest (the remap would silently adopt them)."""
+    during ingest (the remap would silently adopt them). The per-table
+    predicates derive from the catalogue's FK graph: one predicate per
+    reference to an in-artifact table (repositories by value, commits and
+    features by membership, nullable columns guarded)."""
     repos = conn.execute("SELECT id FROM repositories ORDER BY id").fetchall()
     if len(repos) != 1:
         raise MaterializeError(
             f"artifact refused: {len(repos)} repositories rows (expected exactly 1)"
         )
     rid = int(repos[0][0])
-    in_commits = "(SELECT id FROM commits)"
-    in_features = "(SELECT id FROM features)"
-    foreign = [
-        ("commits", f"SELECT COUNT(*) c FROM commits WHERE repo_id != {rid}"),
-        ("features", f"SELECT COUNT(*) c FROM features WHERE repo_id != {rid}"),
-        (
-            "commit_verdicts",
-            f"SELECT COUNT(*) c FROM commit_verdicts WHERE commit_id NOT IN {in_commits}",
-        ),
-        (
-            "ai_attribution",
-            f"SELECT COUNT(*) c FROM ai_attribution WHERE commit_id NOT IN {in_commits}",
-        ),
-        (
-            "ai_evidence",
-            f"SELECT COUNT(*) c FROM ai_evidence WHERE commit_id NOT IN {in_commits}",
-        ),
-        (
-            "pr_evidence",
-            f"SELECT COUNT(*) c FROM pr_evidence WHERE repo_id != {rid}"
-            f" OR (commit_id IS NOT NULL AND commit_id NOT IN {in_commits})",
-        ),
-        (
-            "pr_watermark",
-            f"SELECT COUNT(*) c FROM pr_watermark WHERE repo_id != {rid}",
-        ),
-        (
-            "pr_disclosure",
-            f"SELECT COUNT(*) c FROM pr_disclosure WHERE repo_id != {rid}",
-        ),
-        (
-            "commits_features",
-            f"SELECT COUNT(*) c FROM commits_features WHERE commit_id NOT IN {in_commits}"
-            f" OR feature_id NOT IN {in_features}",
-        ),
-        (
-            "fix_touches",
-            f"SELECT COUNT(*) c FROM fix_touches WHERE fix_commit_id NOT IN {in_commits}"
-            f" OR source_commit_id NOT IN {in_commits}",
-        ),
-        (
-            "fix_targets",
-            f"SELECT COUNT(*) c FROM fix_targets WHERE fix_commit_id NOT IN {in_commits}"
-            f" OR target_commit_id NOT IN {in_commits}",
-        ),
-        (
-            "fixes_features",
-            f"SELECT COUNT(*) c FROM fixes_features WHERE fix_commit_id NOT IN {in_commits}"
-            f" OR feature_id NOT IN {in_features}"
-            f" OR (via_fix_commit_id IS NOT NULL AND via_fix_commit_id NOT IN {in_commits})",
-        ),
-        (
-            "feature_line_samples",
-            f"SELECT COUNT(*) c FROM feature_line_samples WHERE feature_id NOT IN {in_features}",
-        ),
-    ]
-    for table, sql in foreign:
+    for table, sql in tablecatalog.ownership_checks(rid):
         n = int(conn.execute(sql).fetchone()[0])
         if n:
             raise MaterializeError(

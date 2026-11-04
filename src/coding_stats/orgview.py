@@ -24,11 +24,15 @@ curated shape:
   key as the deterministic fallback).
 
 Single-repo DBs pass through unchanged (org rules never fire).
+
+The copies' INSERT statements (column lists, conflict knobs, per-direction
+sentinels) come from the tablecatalog's orgview copy plans; the org RULES —
+winner selection, re-pointing, orphan purging — stay hand-written here.
 """
 
 import sqlite3
 
-from . import identity
+from . import identity, tablecatalog
 from .aiattr import strongest
 
 _PROJECTED_MARK = "_org_projected"
@@ -54,12 +58,10 @@ _base = identity.key_base
 
 
 def _project(conn: sqlite3.Connection) -> sqlite3.Connection:
-    from . import artifact  # lazy: artifact→htmlreport→metrics→orgview cycle
-
     out = sqlite3.connect(":memory:")
     out.row_factory = sqlite3.Row
-    for table in artifact._TABLES:
-        out.execute(table.ddl.strip())
+    for table in tablecatalog.artifact_tables():
+        out.execute(tablecatalog.artifact_ddl(table))
 
     _copy_repositories(conn, out)
     commit_map = _copy_commits(conn, out)  # dedup shas per repo base
@@ -71,47 +73,33 @@ def _project(conn: sqlite3.Connection) -> sqlite3.Connection:
     _copy_links(conn, out, commit_map)
     _repoint_dropped_features(conn, out, commit_map)
     _purge_orphaned_features(out)
-    for r in conn.execute("SELECT key, value FROM settings ORDER BY key"):
-        out.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (r["key"], r["value"]))
+    _copy_settings(conn, out)
     # gather's provenance/completeness table travels too: the least-complete
     # sampling rule reads it on the projection exactly as on the union
     if conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'union_artifacts'"
     ).fetchone():
-        out.execute(
-            """CREATE TABLE union_artifacts (
-                   repo_key TEXT PRIMARY KEY,
-                   artifact_sha256 TEXT NOT NULL,
-                   covered_through TEXT NOT NULL,
-                   backfill_state TEXT NOT NULL,
-                   unattributed_lines INTEGER NOT NULL,
-                   model TEXT NOT NULL,
-                   min_target_lines INTEGER NOT NULL,
-                   source_path TEXT NOT NULL
-               )"""
-        )
-        for r in conn.execute("SELECT * FROM union_artifacts ORDER BY repo_key"):
-            out.execute(
-                "INSERT INTO union_artifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                tuple(r),
-            )
+        out.execute(tablecatalog.fk_ddl(tablecatalog.table("union_artifacts")))
+        plan = tablecatalog.copy_plan("union_artifacts", "orgview")
+        for r in conn.execute(tablecatalog.plan_select_sql(plan)):
+            out.execute(tablecatalog.plan_insert_sql(plan), tablecatalog.plan_values(plan, r))
     out.execute(f"CREATE TABLE {_PROJECTED_MARK} (ok)")
     out.commit()
     return out
 
 
 def _copy_repositories(conn: sqlite3.Connection, out: sqlite3.Connection) -> None:
-    for r in conn.execute("SELECT * FROM repositories ORDER BY id"):
-        out.execute(
-            "INSERT INTO repositories (id, repo_key, slug, branch, clone_url, added_at)"
-            " VALUES (?, ?, ?, ?, ?, '')",
-            (r["id"], r["repo_key"], r["slug"], r["branch"], r["clone_url"]),
-        )
+    """added_at writes the '' wall-clock sentinel (the orgview knob): a
+    projection never carries the wall-clock value."""
+    plan = tablecatalog.copy_plan("repositories", "orgview")
+    for r in conn.execute(tablecatalog.plan_select_sql(plan)):
+        out.execute(tablecatalog.plan_insert_sql(plan), tablecatalog.plan_values(plan, r))
 
 
 def _copy_commits(conn: sqlite3.Connection, out: sqlite3.Connection) -> dict[int, int]:
     """Dedup Shared commits per (repo base, sha); returns loser-id -> winner-id
     re-pointing map (self-mapped when the winner)."""
+    plan = tablecatalog.copy_plan("commits", "orgview")
     bases = {
         int(r["id"]): _base(str(r["repo_key"]))
         for r in out.execute("SELECT id, repo_key FROM repositories")
@@ -122,33 +110,7 @@ def _copy_commits(conn: sqlite3.Connection, out: sqlite3.Connection) -> dict[int
     repoint: dict[int, int] = {}
     for _key, rows in sorted(groups.items()):
         winner = _winner_of(conn, rows)
-        out.execute(
-            "INSERT INTO commits (id, repo_id, sha, parent_sha, tree_sha, committed_at,"
-            " author_name, title, message, subject_patch_id, walk_index, kind, diff,"
-            " added_lines, deleted_lines, churn_lines)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            tuple(
-                winner[c]
-                for c in (
-                    "id",
-                    "repo_id",
-                    "sha",
-                    "parent_sha",
-                    "tree_sha",
-                    "committed_at",
-                    "author_name",
-                    "title",
-                    "message",
-                    "subject_patch_id",
-                    "walk_index",
-                    "kind",
-                    "diff",
-                    "added_lines",
-                    "deleted_lines",
-                    "churn_lines",
-                )
-            ),
-        )
+        out.execute(tablecatalog.plan_insert_sql(plan), tablecatalog.plan_values(plan, winner))
         for r in rows:
             repoint[int(r["id"])] = int(winner["id"])
     return repoint
@@ -182,22 +144,12 @@ def _copy_verdicts(
     conn: sqlite3.Connection, out: sqlite3.Connection, commit_map: dict[int, int]
 ) -> None:
     """Winner verdicts only: a projected commit keeps exactly one.``"""
-    for r in conn.execute("SELECT * FROM commit_verdicts ORDER BY commit_id"):
+    plan = tablecatalog.copy_plan("commit_verdicts", "orgview")
+    for r in conn.execute(tablecatalog.plan_select_sql(plan)):
         cid = int(r["commit_id"])
         if commit_map[cid] != cid:  # loser row: its verdict was superseded
             continue
-        out.execute(
-            "INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output,"
-            " model, run_id, classified_at) VALUES (?, ?, ?, ?, ?, NULL, ?)",
-            (
-                cid,
-                r["verdict"],
-                r["rationale"],
-                r["raw_llm_output"],
-                r["model"],
-                r["classified_at"],
-            ),
-        )
+        out.execute(tablecatalog.plan_insert_sql(plan), tablecatalog.plan_values(plan, r))
 
 
 def _copy_watermarks(conn: sqlite3.Connection, out: sqlite3.Connection) -> None:
@@ -205,19 +157,18 @@ def _copy_watermarks(conn: sqlite3.Connection, out: sqlite3.Connection) -> None:
     (ticket #36): run state recorded like the evidence rows — the resume
     marker's merge date and PR number together — copied verbatim, never
     derived here."""
-    for r in conn.execute("SELECT * FROM pr_watermark ORDER BY repo_id"):
-        out.execute(
-            "INSERT INTO pr_watermark (repo_id, last_pr_number, last_merged_at) VALUES (?, ?, ?)",
-            (r["repo_id"], r["last_pr_number"], r["last_merged_at"]),
-        )
+    plan = tablecatalog.copy_plan("pr_watermark", "orgview")
+    for r in conn.execute(tablecatalog.plan_select_sql(plan)):
+        out.execute(tablecatalog.plan_insert_sql(plan), tablecatalog.plan_values(plan, r))
 
 
 def _copy_disclosure(conn: sqlite3.Connection, out: sqlite3.Connection) -> None:
     """The PR-tier disclosure marker rides the projection per repository too
     (ADR-0007 clause 5): recorded state like the watermark — copied
     verbatim, never derived here — one row per repo whose PR tier has run."""
-    for r in conn.execute("SELECT repo_id FROM pr_disclosure ORDER BY repo_id"):
-        out.execute("INSERT INTO pr_disclosure (repo_id) VALUES (?)", (r["repo_id"],))
+    plan = tablecatalog.copy_plan("pr_disclosure", "orgview")
+    for r in conn.execute(tablecatalog.plan_select_sql(plan)):
+        out.execute(tablecatalog.plan_insert_sql(plan), tablecatalog.plan_values(plan, r))
 
 
 def _copy_attribution(
@@ -250,6 +201,8 @@ def _merge_git_attribution(
     """One ai_attribution row + the unioned ai_evidence rows for the copies
     of one Shared commit (ids in winner-first order; all rows land on the
     first id)."""
+    evidence = tablecatalog.copy_plan("ai_evidence", "orgview")
+    summary = tablecatalog.copy_plan("ai_attribution", "orgview")
     winner = cids[0]
     for cid in cids:
         for r in conn.execute(
@@ -257,9 +210,8 @@ def _merge_git_attribution(
             (cid,),
         ):
             out.execute(
-                "INSERT OR IGNORE INTO ai_evidence (commit_id, rule, raw, verdict)"
-                " VALUES (?, ?, ?, ?)",
-                (winner, r["rule"], r["raw"], r["verdict"]),
+                tablecatalog.plan_insert_sql(evidence),
+                tablecatalog.plan_values(evidence, r, overrides={"commit_id": winner}),
             )
     summaries = [
         r
@@ -275,9 +227,12 @@ def _merge_git_attribution(
     harness = next((r["harness"] for r in summaries if r["harness"] is not None), None)
     model = next((r["model"] for r in summaries if r["model"] is not None), None)
     out.execute(
-        "INSERT OR REPLACE INTO ai_attribution (commit_id, verdict, harness, model)"
-        " VALUES (?, ?, ?, ?)",
-        (winner, verdict, harness, model),
+        tablecatalog.plan_insert_sql(summary),
+        tablecatalog.plan_values(
+            summary,
+            summaries[0],
+            overrides={"commit_id": winner, "verdict": verdict, "harness": harness, "model": model},
+        ),
     )
 
 
@@ -293,42 +248,30 @@ def _copy_pr_evidence(
     (repo_id, pr_number, rule, raw). Channel precedence at consumption is
     the gather/report layer's rule (aiattr.effective_*) — the provenance
     column is what it acts on."""
+    plan = tablecatalog.copy_plan("pr_evidence", "orgview")
     seen_null: set[tuple[int, int, str, str]] = set()
     seen_mapped: set[tuple[int, int, str, str]] = set()
-    for r in conn.execute(
-        "SELECT * FROM pr_evidence ORDER BY repo_id, pr_number, commit_id, rule, raw"
-    ):
+    for r in conn.execute(tablecatalog.plan_select_sql(plan)):
         cid = r["commit_id"]
         key_prefix: tuple[int, int, str, str]
         if cid is None:
-            mapped = None
             key_prefix = (int(r["repo_id"]), int(r["pr_number"]), str(r["rule"]), str(r["raw"]))
             if key_prefix in seen_null:
                 continue
             seen_null.add(key_prefix)
         else:
-            mapped = commit_map[int(cid)]
-            key_prefix = (mapped, int(r["pr_number"]), str(r["rule"]), str(r["raw"]))
+            key_prefix = (
+                commit_map[int(cid)],
+                int(r["pr_number"]),
+                str(r["rule"]),
+                str(r["raw"]),
+            )
             if key_prefix in seen_mapped:
                 continue
             seen_mapped.add(key_prefix)
         out.execute(
-            "INSERT INTO pr_evidence (repo_id, pr_number, commit_id, rule, raw, verdict,"
-            " harness, model, channel, observed_at, suspicious)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                r["repo_id"],
-                r["pr_number"],
-                mapped,
-                r["rule"],
-                r["raw"],
-                r["verdict"],
-                r["harness"],
-                r["model"],
-                r["channel"],
-                r["observed_at"],
-                r["suspicious"],
-            ),
+            tablecatalog.plan_insert_sql(plan),
+            tablecatalog.plan_values(plan, r, commit_ids=commit_map),
         )
 
 
@@ -337,9 +280,12 @@ def _copy_features(
 ) -> dict[str, int]:
     """One feature row per feature id (duplicated, seeded ids collapse over
     a repo's keys); returns fid -> the owner's projected repo_id (the key
-    that won its defining sha's dedup; least Repository key fallback)."""
+    that won its defining sha's dedup; least Repository key fallback).
+    created_run_id writes NULL (the orgview knob: a projected feature keeps
+    no run provenance)."""
+    plan = tablecatalog.copy_plan("features", "orgview")
     groups: dict[str, list[sqlite3.Row]] = {}
-    for r in conn.execute("SELECT * FROM features ORDER BY repo_id, id"):
+    for r in conn.execute(tablecatalog.plan_select_sql(plan)):
         groups.setdefault(str(r["id"]), []).append(r)
     owner: dict[str, int] = {}
     for fid, rows in sorted(groups.items()):
@@ -360,17 +306,8 @@ def _copy_features(
         picked = next((r for r in rows if int(r["repo_id"]) == fid_owner), rows[0])
         owner[fid] = fid_owner
         out.execute(
-            "INSERT INTO features (id, title, about, title_history_json, created_at,"
-            " created_run_id, repo_id, live_lines) VALUES (?, ?, ?, ?, ?, NULL, ?, ?)",
-            (
-                fid,
-                picked["title"],
-                picked["about"],
-                picked["title_history_json"],
-                picked["created_at"],
-                fid_owner,
-                int(picked["live_lines"]),
-            ),
+            tablecatalog.plan_insert_sql(plan),
+            tablecatalog.plan_values(plan, picked, overrides={"repo_id": fid_owner}),
         )
     return owner
 
@@ -381,55 +318,37 @@ def _copy_links(
     """commits_features: winner rows verbatim (loser rows dropped — the
     winner's links represent the Shared commit). fix-side rows re-point at
     every commit reference onto its projected row."""
-    for r in conn.execute("SELECT * FROM commits_features ORDER BY commit_id, feature_id"):
+    plan = tablecatalog.copy_plan("commits_features", "orgview")
+    for r in conn.execute(tablecatalog.plan_select_sql(plan)):
         cid = int(r["commit_id"])
         if commit_map[cid] != cid:
             continue  # loser row: the winner's links apply
+        out.execute(tablecatalog.plan_insert_sql(plan), tablecatalog.plan_values(plan, r))
+    for name in ("fix_touches", "fix_targets"):
+        plan = tablecatalog.copy_plan(name, "orgview")
+        for r in conn.execute(tablecatalog.plan_select_sql(plan)):
+            out.execute(
+                tablecatalog.plan_insert_sql(plan),
+                tablecatalog.plan_values(plan, r, commit_ids=commit_map),
+            )
+    plan = tablecatalog.copy_plan("fixes_features", "orgview")
+    for r in conn.execute(tablecatalog.plan_select_sql(plan)):
         out.execute(
-            "INSERT OR IGNORE INTO commits_features (commit_id, feature_id, role) VALUES (?, ?, ?)",
-            (cid, str(r["feature_id"]), r["role"]),
-        )
-    for r in conn.execute("SELECT * FROM fix_touches ORDER BY fix_commit_id, source_commit_id"):
-        out.execute(
-            "INSERT OR IGNORE INTO fix_touches (fix_commit_id, source_commit_id, hit_lines)"
-            " VALUES (?, ?, ?)",
-            (
-                commit_map[int(r["fix_commit_id"])],
-                commit_map[int(r["source_commit_id"])],
-                int(r["hit_lines"]),
-            ),
-        )
-    for r in conn.execute("SELECT * FROM fix_targets ORDER BY fix_commit_id, target_commit_id"):
-        out.execute(
-            "INSERT OR IGNORE INTO fix_targets (fix_commit_id, target_commit_id) VALUES (?, ?)",
-            (commit_map[int(r["fix_commit_id"])], commit_map[int(r["target_commit_id"])]),
-        )
-    for r in conn.execute(
-        "SELECT * FROM fixes_features ORDER BY fix_commit_id, feature_id, via_fix_commit_id"
-    ):
-        via = r["via_fix_commit_id"]
-        out.execute(
-            "INSERT OR IGNORE INTO fixes_features (fix_commit_id, feature_id, via_fix_commit_id)"
-            " VALUES (?, ?, ?)",
-            (
-                commit_map[int(r["fix_commit_id"])],
-                str(r["feature_id"]),
-                commit_map[int(via)] if via is not None else None,
-            ),
+            tablecatalog.plan_insert_sql(plan),
+            tablecatalog.plan_values(plan, r, commit_ids=commit_map),
         )
     # Sample rows have no repo dimension either: a seeded id's (id, sha) row
-    # is ONE union row. Keys may disagree on the value; rows read in
-    # (feature_id, at_commit_sha, live_lines) order make the lowest value
-    # the deterministic winner of the IGNORE.
-    for r in conn.execute(
-        """SELECT feature_id, at_commit_sha, live_lines FROM feature_line_samples
-           ORDER BY feature_id, at_commit_sha, live_lines"""
-    ):
-        out.execute(
-            "INSERT OR IGNORE INTO feature_line_samples (feature_id, at_commit_sha, live_lines)"
-            " VALUES (?, ?, ?)",
-            (str(r["feature_id"]), str(r["at_commit_sha"]), int(r["live_lines"])),
-        )
+    # is ONE union row. Keys may disagree on the value; the plan's read order
+    # (lowest live_lines first) makes the OR IGNORE's winner deterministic.
+    plan = tablecatalog.copy_plan("feature_line_samples", "orgview")
+    for r in conn.execute(tablecatalog.plan_select_sql(plan)):
+        out.execute(tablecatalog.plan_insert_sql(plan), tablecatalog.plan_values(plan, r))
+
+
+def _copy_settings(conn: sqlite3.Connection, out: sqlite3.Connection) -> None:
+    plan = tablecatalog.copy_plan("settings", "orgview")
+    for r in conn.execute(tablecatalog.plan_select_sql(plan)):
+        out.execute(tablecatalog.plan_insert_sql(plan), tablecatalog.plan_values(plan, r))
 
 
 def _repoint_dropped_features(
