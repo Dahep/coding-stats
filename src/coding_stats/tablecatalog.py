@@ -8,8 +8,9 @@ copies) and the copies were deliberately non-uniform. This module is the ONE
 owner: every consumer derives its SQL from here.
 
 It is a LEAF: zero imports from the coding-stats package. artifact, schema,
-gather, orgview, db, recovery and migration all consume it; it imports
-nothing back, so the declaration can never depend on a consumer.
+gather and orgview consume it directly (db, recovery and migration reach it
+through artifact); it imports nothing back, so the declaration can never
+depend on a consumer.
 
 Declared per table:
 
@@ -69,6 +70,7 @@ ingest's one-repository defense), ``purge_statements`` +
 copy plans (``plan_insert_sql`` / ``plan_select_sql`` / ``plan_values``).
 """
 
+import re
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -81,6 +83,19 @@ Direction = Literal["gather", "orgview"]
 # table's step); core tables are NEVER resurrected — a replay missing one is
 # refused.
 CORE_STEP = 3
+
+# The ownership graph: every in-artifact reference must target one of these
+# (or ``runs``, whose provenance columns are machine-local and NULL in an
+# artifact). ownership_checks derives one predicate per reference to an owner.
+_OWNERS = frozenset({"repositories", "commits", "features"})
+
+# Artifact tables the repo-scoped purge never touches: repositories itself
+# (the union's identity rows are global), settings (derived, never copied),
+# and feature_line_samples (no repo dimension — swept by feature instead).
+_PURGE_UNSCOPED = ("repositories", "settings", "feature_line_samples")
+
+# The closed set of copy-plan modes (plan_values dispatches on these).
+_MODES = ("verbatim", "literal", "repo_id", "commit_ids", "nullable_commit_ids", "override")
 
 _UNSET = object()  # marks "column carries no Artifact sentinel"
 
@@ -556,8 +571,6 @@ _PLANS: tuple[CopyPlan, ...] = (
             CopyColumn("model", "override"),
         ),
     ),
-    # ai_evidence, orgview: OR IGNORE — every copy's git evidence lands on
-    # the winner, deduped on (rule, raw).
     CopyPlan(
         "ai_evidence",
         "gather",
@@ -568,6 +581,8 @@ _PLANS: tuple[CopyPlan, ...] = (
             CopyColumn("verdict", "verbatim"),
         ),
     ),
+    # ai_evidence, orgview: OR IGNORE — every copy's git evidence lands on
+    # the winner, deduped on (rule, raw).
     CopyPlan(
         "ai_evidence",
         "orgview",
@@ -848,8 +863,25 @@ def _validate() -> None:
             raise RuntimeError(f"table {t.name} declares a column twice")
         if not set(t.order_by) <= set(names):
             raise RuntimeError(f"table {t.name}: order_by outside its columns")
+        if t.order_by and not any(
+            uniq[: len(t.order_by)] == t.order_by for uniq in _unique_sets(t)
+        ):
+            raise RuntimeError(
+                f"{t.name}: order_by {t.order_by} prefixes no declared UNIQUE set"
+                " — the canonical SELECT would not be a total order"
+            )
         if t.settings_filter and t.name != "settings":
             raise RuntimeError(f"settings_filter on non-settings table {t.name}")
+        if t.in_artifact and t.minted_at is None:
+            raise RuntimeError(f"{t.name}: artifact table without a minted_at step")
+        if t.in_artifact and not any(
+            c.ref is not None and c.ref.table in ("repositories", "commits")
+            for c in t.columns
+        ) and t.name not in _PURGE_UNSCOPED:
+            raise RuntimeError(
+                f"{t.name}: holds repo rows but the purge cannot scope it"
+                " (no repositories/commits reference)"
+            )
         for c in t.columns:
             if c.minted_at is not None and t.minted_at is not None and c.minted_at <= t.minted_at:
                 raise RuntimeError(
@@ -857,6 +889,16 @@ def _validate() -> None:
                 )
             if c.ref is not None and c.ref.table not in (*_seen_before(seen, t.name), "runs"):
                 raise RuntimeError(f"{t.name}.{c.name} references undeclared {c.ref.table}")
+            if t.in_artifact and c.ref is not None and c.ref.table not in (*_OWNERS, "runs"):
+                raise RuntimeError(
+                    f"{t.name}.{c.name}: reference to {c.ref.table} is outside the"
+                    " ownership graph — the one-repository defense would not see it"
+                )
+            if c.ref is not None and c.ref.table == "features" and c.name != "feature_id":
+                raise RuntimeError(
+                    f"{t.name}.{c.name}: the feature sweep's DELETE hardcodes"
+                    " feature_id — a features reference must carry that name"
+                )
     for plan in _PLANS:
         t = table(plan.table)
         declared = t.names
@@ -871,6 +913,61 @@ def _validate() -> None:
             raise RuntimeError(f"{plan.table} must not carry a gather plan")
         if plan.order_by is not None and not set(plan.order_by) <= set(declared):
             raise RuntimeError(f"{plan.table}/{plan.direction}: order_by outside columns")
+        for pc in plan.columns:
+            if pc.mode not in _MODES:
+                raise RuntimeError(
+                    f"{plan.table}/{plan.direction}: unknown copy mode {pc.mode!r}"
+                )
+            if pc.mode in ("commit_ids", "nullable_commit_ids"):
+                col = t.column(pc.name)
+                if col.ref is None or col.ref.table != "commits":
+                    raise RuntimeError(
+                        f"{plan.table}/{plan.direction}.{pc.name}: commit remap on a"
+                        " column that does not reference commits"
+                    )
+                if pc.mode == "nullable_commit_ids" and not col.nullable:
+                    raise RuntimeError(
+                        f"{plan.table}/{plan.direction}.{pc.name}: nullable remap on"
+                        " a NOT NULL column (use commit_ids)"
+                    )
+            if pc.mode == "repo_id":
+                col = t.column(pc.name)
+                if col.ref is None or col.ref.table != "repositories":
+                    raise RuntimeError(
+                        f"{plan.table}/{plan.direction}.{pc.name}: repo_id mode on a"
+                        " column that does not reference repositories"
+                    )
+    # Plan coverage: a declared artifact table without a copy plan is purged
+    # but never re-inserted — silent data loss in the union. Required HERE,
+    # at import, not only in tests.
+    for t in artifact_tables():
+        for direction in ("gather", "orgview"):
+            if direction == "gather" and t.name in _NO_GATHER_PLAN:
+                continue
+            try:
+                copy_plan(t.name, direction)
+            except KeyError:
+                raise RuntimeError(
+                    f"{t.name}: no {direction} copy plan — every artifact table"
+                    " declares both directions (settings excepted for gather)"
+                ) from None
+    # The purge's DELETE order must be FK-safe: every purged physical parent
+    # comes after all its purged physical children.
+    order = [sql.split()[2] for sql, _n in purge_statements()]
+    position = {name: i for i, name in enumerate(order)}
+    for t in artifact_tables():
+        if t.name not in position:
+            continue
+        for c in t.columns:
+            if (
+                c.ref is not None
+                and c.ref.physical
+                and c.ref.table in position
+                and position[t.name] > position[c.ref.table]
+            ):
+                raise RuntimeError(
+                    f"purge deletes {c.ref.table} before its child {t.name}"
+                )
 
 
 def _seen_before(seen: set[str], name: str) -> set[str]:
@@ -883,7 +980,18 @@ def _seen_before(seen: set[str], name: str) -> set[str]:
     return seen & out
 
 
-_validate()
+def _unique_sets(t: Table) -> tuple[tuple[str, ...], ...]:
+    """Every declared unique column set: table-level PRIMARY KEY / UNIQUE
+    constraints plus inline PRIMARY KEY decls."""
+    out: list[tuple[str, ...]] = []
+    for c in t.columns:
+        if "PRIMARY KEY" in c.decl:
+            out.append((c.name,))
+    for cons in t.table_constraints:
+        m = re.match(r"(?:PRIMARY KEY|UNIQUE) \(([^)]*)\)$", cons)
+        if m:
+            out.append(tuple(x.strip() for x in m.group(1).split(",")))
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------
@@ -968,12 +1076,11 @@ def ownership_checks(rid: int) -> list[tuple[str, str]]:
     in-artifact table. References to ``runs`` are skipped — the runs table is
     machine-local and absent from an artifact; its provenance columns are
     NULL there by curation."""
-    owners = {"repositories", "commits", "features"}
     out: list[tuple[str, str]] = []
     for t in artifact_tables():
         preds: list[str] = []
         for c in t.columns:
-            if c.ref is None or c.ref.table not in owners:
+            if c.ref is None or c.ref.table not in _OWNERS:
                 continue
             if c.ref.table == "repositories":
                 preds.append(f"{c.name} != {rid}")
@@ -1005,7 +1112,7 @@ def purge_statements() -> list[tuple[str, int]]:
     out: list[tuple[str, str]] = []
     last: list[tuple[str, str]] = []
     for t in artifact_tables():
-        if t.name in ("repositories", "settings", "feature_line_samples"):
+        if t.name in _PURGE_UNSCOPED:
             continue
         repo_scoped = any(
             c.ref is not None and c.ref.table == "repositories" for c in t.columns
@@ -1095,3 +1202,10 @@ def plan_values(
         else:  # pragma: no cover - _validate keeps modes closed
             raise RuntimeError(f"unknown copy mode {c.mode!r}")
     return tuple(out)
+
+
+# Import-time validation runs last: it consumes the generators
+# (purge_statements) and every lookup above, so a drifting declaration or
+# copy plan fails the import — in tests AND in production — before any
+# consumer derives SQL from a shape that does not hold together.
+_validate()

@@ -830,7 +830,12 @@ def test_every_table_round_trips_through_the_purge_and_reinsert(tmp_path, repo):
             " JOIN commits c ON c.id = f.fix_commit_id",
         )
     }
-    assert fixes[rid_b] is None and fixes[rid_a] is not None  # A's via was set, remapped
+    # A's via was set (artifact-local commit id 1) and remapped onto A's
+    # union-space commit with walk_index 1; B's stays NULL.
+    a_via = _rows(
+        union, f"SELECT id FROM commits WHERE repo_id = {rid_a} AND walk_index = 1"
+    )[0]["id"]
+    assert fixes[rid_a] == a_via and fixes[rid_b] is None
     samples = {
         r["live_lines"]
         for r in _rows(union, "SELECT DISTINCT live_lines FROM feature_line_samples")
