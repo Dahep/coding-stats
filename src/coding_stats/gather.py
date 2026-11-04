@@ -33,23 +33,16 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import artifact, datastore, db, identity
+from . import artifact, datastore, db, identity, tablecatalog
 
 STORE_REL = datastore.STORE_TREE
 _STORE_TREE_PATH = datastore.STORE_TREE
 
-_UNION_ARTIFACTS_DDL = """
-CREATE TABLE IF NOT EXISTS union_artifacts (
-    repo_key TEXT PRIMARY KEY,
-    artifact_sha256 TEXT NOT NULL,
-    covered_through TEXT NOT NULL,
-    backfill_state TEXT NOT NULL,
-    unattributed_lines INTEGER NOT NULL,
-    model TEXT NOT NULL,
-    min_target_lines INTEGER NOT NULL,
-    source_path TEXT NOT NULL
+# Union-only metadata table: its shape is catalogued (orgview's projection
+# used to re-type it by hand); gather creates it, never a schema step.
+_UNION_ARTIFACTS_DDL = tablecatalog.fk_ddl(
+    tablecatalog.table("union_artifacts"), if_not_exists=True
 )
-"""
 
 
 class GatherError(RuntimeError):
@@ -288,7 +281,14 @@ def _refuse_drifted_feature_ids(conn: sqlite3.Connection) -> None:
 def _upsert(conn: sqlite3.Connection, item: _Ingest) -> None:
     """Replace (or add) one repository's rows in the union, remapping
     artifact-local commit ids into union-space ints (deterministic: assigned
-    in ingest order). Feature ids are prefixed TEXT and copy verbatim."""
+    in ingest order). Feature ids are prefixed TEXT and copy verbatim.
+
+    Every INSERT derives from the catalogue's gather copy plans: the column
+    lists, the per-column modes (verbatim / literal / repo_id / commit-id
+    remap / override), and the per-table conflict knobs (plain INSERT as the
+    drift guard, OR REPLACE for feature_line_samples' last-wins) are declared
+    there. commits is special-cased: its union ids are assigned here, in
+    order, building the remap every other plan consumes."""
     old = conn.execute("SELECT id FROM repositories WHERE repo_key = ?", (item.key,)).fetchone()
     if old is not None:
         repo_id = int(old["id"])
@@ -302,148 +302,24 @@ def _upsert(conn: sqlite3.Connection, item: _Ingest) -> None:
     next_id_row = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 n FROM commits").fetchone()
     next_id = int(next_id_row["n"])
     commit_ids: dict[int, int] = {}
-    for r in src.execute("SELECT * FROM commits ORDER BY id"):
+    commits = tablecatalog.copy_plan("commits", "gather")
+    for r in src.execute(tablecatalog.plan_select_sql(commits)):
         commit_ids[int(r["id"])] = next_id
         conn.execute(
-            """INSERT INTO commits (id, repo_id, sha, parent_sha, tree_sha, committed_at,
-               author_name, title, message, subject_patch_id, walk_index, kind, diff,
-               added_lines, deleted_lines, churn_lines)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                next_id,
-                repo_id,
-                r["sha"],
-                r["parent_sha"],
-                r["tree_sha"],
-                r["committed_at"],
-                r["author_name"],
-                r["title"],
-                r["message"],
-                r["subject_patch_id"],
-                r["walk_index"],
-                r["kind"],
-                r["diff"],
-                r["added_lines"],
-                r["deleted_lines"],
-                r["churn_lines"],
-            ),
+            tablecatalog.plan_insert_sql(commits),
+            tablecatalog.plan_values(commits, r, repo_id=repo_id, overrides={"id": next_id}),
         )
         next_id += 1
-
-    for r in src.execute("SELECT * FROM features ORDER BY rowid"):
-        conn.execute(
-            """INSERT INTO features (id, title, about, title_history_json, created_at,
-               created_run_id, repo_id, live_lines) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                r["id"],
-                r["title"],
-                r["about"],
-                r["title_history_json"],
-                r["created_at"],
-                r["created_run_id"],
-                repo_id,
-                r["live_lines"],
-            ),
-        )
-    for r in src.execute("SELECT * FROM commit_verdicts ORDER BY commit_id"):
-        conn.execute(
-            """INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output,
-               model, run_id, classified_at) VALUES (?, ?, ?, ?, ?, NULL, ?)""",
-            (
-                commit_ids[int(r["commit_id"])],
-                r["verdict"],
-                r["rationale"],
-                r["raw_llm_output"],
-                r["model"],
-                r["classified_at"],
-            ),
-        )
-    for r in src.execute("SELECT * FROM ai_attribution ORDER BY commit_id"):
-        conn.execute(
-            "INSERT INTO ai_attribution (commit_id, verdict, harness, model) VALUES (?, ?, ?, ?)",
-            (commit_ids[int(r["commit_id"])], r["verdict"], r["harness"], r["model"]),
-        )
-    for r in src.execute("SELECT * FROM ai_evidence ORDER BY commit_id, rule, raw"):
-        conn.execute(
-            "INSERT INTO ai_evidence (commit_id, rule, raw, verdict) VALUES (?, ?, ?, ?)",
-            (commit_ids[int(r["commit_id"])], r["rule"], r["raw"], r["verdict"]),
-        )
-    for r in src.execute(
-        "SELECT * FROM pr_evidence ORDER BY repo_id, pr_number, commit_id, rule, raw"
-    ):
-        conn.execute(
-            "INSERT INTO pr_evidence (repo_id, pr_number, commit_id, rule, raw, verdict,"
-            " harness, model, channel, observed_at, suspicious)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                repo_id,
-                r["pr_number"],
-                commit_ids[int(r["commit_id"])] if r["commit_id"] is not None else None,
-                r["rule"],
-                r["raw"],
-                r["verdict"],
-                r["harness"],
-                r["model"],
-                r["channel"],
-                r["observed_at"],
-                r["suspicious"],
-            ),
-        )
-    for r in src.execute("SELECT * FROM pr_watermark ORDER BY repo_id"):
-        # the resume marker is recorded state like the evidence rows: it
-        # rides the union per repo (merge date and PR number together) and
-        # is replaced wholesale on re-ingest
-        conn.execute(
-            "INSERT INTO pr_watermark (repo_id, last_pr_number, last_merged_at) VALUES (?, ?, ?)",
-            (repo_id, r["last_pr_number"], r["last_merged_at"]),
-        )
-    if src.execute("SELECT 1 FROM pr_disclosure LIMIT 1").fetchone() is not None:
-        # the PR-tier disclosure marker rides the union per repo too: one
-        # row per repo whose tier has run, remapped like the watermark and
-        # replaced wholesale on re-ingest
-        conn.execute("INSERT INTO pr_disclosure (repo_id) VALUES (?)", (repo_id,))
-    for r in src.execute("SELECT * FROM commits_features ORDER BY commit_id, feature_id"):
-        conn.execute(
-            "INSERT INTO commits_features (commit_id, feature_id, role) VALUES (?, ?, ?)",
-            (commit_ids[int(r["commit_id"])], r["feature_id"], r["role"]),
-        )
-    for r in src.execute("SELECT * FROM fix_touches ORDER BY fix_commit_id, source_commit_id"):
-        conn.execute(
-            "INSERT INTO fix_touches (fix_commit_id, source_commit_id, hit_lines) VALUES (?, ?, ?)",
-            (
-                commit_ids[int(r["fix_commit_id"])],
-                commit_ids[int(r["source_commit_id"])],
-                r["hit_lines"],
-            ),
-        )
-    for r in src.execute("SELECT * FROM fix_targets ORDER BY fix_commit_id, target_commit_id"):
-        conn.execute(
-            "INSERT INTO fix_targets (fix_commit_id, target_commit_id) VALUES (?, ?)",
-            (commit_ids[int(r["fix_commit_id"])], commit_ids[int(r["target_commit_id"])]),
-        )
-    for r in src.execute(
-        "SELECT * FROM fixes_features ORDER BY fix_commit_id, feature_id, via_fix_commit_id"
-    ):
-        via = r["via_fix_commit_id"]
-        conn.execute(
-            "INSERT INTO fixes_features (fix_commit_id, feature_id, via_fix_commit_id)"
-            " VALUES (?, ?, ?)",
-            (
-                commit_ids[int(r["fix_commit_id"])],
-                r["feature_id"],
-                commit_ids[int(via)] if via is not None else None,
-            ),
-        )
-    for r in src.execute("SELECT * FROM feature_line_samples ORDER BY feature_id, at_commit_sha"):
-        # a duplicated (seeded) feature id's sample row is shared in the
-        # union (keyed (feature_id, at_commit_sha) with no repo dimension):
-        # re-gathering a key REPLACES the row with its newest artifact's
-        # value (last-wins, matching union_artifacts), never duplicating
-        conn.execute(
-            "INSERT OR REPLACE INTO feature_line_samples (feature_id, at_commit_sha, live_lines)"
-            " VALUES (?, ?, ?)",
-            (r["feature_id"], r["at_commit_sha"], r["live_lines"]),
-        )
+    for name in tablecatalog.copy_tables("gather"):
+        if name in ("repositories", "commits"):
+            continue  # repositories: inserted above from the canonicalized identity
+        plan = tablecatalog.copy_plan(name, "gather")
+        for r in src.execute(tablecatalog.plan_select_sql(plan)):
+            conn.execute(
+                tablecatalog.plan_insert_sql(plan),
+                tablecatalog.plan_values(plan, r, repo_id=repo_id, commit_ids=commit_ids),
+            )
+    # union-only provenance rides the ingest's own fields, not a source row
     conn.execute(
         """INSERT OR REPLACE INTO union_artifacts (repo_key, artifact_sha256, covered_through,
            backfill_state, unattributed_lines, model, min_target_lines, source_path)
@@ -464,53 +340,45 @@ def _upsert(conn: sqlite3.Connection, item: _Ingest) -> None:
 def _insert_repo(conn: sqlite3.Connection, item: _Ingest, repo_id: int) -> None:
     row = item.rows.execute("SELECT * FROM repositories ORDER BY id LIMIT 1").fetchone()
     assert row is not None
+    plan = tablecatalog.copy_plan("repositories", "gather")
     conn.execute(
-        "INSERT OR REPLACE INTO repositories (id, repo_key, slug, branch, clone_url, added_at)"
-        " VALUES (?, ?, ?, ?, ?, ?)",
-        (repo_id, item.key, item.slug, row["branch"], item.clone_url, row["added_at"]),
+        tablecatalog.plan_insert_sql(plan),
+        tablecatalog.plan_values(
+            plan,
+            row,
+            overrides={
+                "id": repo_id,
+                "repo_key": item.key,
+                "slug": item.slug,
+                "clone_url": item.clone_url,
+            },
+        ),
     )
 
 
 def _purge_repo(conn: sqlite3.Connection, repo_id: int) -> None:
     """Drop one repository's union rows (children first: FK enforcement is
-    on). Feature-scoped rows in the dimension-less dependent tables
-    (feature_line_samples, fixes_features, commits_features) are NOT scoped
-    by feature ownership here — a seeded feature id legitimately lives under
-    SEVERAL keys of one repo, so this key's purge must never reach another
-    key's rows. They are instead swept afterwards as orphans: rows whose
-    feature id no longer exists under ANY key (the feature was purged
-    everywhere)."""
-    where = "IN (SELECT id FROM commits WHERE repo_id = ?)"
-    conn.execute(f"DELETE FROM commit_verdicts WHERE commit_id {where}", (repo_id,))
-    conn.execute(f"DELETE FROM ai_evidence WHERE commit_id {where}", (repo_id,))
-    conn.execute(f"DELETE FROM ai_attribution WHERE commit_id {where}", (repo_id,))
-    conn.execute("DELETE FROM pr_evidence WHERE repo_id = ?", (repo_id,))
-    conn.execute("DELETE FROM pr_watermark WHERE repo_id = ?", (repo_id,))
-    conn.execute("DELETE FROM pr_disclosure WHERE repo_id = ?", (repo_id,))
-    conn.execute(f"DELETE FROM commits_features WHERE commit_id {where}", (repo_id,))
-    conn.execute(
-        f"DELETE FROM fix_touches WHERE fix_commit_id {where} OR source_commit_id {where}",
-        (repo_id, repo_id),
-    )
-    conn.execute(
-        f"DELETE FROM fix_targets WHERE fix_commit_id {where} OR target_commit_id {where}",
-        (repo_id, repo_id),
-    )
-    conn.execute(
-        f"DELETE FROM fixes_features WHERE fix_commit_id {where} OR via_fix_commit_id {where}",
-        (repo_id, repo_id),
-    )
-    conn.execute("DELETE FROM features WHERE repo_id = ?", (repo_id,))
-    conn.execute("DELETE FROM commits WHERE repo_id = ?", (repo_id,))
+    on; the DELETEs derive from the catalogue's FK graph). Feature-scoped
+    rows in the dimension-less dependent tables (feature_line_samples,
+    fixes_features, commits_features) are NOT scoped by feature ownership
+    here — a seeded feature id legitimately lives under SEVERAL keys of one
+    repo, so this key's purge must never reach another key's rows. They are
+    instead swept afterwards as orphans: rows whose feature id no longer
+    exists under ANY key (the feature was purged everywhere)."""
+    for sql, arity in tablecatalog.purge_statements():
+        conn.execute(sql, (repo_id,) * arity)
     _sweep_orphaned_feature_rows(conn)
 
 
 def _sweep_orphaned_feature_rows(conn: sqlite3.Connection) -> None:
     """Feature-scoped rows whose feature id exists under NO key anymore
     (the same purge rule the walk applies to features without defining
-    commits). Rows for ids still alive under another key stay."""
-    for table in ("feature_line_samples", "fixes_features", "commits_features"):
-        conn.execute(f"DELETE FROM {table} WHERE feature_id NOT IN (SELECT id FROM features)")
+    commits). Rows for ids still alive under another key stay. The swept
+    tables are the catalogue's feature-scoped, dimension-less set."""
+    for name in tablecatalog.feature_sweep_tables():
+        conn.execute(
+            f"DELETE FROM {name} WHERE feature_id NOT IN (SELECT id FROM features)"
+        )
 
 
 def _write_union_settings(conn: sqlite3.Connection) -> None:
