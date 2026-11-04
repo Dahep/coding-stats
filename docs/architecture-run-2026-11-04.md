@@ -79,8 +79,7 @@ every PR's body carries its merge-danger notes.
 ## Known follow-ups recorded during the run
 
 - `attribution_trend`'s month normalization and its fix-verdict gate are pre-existing
-  divergences, observed during the #61 review and not yet filed as an issue — follow-up
-  issue worthy.
+  divergences, observed during the #61 review and now filed: issue #65.
 - Historical `feature_line_samples` rows keep old attribution after a raised
   `min_target_lines` until the next backfill sweep trigger (noted to #48).
 - DESIGN.md still carries stale bullets (two "Feature size"/"Identity" pairs; the
