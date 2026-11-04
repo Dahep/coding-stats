@@ -41,10 +41,12 @@ footers, PR author identity, head branch name) through ``pr_matches``.
 This leaf also owns the shared resolution vocabulary: the channel
 constants, the disclosure line, and the ONE verdict ladder
 (``VERDICT_STRENGTH``/``strongest``) plus the canonical per-commit
-resolution (``resolve`` — ONE evidence read carrying the Attribution, the
-resolved channel and the channel-tagged rows) every layer resolves through,
-with ``effective_evidence`` as its row-level view (the summary view is
-``resolve(...).attribution``) — pure DB readers, no git, no network.
+resolution (``resolve`` — exactly ONE SQL read per commit carrying the
+Attribution, the resolved channel and the channel-tagged contribution rows
+with their identity columns) every layer resolves through, with
+``effective_evidence`` as its row-level view and the ONE-read statement
+itself (the summary view is ``resolve(...).attribution``) — pure DB
+readers, no git, no network.
 """
 
 import re
@@ -492,39 +494,75 @@ def record(conn: sqlite3.Connection, commit_id: int, facts: CommitFacts) -> Attr
 # --------------------------------------------------------------------------
 
 
-def effective_evidence(conn: sqlite3.Connection, commit_id: int) -> list[tuple[str, str, str, str]]:
-    """(channel, rule, raw, verdict) contributing rows of one commit, the
-    git channel first (it outranks inherited PR evidence). Suspicious PR
-    rows never contribute — they are audit records, not attribution."""
-    out: list[tuple[str, str, str, str]] = []
-    for channel, sql, args in (
-        (
-            CHANNEL_GIT,
-            "SELECT rule, raw, verdict FROM ai_evidence WHERE commit_id = ?",
-            (commit_id,),
-        ),
-        (
-            CHANNEL_PR,
-            "SELECT rule, raw, verdict FROM pr_evidence WHERE commit_id = ? AND suspicious = 0",
-            (commit_id,),
-        ),
+@dataclass(frozen=True)
+class Contribution:
+    """One contributing row of a commit's resolution: the channel it came
+    from, the rule-table match (rule/raw/verdict) and the identity columns
+    its channel names — a git row carries the walk's own summary claim
+    (``ai_attribution``'s harness/model for the commit), a PR row the
+    identity recorded on the PR-channel observation. Suspicious PR rows
+    never appear here (audit records, never attribution)."""
+
+    channel: str  # CHANNEL_GIT | CHANNEL_PR
+    rule: str
+    raw: str
+    verdict: str  # 'yes' | 'possible'
+    harness: str | None
+    model: str | None
+
+
+def effective_evidence(conn: sqlite3.Connection, commit_id: int) -> list[Contribution]:
+    """One commit's contributing rows in ONE read, the git channel first (it
+    outranks inherited PR-channel evidence), each channel's rows ranked by
+    the rule table. The exact read contract, ONE SQL statement per commit:
+
+    ``ai_evidence`` joined to the walk's own summary (``ai_attribution`` —
+    the git channel's harness/model ride the git rows, so the identity
+    claim needs no second pass through the evidence tables), UNION ALL
+    ``pr_evidence`` with the suspicious filter applied here, and only
+    here — each table read exactly once per commit. A summary row with no
+    git evidence row of its own does not surface (the walk records the
+    summary and its rows together)."""
+    rows: list[Contribution] = []
+    for r in conn.execute(
+        """SELECT 'git' AS channel, e.rule AS rule, e.raw AS raw,
+                  e.verdict AS verdict, a.harness AS harness, a.model AS model
+             FROM ai_evidence e
+             LEFT JOIN ai_attribution a ON a.commit_id = e.commit_id
+            WHERE e.commit_id = :cid
+            UNION ALL
+           SELECT 'pr', rule, raw, verdict, harness, model
+             FROM pr_evidence
+            WHERE commit_id = :cid AND suspicious = 0""",
+        {"cid": commit_id},
     ):
-        for r in conn.execute(sql, args):
-            out.append((channel, str(r["rule"]), str(r["raw"]), str(r["verdict"])))
-    out.sort(key=lambda t: (0 if t[0] == CHANNEL_GIT else 1, RULE_RANK.get(t[1], 99), t[2]))
-    return out
+        rows.append(
+            Contribution(
+                str(r["channel"]),
+                str(r["rule"]),
+                str(r["raw"]),
+                str(r["verdict"]),
+                str(r["harness"]) if r["harness"] is not None else None,
+                str(r["model"]) if r["model"] is not None else None,
+            )
+        )
+    rows.sort(
+        key=lambda c: (0 if c.channel == CHANNEL_GIT else 1, RULE_RANK.get(c.rule, 99), c.raw)
+    )
+    return rows
 
 
 @dataclass(frozen=True)
 class Resolution:
     """One commit's canonical consumption resolution: the existing
     Attribution plus the channel that contributed evidence (``''`` when none
-    did) and the channel-tagged contributing rows — all derived from ONE
+    did) and the channel-tagged contributing rows, each carrying its
+    channel and its identity columns — all derived from ONE
     ``effective_evidence`` read."""
 
     attribution: Attribution
     channel: str  # '' | CHANNEL_GIT | CHANNEL_PR
-    tagged: tuple[tuple[str, str, str, str], ...]  # (channel, rule, raw, verdict)
+    tagged: tuple[Contribution, ...]
 
 
 def resolve(conn: sqlite3.Connection, commit_id: int) -> Resolution:
@@ -535,41 +573,24 @@ def resolve(conn: sqlite3.Connection, commit_id: int) -> Resolution:
     * the verdict is the strongest tier of the contributing rows — a
       signature matched anywhere (git commit text or a mapped head commit)
       is still a signature match;
-    * the identity claims (harness/model) resolve git-first: the walk's own
-      summary, then PR rows only where the git evidence is silent;
+    * the identity claims (harness/model) resolve git-first: the git rows
+      carry the walk's own summary claim (the former second identity read
+      is folded into ``effective_evidence``), so a git claim fills first
+      and PR rows only fill what it leaves silent — per field, in the
+      rows' ranked order;
     * the channel is the strongest channel that contributed evidence —
       ``git`` when the walk recorded any row, else ``pr``, else ``''`` —
       ONE channel rule, owned here;
     * suspicious rows contribute nothing, ever.
 
-    The contributing rows are read ONCE (one ``effective_evidence`` call):
-    the resolved channel and the tagged rows derive from that same read.
-    """
-    evs = effective_evidence(conn, commit_id)
-    rows = tuple(Evidence(rule, raw, verdict) for _, rule, raw, verdict in evs)
-    verdict = strongest(e.verdict for e in rows)
-    harness: str | None = None
-    model: str | None = None
-    git = conn.execute(
-        "SELECT harness, model FROM ai_attribution WHERE commit_id = ?", (commit_id,)
-    ).fetchone()
-    if git is not None:
-        harness = str(git["harness"]) if git["harness"] is not None else None
-        model = str(git["model"]) if git["model"] is not None else None
-    if harness is None or model is None:
-        prs = conn.execute(
-            "SELECT rule, raw, harness, model FROM pr_evidence"
-            " WHERE commit_id = ? AND suspicious = 0",
-            (commit_id,),
-        ).fetchall()
-        prs.sort(key=lambda r: (RULE_RANK.get(str(r["rule"]), 99), str(r["raw"])))
-        for r in prs:
-            if harness is None and r["harness"] is not None:
-                harness = str(r["harness"])
-            if model is None and r["model"] is not None:
-                model = str(r["model"])
-            if harness is not None and model is not None:
-                break
-    channels = {ch for ch, _rule, _raw, _v in evs}
+    The resolution runs NO query of its own: verdict, channel, tagged rows
+    and identity claims all derive from the single ``effective_evidence``
+    statement (ONE SQL statement per commit — see its read contract)."""
+    rows = tuple(effective_evidence(conn, commit_id))
+    verdict = strongest(c.verdict for c in rows)
+    harness = next((c.harness for c in rows if c.harness is not None), None)
+    model = next((c.model for c in rows if c.model is not None), None)
+    channels = {c.channel for c in rows}
     channel = CHANNEL_GIT if CHANNEL_GIT in channels else (CHANNEL_PR if channels else "")
-    return Resolution(Attribution(verdict, harness, model, rows), channel, tuple(evs))
+    evidence = tuple(Evidence(c.rule, c.raw, c.verdict) for c in rows)
+    return Resolution(Attribution(verdict, harness, model, evidence), channel, rows)
