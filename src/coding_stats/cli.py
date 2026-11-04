@@ -9,13 +9,93 @@ import argparse
 import json
 import sqlite3
 import sys
+from dataclasses import dataclass, fields
+from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import aiattr, ci, datastore, db, gitwalk, identity, prsource, prsweep
 from .classify import DEFAULT_MODEL, SESSION_DIR, Session, classify_pending
 from .lineage import close_lineage
 from .targets import annotate_all
+
+if TYPE_CHECKING:
+    _SubParsers = argparse._SubParsersAction[argparse.ArgumentParser]
+
+
+class StoreLayout(Enum):
+    """Which committed store a run executes against: the default Data branch
+    (ADR-0006) or the legacy store still committed on the Target branch —
+    the migrate verb regenerates the artifact ON the Target checkout
+    (ADR-0006 clause 6), and the update skips tied to the Data-branch
+    machinery must not apply there."""
+
+    DATA_BRANCH = "data-branch"
+    LEGACY_COMMITTED = "legacy-committed"
+
+
+@dataclass(frozen=True)
+class UpdateOptions:
+    """The update verb's options. The argparse boundary for `_run_update`: a
+    typed, frozen record instead of a duck-typed Namespace, so no caller
+    (notably the migration, which used to fabricate a Namespace by hand) can
+    smuggle an alien field into the run. The fields are exactly the update
+    parser's flags; `update_options` is the one bridge from argparse, and the
+    drift guard in tests/test_update.py pins the two sides together."""
+
+    db: str = "coding-stats.db"
+    no_classify: bool = False
+    no_detect: bool = False
+    no_lineage: bool = False
+    no_serialize: bool = False
+    detect_pr: bool = False
+    pr_backfill: str | None = None
+
+
+def update_options(args: argparse.Namespace) -> UpdateOptions:
+    """Build UpdateOptions from the update parser's namespace: reads exactly
+    UpdateOptions' field names off vars(args), so a dest the parser dropped
+    fails loudly here instead of silently defaulting."""
+    given = vars(args)
+    return UpdateOptions(**{f.name: given[f.name] for f in fields(UpdateOptions)})
+
+
+def _update_parser(sub: "_SubParsers") -> argparse.ArgumentParser:
+    """The update verb's parser. Extracted from main so the drift-guard test
+    reads the same construction point: every flag defined here must be an
+    UpdateOptions field (tests/test_update.py)."""
+    up = sub.add_parser(
+        "update",
+        help="verify -> walk -> seed -> classify -> detect -> lineage -> live-lines"
+        " -> serialize + digest (ADR-0006: the store holds only the SQL artifact;"
+        " reports render via the report verb/action)",
+    )
+    up.add_argument("--db", default="coding-stats.db")
+    up.add_argument("--no-classify", action="store_true", help="skip LLM classification")
+    up.add_argument("--no-detect", action="store_true", help="skip blame-based fix detection")
+    up.add_argument("--no-lineage", action="store_true", help="skip lineage closure")
+    up.add_argument("--no-serialize", action="store_true", help="skip artifact write")
+    up.add_argument(
+        "--detect-pr",
+        action="store_true",
+        help="opt-in PR tier (ADR-0007 clause 1): run the watermark-driven"
+        " PR-channel increment after the deterministic stages, before"
+        " serialization (detection-only, no LLM calls)",
+    )
+    up.add_argument(
+        "--pr-backfill",
+        choices=("full",),
+        default=None,
+        metavar="full",
+        help="batched history backfill (the workflow_dispatch passthrough"
+        " `pr-backfill: full`): oldest-unincorporated merged PRs past the"
+        " watermark — the increment's resume machinery at 250 PRs per"
+        " invocation (DEFAULT_BACKFILL_CAP). Each run lands one disjoint chunk"
+        " and its watermark, and the next identical dispatch continues past it"
+        " (never restarting at PR 1) until history is caught up. NOT a re-sweep:"
+        " history below the marker is the direct `pr-sweep --full` face's job",
+    )
+    return up
 
 
 def _settings(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -71,37 +151,7 @@ def main(argv: list[str] | None = None) -> None:
     rep.add_argument("--out", default="coding-stats-report")
     rep.add_argument("--json", action="store_true")
 
-    up = sub.add_parser(
-        "update",
-        help="verify -> walk -> seed -> classify -> detect -> lineage -> live-lines"
-        " -> serialize + digest (ADR-0006: the store holds only the SQL artifact;"
-        " reports render via the report verb/action)",
-    )
-    up.add_argument("--db", default="coding-stats.db")
-    up.add_argument("--no-classify", action="store_true", help="skip LLM classification")
-    up.add_argument("--no-detect", action="store_true", help="skip blame-based fix detection")
-    up.add_argument("--no-lineage", action="store_true", help="skip lineage closure")
-    up.add_argument("--no-serialize", action="store_true", help="skip artifact write")
-    up.add_argument(
-        "--detect-pr",
-        action="store_true",
-        help="opt-in PR tier (ADR-0007 clause 1): run the watermark-driven"
-        " PR-channel increment after the deterministic stages, before"
-        " serialization (detection-only, no LLM calls)",
-    )
-    up.add_argument(
-        "--pr-backfill",
-        choices=("full",),
-        default=None,
-        metavar="full",
-        help="batched history backfill (the workflow_dispatch passthrough"
-        " `pr-backfill: full`): oldest-unincorporated merged PRs past the"
-        " watermark — the increment's resume machinery at 250 PRs per"
-        " invocation (DEFAULT_BACKFILL_CAP). Each run lands one disjoint chunk"
-        " and its watermark, and the next identical dispatch continues past it"
-        " (never restarting at PR 1) until history is caught up. NOT a re-sweep:"
-        " history below the marker is the direct `pr-sweep --full` face's job",
-    )
+    _update_parser(sub)
 
     ci_grp = sub.add_parser("ci", help="CI scaffold: workflow rendering + artifact landing")
     ci_sub = ci_grp.add_subparsers(dest="ci_cmd", required=True)
@@ -412,7 +462,7 @@ def main(argv: list[str] | None = None) -> None:
             html_path = write_report(conn, args.html)
             print(f"wrote {html_path}")
     elif args.cmd == "update":
-        conn = _run_update(conn, Path(args.db), args)
+        conn = _run_update(conn, update_options(args))
     conn.close()
 
 
@@ -475,14 +525,21 @@ def _report_sweep(res: prsweep.SweepResult) -> None:
 
 
 def _run_update(
-    conn: sqlite3.Connection, db_path: Path, args: argparse.Namespace, legacy_store: bool = False
+    conn: sqlite3.Connection, options: UpdateOptions, layout: StoreLayout = StoreLayout.DATA_BRANCH
 ) -> sqlite3.Connection:
     """One orchestrating run (ADR-0003 clause 7, Q11): verify the existing
     artifact first, then walk -> classify -> detect -> lineage -> live-lines ->
-    report -> serialize + digest + verify. Deterministic stages always run;
+    serialize + digest + verify (no report stage since ADR-0006: the store
+    holds only the SQL artifact; reports render via the report verb/action).
+    Deterministic stages always run;
     classification is best-effort — when it cannot run the walked backlog stays
     pending, is printed loudly, and reprocesses on a later successful update
     (Q13). The exit code stays 0 with a backlog.
+
+    `layout` tells the run which committed store it executes against: the
+    default Data branch, or StoreLayout.LEGACY_COMMITTED when the migrate
+    verb regenerates the store ON the Target checkout and the Data-branch
+    skips must not apply.
 
     ADR-0006 clause 1: the store is the Data branch `coding-stats/<target>` —
     prepare mounts its worktree, and the artifact is verified / rebuilt /
@@ -513,6 +570,7 @@ def _run_update(
 
     from . import artifact, livelines, recovery
 
+    db_path = Path(options.db)
     settings = _settings(conn)
     if "repo" in settings:
         repo_dir = Path(str(settings["repo"]))
@@ -534,7 +592,7 @@ def _run_update(
         settings["branch"] = branch
     identity.register_repository(conn, repo_dir, branch)
 
-    if legacy_store:
+    if layout is StoreLayout.LEGACY_COMMITTED:
         # the ADR-0005 migration verb regenerates the store ON the Target
         # checkout (legacy layout); the skips below apply only to the
         # default Data-branch layout
@@ -553,7 +611,7 @@ def _run_update(
     legacy_path = repo_dir / ".coding-stats" / "coding-stats.sql"
     recovered = False
     if not art_path.exists():
-        if not legacy_store and legacy_path.exists():
+        if layout is StoreLayout.DATA_BRANCH and legacy_path.exists():
             exposed = "coding-stats update skipped: the Target branch carries a committed"
             msg = (
                 f"::notice::{exposed} .coding-stats/ store (ADR-0003 layout) but its Data"
@@ -582,7 +640,7 @@ def _run_update(
             print(f"artifact digest: MISMATCH ({err})")
             anchor = (
                 f"refs/heads/{branch}"
-                if legacy_store
+                if layout is StoreLayout.LEGACY_COMMITTED
                 else datastore.anchor_ref(repo_dir, store.data_branch)
             )
             rec, conn = recovery.recover(conn, db_path, repo_dir, branch, anchor)
@@ -600,8 +658,8 @@ def _run_update(
     n = gitwalk.walk(repo_dir, conn, branch)
     print(f"walked {n} new commits")
 
-    if not args.no_classify:
-        if not legacy_store:
+    if not options.no_classify:
+        if layout is StoreLayout.DATA_BRANCH:
             from .seeding import seed_from_siblings
 
             seed = seed_from_siblings(conn, repo_dir, store.data_branch)
@@ -633,10 +691,10 @@ def _run_update(
                 " update"
             )
 
-    if not args.no_detect:
+    if not options.no_detect:
         n_fixes = annotate_all(repo_dir, conn, int(settings.get("min_target_lines", 1)))
         print(f"annotated {n_fixes} fix commits")
-    if not args.no_lineage:
+    if not options.no_lineage:
         close_lineage(conn)
         print("lineage closure updated")
 
@@ -650,9 +708,9 @@ def _run_update(
     # stage before serialization, so its evidence rows and the watermark
     # ride the same artifact the landing pushes — and the off default never
     # enters it at all (no API call, no disclosure).
-    if args.detect_pr or args.pr_backfill:
+    if options.detect_pr or options.pr_backfill:
         try:
-            if args.pr_backfill:
+            if options.pr_backfill:
                 # UPDATE's --pr-backfill full: the BATCHED backfill face —
                 # DEFAULT_BACKFILL_CAP PRs of oldest-unincorporated history
                 # per invocation (never a restart at PR 1, never a re-sweep
@@ -681,7 +739,7 @@ def _run_update(
             _report_sweep(res)
         print(f"::notice::{aiattr.DISCLOSURE_LINE}")
 
-    if not args.no_serialize:
+    if not options.no_serialize:
         path = artifact.write(conn, store_dir)
         err = artifact.verify(path)
         print(f"wrote {path} (digest {'ok' if err is None else 'MISMATCH ' + str(err)})")
@@ -691,7 +749,7 @@ def _run_update(
     total = conn.execute("SELECT COUNT(*) c FROM commits").fetchone()["c"]
     classified = conn.execute("SELECT COUNT(*) c FROM commit_verdicts").fetchone()["c"]
     pending = int(total) - int(classified)
-    suffix = "artifact updated" if not args.no_serialize else "artifact not written"
+    suffix = "artifact updated" if not options.no_serialize else "artifact not written"
     print(f"{total} walked, {classified} classified, {pending} pending, {suffix}")
     if pending:
         print(
